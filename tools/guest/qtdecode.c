@@ -68,6 +68,9 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 		ry = gRef + (size_t)gFrames * frame_bytes;
 		ru = ry + (size_t)w * h;
 		rv = ru + (size_t)w * h / 4;
+		if (getenv("QTDECODE_NOATTRS") && gFrames == 0)
+			fprintf(stderr, "emitted: format %.4s (0x%lx) %lux%lu\n", (char *)&fmt, (unsigned long)fmt,
+				(unsigned long)CVPixelBufferGetWidth(pb), (unsigned long)CVPixelBufferGetHeight(pb));
 		if (fmt != k422YpCbCr8PixelFormat || CVPixelBufferGetWidth(pb) != w || CVPixelBufferGetHeight(pb) != h) {
 			fprintf(stderr, "picture %u: pixel format %.4s %lux%lu\n", gFrames, (char *)&fmt,
 				(unsigned long)CVPixelBufferGetWidth(pb), (unsigned long)CVPixelBufferGetHeight(pb));
@@ -249,6 +252,10 @@ int main(int argc, char **argv)
 		CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, nf);
 		CFDictionarySetValue(attrs, kCVPixelBufferWidthKey, nw);
 		CFDictionarySetValue(attrs, kCVPixelBufferHeightKey, nh);
+	}
+	if (getenv("QTDECODE_NOATTRS")) {
+		CFRelease(attrs);
+		attrs = NULL;
 	}
 	err = ICMDecompressionSessionCreate(NULL, (ImageDescriptionHandle)sd, options, attrs, &cb, &session);
 	if (err) {
