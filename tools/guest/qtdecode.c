@@ -45,6 +45,9 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 		 TimeValue64 displayTime, TimeValue64 displayDuration, ICMValidTimeFlags validTime, void *reserved,
 		 void *sourceFrameRefCon)
 {
+	/* the source data is not needed any more */
+	if ((flags & kICMDecompressionTracking_ReleaseSourceData) && sourceFrameRefCon)
+		free(sourceFrameRefCon);
 	if (getenv("QTDECODE_TRACE"))
 		fprintf(stderr, "tracking: result %ld flags 0x%lx pb %p time %lld valid 0x%lx\n", (long)result,
 			(unsigned long)flags, (void *)pb, (long long)displayTime, (unsigned long)validTime);
@@ -290,7 +293,13 @@ int main(int argc, char **argv)
 			ft.flags = 0;
 		if (getenv("QTDECODE_NSONLY"))
 			ft.flags = icmFrameTimeIsNonScheduledDisplayTime;
-		err = ICMDecompressionSessionDecodeFrame(session, buffer, got, NULL, &ft, NULL);
+		/* the session reads the data later, when it decodes: every sample has its own buffer, kept until the session lets go */
+		{
+			unsigned char *own = malloc(got);
+
+			memcpy(own, buffer, got);
+			err = ICMDecompressionSessionDecodeFrame(session, own, got, NULL, &ft, own);
+		}
 		if (err) {
 			fprintf(stderr, "decode frame %u: %ld\n", samples, (long)err);
 			gErrors++;
