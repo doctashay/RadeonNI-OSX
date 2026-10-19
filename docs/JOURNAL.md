@@ -7328,3 +7328,19 @@ component (old copies in the G5's `/tmp`, lost at a restart), and the user resta
   until the G5 was restarted fits. Linux's full start puts all of them in reset (`UVD_SOFT_RESET`, SRBM reset) first.
 - Known and harmless: the 15 "Non-aligned pointer being freed" lines at the start of every Leopard program that loads `librdnvd` are the
   libstdc++ coalescing problem of docs/LEOPARD.md; the library needs the same export list as the GL bundle.
+
+## 2026-10-19 (evening): the wedge is still there after Player; sub-block and block resets built for the kext's restarts
+
+The Player run left the decoder dead for every program, including a fresh process's first decode (`qtdecode` 150 of 150 errors, `rdn_uvdtest`
+all access units failed), through the kext's restarts (epochs 239 to 251 each did "readback, ring test, initialized" and nothing decoded). Same
+as the morning's note: only a restart of the G5 clears it. So a restart of the VCPU does not clear what Player does to the block.
+Registers in that state (`rdnuvd regs`, the known-safe list, clocks down after the last user): UVD_STATUS 0x0a, UVD_SOFT_RESET 0,
+UVD_VCPU_CNTL 0x200, RB_RPTR = RB_WPTR = 0x20, UVD_CONTEXT_ID 0xdeadbeef, LMI_CTRL 0x00302340, LMI_CTRL2 0x30, EXT40_ADDR 0x80070000,
+SWAP 0xa, VCPU_CACHE_OFFSET0 0x00484830 size 0x6600, OFFSET1/2 0, VCPU_CHIP_ID 0, ARB_CTRL 0, CGC_GATE 0x0003f786, MASTINT_EN 6,
+SRBM_SOFT_RESET 0, UPLL FUNC_CNTL 0x306 / _2 0x021c0403 / _3 0x100ece38. (No healthy snapshot of the same moment to compare with.)
+An OpenGL context made after the first picture (`qtdecode` QTDECODE_GL=2, new) could not be tried: the card was already dead.
+Built, installed on the G5, not yet loaded (needs a restart): `rdn_uvd_set_reset_level()`. The kext's restarts now reset every UVD sub-block
+(level 1: `UVD_SOFT_RESET` with LMI, VCPU, LBSI, RBC, CSM, CXW, TAP and LMI_UMC, sub-blocks let out before the VCPU, as uvd_v1_0_start() does),
+and a reset asked for by a program within 20 s of its previous one is level 2: also `SOFT_RESET_UVD` in `SRBM_SOFT_RESET` (what
+evergreen_gpu_soft_reset() does for a UVD that hung). The log says "UVD restarted (epoch N, reset level L)". Old binary:
+`RadeonNI.before-resetlevels-202610191433`. The test: a Player run (open, 5 s, play); if the decoder stalls, do the tries revive it, and at which level?
