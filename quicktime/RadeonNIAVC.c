@@ -193,6 +193,8 @@ pascal ComponentResult RDNAVC_Initialize(RDNAVCGlobals *storage, ImageSubCodecDe
 {
 	cap->decompressRecordSize = sizeof(RDNAVCDecompressRecord);
 	cap->canAsync = true;
+	/* pictures decoded ahead of the one being drawn: a B pyramid holds several back */
+	cap->suggestedQueueSize = getenv("RDNAVC_QUEUE") ? (UInt16)atoi(getenv("RDNAVC_QUEUE")) : 16;
 	if (debug())
 		say("Initialize: record size %ld (needs more than %ld for the QuickTime 7 fields)", (long)cap->recordSize,
 		    (long)offsetof(ImageSubCodecDecompressCapabilities, baseCodecShouldCallDecodeBandForAllFrames));
