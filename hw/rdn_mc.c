@@ -262,3 +262,23 @@ int rdn_mc_relocate(struct rdn_card *card, uint64_t new_base)
 		(unsigned long long)old_base, (unsigned long long)new_base);
 	return 0;
 }
+
+/*
+ * Stop (or let go again) the display controllers' reads of video memory, without touching anything else: the
+ * test for whether display traffic gets in the way of another block's memory access.
+ */
+void rdn_display_hold(struct rdn_card *card, bool hold)
+{
+	unsigned i;
+
+	for (i = 0; i < RDN_NUM_CRTC; i++) {
+		uint32_t off = reloc_crtc[i], tmp = rdn_rreg(card, MC_RELOC_CRTC_CONTROL + off);
+
+		if (!(tmp & MC_RELOC_CRTC_MASTER_EN))
+			continue;
+		rdn_wreg(card, MC_RELOC_CRTC_UPDATE_LOCK + off, 1);
+		rdn_wreg(card, MC_RELOC_CRTC_CONTROL + off,
+			 hold ? tmp | MC_RELOC_CRTC_READ_REQ_DISABLE : tmp & ~MC_RELOC_CRTC_READ_REQ_DISABLE);
+		rdn_wreg(card, MC_RELOC_CRTC_UPDATE_LOCK + off, 0);
+	}
+}

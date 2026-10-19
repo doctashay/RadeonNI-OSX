@@ -668,8 +668,12 @@ int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 	uvd->swapped = RDN_BIG_ENDIAN;
 
 	/* radeon_uvd_resume(): the firmware as in the file, the rest zero */
-	for (i = 0; i < fw_size; i++)
-		vcpu_cpu[i] = fw[i];
+	{
+		uint32_t x = (flags & RDN_UVD_F_SWAP4) ? 3 : (flags & RDN_UVD_F_SWAP2) ? 2 : 0;
+
+		for (i = 0; i < fw_size; i++)
+			vcpu_cpu[i ^ x] = fw[i];
+	}
 	for (; i < vcpu_bytes; i++)
 		vcpu_cpu[i] = 0;
 	for (i = 0; i < ring_bytes + RDN_UVD_RING_EXTRA; i++)
@@ -680,7 +684,7 @@ int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 		uint32_t bad = 0, first = 0;
 
 		for (i = 0; i < fw_size; i++)
-			if (vcpu_cpu[i] != fw[i]) {
+			if (vcpu_cpu[i ^ ((flags & RDN_UVD_F_SWAP4) ? 3 : (flags & RDN_UVD_F_SWAP2) ? 2 : 0)] != fw[i]) {
 				if (!bad)
 					first = i;
 				bad++;

@@ -774,8 +774,12 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	      (unsigned long)fwSize, (unsigned long)vcpuOff, (unsigned long)ringOff,
 	      (unsigned long)ref);
 	IOLockLock(fLock);
+	if (flags & RDN_UVD_F_BLANK)
+		rdn_display_hold(fAccel.card, true);
 	r = rdn_uvd_init(&fUvd, &fAccel, ref, (const uint8_t *)fw, fwSize,
 			 RDN_UVD_DEFAULT_HANDLES, vcpuOff, ringOff, 4096, flags);
+	if (flags & RDN_UVD_F_BLANK)
+		rdn_display_hold(fAccel.card, false);
 	*status = rdn_rreg(fAccel.card, 0xf6bc);
 	if (r) {
 		IOLockUnlock(fLock);

@@ -39,4 +39,7 @@ int rdn_mc_load_microcode(struct rdn_card *card, const void *fw, size_t size);
  */
 int rdn_mc_relocate(struct rdn_card *card, uint64_t new_base);
 
+/* Test aid: the display controllers stop reading video memory (hold) or resume (!hold). */
+void rdn_display_hold(struct rdn_card *card, bool hold);
+
 #endif /* RDN_MC_H */

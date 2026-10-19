@@ -48,6 +48,9 @@
 #define RDN_UVD_F_MINIMAL	(1 << 10)	/* only the register writes a bisection of radeon showed necessary; the caller moves VRAM to MC address 0 and starts the RLC first */
 #define RDN_UVD_F_LMI		(1 << 11)	/* with MINIMAL: also the LMI control, swap and MPC mux registers */
 #define RDN_UVD_F_EXT		(1 << 12)	/* with MINIMAL: also the address extension registers (bits 28-39 of the window) */
+#define RDN_UVD_F_SWAP4		(1 << 13)	/* test: copy the firmware with the bytes of each 32-bit word reversed (addr ^ 3) */
+#define RDN_UVD_F_SWAP2		(1 << 14)	/* test: copy the firmware with the 16-bit halves of each word exchanged (addr ^ 2) */
+#define RDN_UVD_F_BLANK		(1 << 15)	/* test (kext): the display controllers stop reading video memory while UVD starts */
 #define RDN_UVD_F_GART		(1 << 9)	/* (kext) the VCPU region and ring in GART memory: addresses with bits 32-39 zero */
 
 struct rdn_uvd {
