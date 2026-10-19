@@ -192,10 +192,11 @@ int main(int argc, char **argv)
 		FSRef fsref;
 
 		if (FSPathMakeRef((const UInt8 *)component_path, &fsref, NULL) ||
-		    (err = RegisterComponentFileRef(&fsref, 0)) <= 0) {
+		    (err = RegisterComponentFileRef(&fsref, 0)) < 0) {
 			fprintf(stderr, "cannot register %s (%ld)\n", component_path, (long)err);
 			return 1;
 		}
+		printf("RegisterComponentFileRef: %ld\n", (long)err);
 	}
 
 	path = CFStringCreateWithCString(NULL, movie_path, kCFStringEncodingUTF8);
