@@ -1316,6 +1316,14 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
                struct rdn_bo *bo = dbg.bo[k];
                const uint8_t *p;
 
+               if (dbg.cmd[k] == 0x100 && bo->region != RDN_GART && bo->region != RDN_USER) {
+                  /* the slice data the decoder reads: its first bytes, to compare with another run's */
+                  p = (const uint8_t *)ws->dev->aperture + bo->offset + dbg.offset[k];
+                  syslog(LOG_NOTICE, "RadeonNIAVC: uvd bitstream: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+                         p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14],
+                         p[15], p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23]);
+                  continue;
+               }
                if (bo->region == RDN_GART || bo->region == RDN_USER || dbg.cmd[k] > 3)
                   continue;
                if (dbg.cmd[k] == 1 || dbg.cmd[k] == 2)
