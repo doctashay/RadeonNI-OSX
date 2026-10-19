@@ -4,7 +4,7 @@
  * buffers and compare every picture, in display order, with ffmpeg's decode of the same stream (yuv420p).
  * Nothing is shown on the screen.
  *
- *   qtdecode movie.mp4 reference.yuv|- [-c RadeonNIAVC.component] [-a] [-t]  (- : no reference, only count and time;
+ *   [QTDECODE_PAUSE=seconds [QTDECODE_PAUSE_AFTER=samples]] qtdecode movie.mp4 reference.yuv|- [-c RadeonNIAVC.component] [-a] [-t]  (- : no reference, only count and time;
  *   -t: the frames are scheduled against a time base that runs in real time, as when a movie plays: pictures come late
  *   or not at all, each is checked by its own display time)
  *
@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 #include <QuickTime/QuickTime.h>
 #include <CoreServices/CoreServices.h>
 #include <CoreVideo/CoreVideo.h>
@@ -406,6 +407,13 @@ int main(int argc, char **argv)
 				break;
 			ICMDecompressionSessionSetNonScheduledDisplayTime(session, sorted[next], scale, 0);
 			next++;
+		}
+		/* QTDECODE_PAUSE=seconds[,after]: stop feeding for a while after that many samples (QuickTime Player decodes the first
+		 * picture when a movie opens and the next ones when the user presses play) */
+		if (getenv("QTDECODE_PAUSE") && samples == (getenv("QTDECODE_PAUSE_AFTER") ? (unsigned)atoi(getenv("QTDECODE_PAUSE_AFTER")) : 1)) {
+			printf("pausing %d s after %u samples\n", atoi(getenv("QTDECODE_PAUSE")), samples);
+			fflush(stdout);
+			sleep(atoi(getenv("QTDECODE_PAUSE")));
 		}
 	}
 	if (gSched) {

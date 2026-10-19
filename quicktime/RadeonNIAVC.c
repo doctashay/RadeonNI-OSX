@@ -446,6 +446,19 @@ pascal ComponentResult RDNAVC_DrawBand(RDNAVCGlobals *storage, ImageSubCodecDeco
 			}
 			say("DrawBand: display %lld picture %p sum %08lx zero %lu%% inst %p", rec->display, (void *)rec->frame,
 			    sum & 0xffffffffUL, zero * 100 / ((unsigned long)rec->width * 2 * rec->height), (void *)storage);
+			/* /tmp/rdnavc.dump: also keep every tenth picture (by display time in 40 ms steps) as a raw 2vuy file */
+			if (access("/tmp/rdnavc.dump", F_OK) == 0 && rec->display >= 0 && (rec->display / 40) % 10 == 0) {
+				char name[64];
+				FILE *f;
+
+				snprintf(name, sizeof(name), "/tmp/avc-%lld.2vuy", rec->display);
+				f = fopen(name, "wb");
+				if (f) {
+					for (row = 0; row < rec->height; row++)
+						fwrite((const UInt8 *)drp->baseAddr + row * drp->rowBytes, 1, (size_t)rec->width * 2, f);
+					fclose(f);
+				}
+			}
 		}
 	} else {
 		/* no picture (the sample held none, or it is not one to start from): black */
