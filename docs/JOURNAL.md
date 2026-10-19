@@ -7135,3 +7135,18 @@ The ring test failed until the submission was padded to 16 dwords with UVD_NO_OP
 Earlier failures explained: our flow never moved VRAM below 4 GB, then started the RLC before the window.
 Open: the IB/fence test (`uvd IB: -60`, fence write-back), the LMI block (needed or not), porting to the kext
 and the G5 (big-endian: ring words, the LMI swap), then the QEMU Tiger guest, then the VA-API/decoder layer.
+
+2026-10-18 night (x86 host): the whole kernel-level UVD path works from our code on a cold POSTed card.
+`rdn_tool uvdonly` with `RDN_MIN=1 RDN_MIN_LMI=1` (hw/rdn_uvd.c `RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI`):
+VCPU boots (the firmware modifies its image exactly as under radeon), ring test passes, an IB is executed and
+its fence written back (`uvd IB: 0`, fence word = 1). Bugs fixed on the way: submissions padded to 16 dwords
+with UVD_NO_OP (the ring controller fetches in 16-dword blocks); the evergreen fence protocol
+(`uvd_v2_2_fence_emit`: UVD_CONTEXT_ID carries the sequence number, the VCPU stores that register's value at the
+DATA0/DATA1 address on command 0, command 2 traps), not the r600 one.
+Still required: VRAM at MC address 0 (MC_VM_FB_LOCATION = 0x003f0000, HDP_NONSURFACE_BASE = 0). With VRAM left
+where POST puts it (0xF00000000) the VCPU does not answer, with or without the address extension registers
+(UVD_LMI_ADDR_EXT, UVD_LMI_EXT40_ADDR) and with the cache offset masked to 28 bits. Open design question:
+relocate VRAM like radeon's evergreen_mc_program (touches the framebuffer driver's scan-out addresses and
+the accelerator's), or put the UVD window and ring in GART memory (addresses below 4 GB, no relocation; needs
+DMA memory and the GART; untestable with `rdn_tool` on this server because the host IOMMU translates the card's DMA,
+so it is for the Tiger guest under QEMU/VFIO).
