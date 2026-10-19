@@ -2,12 +2,14 @@
  * rdn_uvdtest: decode one H.264 picture on the card's video decoder (UVD)
  * through Mesa's pipe_video_codec and compare it with a reference.
  *
- *   rdn_uvdtest stream.h264 reference.yuv [-l level] [-n count] [-o out.nv12]
+ *   rdn_uvdtest stream.h264 reference.yuv [-l level] [-n count] [-o last.nv12]
  *
- * stream.h264: Annex B with one SPS, one PPS and one IDR slice (4:2:0, 8
- * bits, CAVLC or CABAC, one slice group); scripts/uvd-testvec.sh makes
- * one with ffmpeg. reference.yuv: the same picture decoded by ffmpeg as
- * yuv420p. H.264 decodes bit-exactly, so the pictures must be identical.
+ * stream.h264: Annex B with one SPS, one PPS and then one slice per
+ * picture, the first an IDR (4:2:0, 8 bits, frame pictures, I and P
+ * slices, picture order count type 0 or 2, one slice group);
+ * scripts/uvd-testvec.sh makes one with ffmpeg. reference.yuv: the same
+ * pictures decoded by ffmpeg as yuv420p. H.264 decodes bit-exactly, so
+ * every picture must be identical. -n repeats the whole sequence.
  *
  * The parameters are parsed here only as far as a test needs; the real
  * path (a parser that fills pipe_h264_picture_desc from ffmpeg's) is not
@@ -256,29 +258,141 @@ static double now_ms(void)
 	return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+/*
+ * Slice headers: as far as the picture description needs them.
+ */
+
+struct slice {
+	const uint8_t *nal;
+	size_t size;
+	unsigned nal_ref_idc;
+	bool idr;
+	unsigned slice_type, frame_num, poc_lsb;
+	int delta_poc_bottom;
+	unsigned num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1;
+};
+
+static int parse_slice(struct slice *sl, const struct pipe_h264_sps *sps, const struct pipe_h264_pps *pps)
+{
+	/* The header is in the first bytes. */
+	static uint8_t rbsp[256];
+	struct bits b = { rbsp, 0, 0 };
+	unsigned n = unescape(sl->nal, sl->size > 64 ? 64 : sl->size, rbsp);
+
+	b.bits = n * 8;
+	sl->nal_ref_idc = (sl->nal[0] >> 5) & 3;
+	sl->idr = (sl->nal[0] & 0x1f) == 5;
+	get_ue(&b);			/* first_mb_in_slice */
+	sl->slice_type = get_ue(&b) % 5;
+	get_ue(&b);			/* pic_parameter_set_id */
+	sl->frame_num = get_bits(&b, sps->log2_max_frame_num_minus4 + 4);
+	if (sl->idr)
+		get_ue(&b);		/* idr_pic_id */
+	if (sps->pic_order_cnt_type == 0) {
+		sl->poc_lsb = get_bits(&b, sps->log2_max_pic_order_cnt_lsb_minus4 + 4);
+		if (pps->bottom_field_pic_order_in_frame_present_flag)
+			sl->delta_poc_bottom = get_se(&b);
+	} else if (sps->pic_order_cnt_type == 1) {
+		fprintf(stderr, "uvdtest: picture order count type 1 is not handled here\n");
+		return -1;
+	}
+	if (pps->redundant_pic_cnt_present_flag)
+		get_ue(&b);
+	if (sl->slice_type == 1)
+		get_bits(&b, 1);	/* direct_spatial_mv_pred_flag */
+	sl->num_ref_idx_l0_active_minus1 = pps->num_ref_idx_l0_default_active_minus1;
+	sl->num_ref_idx_l1_active_minus1 = pps->num_ref_idx_l1_default_active_minus1;
+	if (sl->slice_type == 0 || sl->slice_type == 1 || sl->slice_type == 3) {
+		if (get_bits(&b, 1)) {
+			sl->num_ref_idx_l0_active_minus1 = get_ue(&b);
+			if (sl->slice_type == 1)
+				sl->num_ref_idx_l1_active_minus1 = get_ue(&b);
+		}
+	}
+	return 0;
+}
+
+/* A reference picture the decoder holds. */
+struct ref {
+	unsigned frame_num;
+	int poc[2];
+	struct pipe_video_buffer *target;
+};
+
+/*
+ * The decoded picture in `target` against the reference's: the number of
+ * samples that differ, and where the first luma one is.
+ */
+static unsigned long compare(struct pipe_screen *screen, struct pipe_video_buffer *target, const uint8_t *ref_frame,
+			     unsigned width, unsigned height, const unsigned crop[4], unsigned out_w,
+			     unsigned out_h, FILE *out, unsigned long *first_luma)
+{
+	struct pipe_resource *res[3] = { NULL, NULL, NULL };
+	unsigned stride_y, stride_uv, x, row;
+	const uint8_t *ref_y = ref_frame, *ref_u = ref_frame + out_w * out_h, *ref_v = ref_u + out_w * out_h / 4;
+	const uint8_t *y, *uv;
+	unsigned long bad = 0;
+
+	target->get_resources(target, res);
+	y = raw_plane(screen, res[0], &stride_y);
+	uv = res[1] ? raw_plane(screen, res[1], &stride_uv) : NULL;
+	if (!y || !uv) {
+		fprintf(stderr, "uvdtest: cannot map the decoded picture\n");
+		return (unsigned long)-1;
+	}
+	*first_luma = (unsigned long)-1;
+	for (row = 0; row < out_h; row++)
+		for (x = 0; x < out_w; x++)
+			if (y[(row + 2 * crop[2]) * stride_y + x + 2 * crop[0]] != ref_y[row * out_w + x]) {
+				if (*first_luma == (unsigned long)-1)
+					*first_luma = row * out_w + x;
+				bad++;
+			}
+	for (row = 0; row < out_h / 2; row++)
+		for (x = 0; x < out_w / 2; x++) {
+			const uint8_t *p = uv + (row + crop[2]) * stride_uv + (x + crop[0]) * 2;
+
+			bad += p[0] != ref_u[row * (out_w / 2) + x];
+			bad += p[1] != ref_v[row * (out_w / 2) + x];
+		}
+	if (out) {
+		rewind(out);
+		for (row = 0; row < height; row++)
+			fwrite(y + row * stride_y, 1, width, out);
+		for (row = 0; row < height / 2; row++)
+			fwrite(uv + row * stride_uv, 1, width, out);
+	}
+	return bad;
+}
+
+#define MAX_PICTURES 4096
+
 int main(int argc, char **argv)
 {
 	const char *stream_path = NULL, *ref_path = NULL, *out_path = NULL;
-	unsigned level = 0, count = 1, n;
+	unsigned level = 0, count = 1, pass;
 	size_t stream_size, ref_size, i;
 	uint8_t *stream, *ref;
-	const uint8_t *sps_nal = NULL, *pps_nal = NULL, *slice_nal = NULL;
-	size_t sps_size = 0, pps_size = 0, slice_size = 0;
+	const uint8_t *sps_nal = NULL, *pps_nal = NULL;
+	size_t sps_size = 0, pps_size = 0;
+	static struct slice slices[MAX_PICTURES];
+	unsigned num_slices = 0;
 	struct pipe_h264_sps sps;
 	struct pipe_h264_pps pps;
 	struct pipe_h264_picture_desc desc;
-	unsigned profile_idc, crop[4], width, height, out_w, out_h;
+	unsigned profile_idc, crop[4], width, height, out_w, out_h, frame_bytes;
 	struct pipe_screen *screen;
 	struct pipe_context *ctx;
 	struct pipe_video_codec templ, *codec;
-	struct pipe_video_buffer vtempl, *target;
-	struct pipe_resource *res[3] = { NULL, NULL, NULL };
+	struct pipe_video_buffer vtempl, *pool[16];
+	unsigned pool_size, pool_next = 0;
 	struct pipe_fence_handle *fence = NULL;
 	static const uint8_t start_code[3] = { 0, 0, 1 };
-	uint8_t *picture;
 	const void *buffers[2];
 	unsigned sizes[2];
+	unsigned long total_bad = 0;
 	double t0;
+	FILE *out = NULL;
 	int a;
 
 	for (a = 1; a < argc; a++) {
@@ -294,7 +408,7 @@ int main(int argc, char **argv)
 			ref_path = argv[a];
 	}
 	if (!stream_path || !ref_path) {
-		fprintf(stderr, "usage: rdn_uvdtest stream.h264 reference.yuv [-l level] [-n count] [-o out.nv12]\n");
+		fprintf(stderr, "usage: rdn_uvdtest stream.h264 reference.yuv [-l level] [-n count] [-o last.nv12]\n");
 		return 2;
 	}
 	stream = read_file(stream_path, &stream_size);
@@ -302,7 +416,7 @@ int main(int argc, char **argv)
 	if (!stream || !ref)
 		return 1;
 
-	/* The NAL units: SPS, PPS and the IDR slice. */
+	/* The NAL units: SPS, PPS and the slices. */
 	for (i = 0; i + 3 < stream_size;) {
 		size_t start, end;
 
@@ -330,17 +444,19 @@ int main(int argc, char **argv)
 				pps_size = end - start;
 			}
 			break;
+		case 1:
 		case 5:
-			if (!slice_nal) {
-				slice_nal = stream + start;
-				slice_size = end - start;
+			if (num_slices < MAX_PICTURES) {
+				slices[num_slices].nal = stream + start;
+				slices[num_slices].size = end - start;
+				num_slices++;
 			}
 			break;
 		}
 		i = end;
 	}
-	if (!sps_nal || !pps_nal || !slice_nal) {
-		fprintf(stderr, "uvdtest: the stream needs an SPS, a PPS and an IDR slice\n");
+	if (!sps_nal || !pps_nal || !num_slices || (slices[0].nal[0] & 0x1f) != 5) {
+		fprintf(stderr, "uvdtest: the stream needs an SPS, a PPS and slices, the first an IDR\n");
 		return 1;
 	}
 
@@ -353,12 +469,13 @@ int main(int argc, char **argv)
 	height = (sps.pic_height_in_mbs_minus1 + 1) * 16;
 	out_w = width - 2 * (crop[0] + crop[1]);
 	out_h = height - 2 * (crop[2] + crop[3]);
-	printf("stream: profile_idc %u, level_idc %u, %ux%u (shown %ux%u), %s, %u reference frames\n",
+	frame_bytes = out_w * out_h * 3 / 2;
+	printf("stream: profile_idc %u, level_idc %u, %ux%u (shown %ux%u), %s, %u reference frames, %u pictures\n",
 	       profile_idc, (unsigned)sps.level_idc, width, height, out_w, out_h,
-	       pps.entropy_coding_mode_flag ? "CABAC" : "CAVLC", (unsigned)sps.max_num_ref_frames);
-	if (ref_size != (size_t)out_w * out_h * 3 / 2) {
-		fprintf(stderr, "uvdtest: the reference has %lu bytes, a %ux%u yuv420p picture has %u\n",
-			(unsigned long)ref_size, out_w, out_h, out_w * out_h * 3 / 2);
+	       pps.entropy_coding_mode_flag ? "CABAC" : "CAVLC", (unsigned)sps.max_num_ref_frames, num_slices);
+	if (ref_size != (size_t)frame_bytes * num_slices) {
+		fprintf(stderr, "uvdtest: the reference has %lu bytes, %u yuv420p pictures of %ux%u have %u\n",
+			(unsigned long)ref_size, num_slices, out_w, out_h, frame_bytes * num_slices);
 		return 1;
 	}
 
@@ -389,109 +506,135 @@ int main(int argc, char **argv)
 	}
 	printf("decoder created in %.1f ms\n", now_ms() - t0);
 
+	/* Pictures go round a pool of targets, so that a reference is not overwritten while it is one. */
+	pool_size = sps.max_num_ref_frames + 2;
+	if (pool_size > 16)
+		pool_size = 16;
 	memset(&vtempl, 0, sizeof(vtempl));
 	vtempl.buffer_format = PIPE_FORMAT_NV12;
 	vtempl.width = width;
 	vtempl.height = height;
-	target = ctx->create_video_buffer(ctx, &vtempl);
-	if (!target) {
-		fprintf(stderr, "uvdtest: create_video_buffer failed\n");
-		return 1;
+	for (i = 0; i < pool_size; i++) {
+		pool[i] = ctx->create_video_buffer(ctx, &vtempl);
+		if (!pool[i]) {
+			fprintf(stderr, "uvdtest: create_video_buffer failed\n");
+			return 1;
+		}
 	}
+	if (out_path)
+		out = fopen(out_path, "wb");
 
-	memset(&desc, 0, sizeof(desc));
-	desc.base.profile = templ.profile;
-	desc.base.entry_point = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
-	desc.base.out_fence = &fence;
-	desc.pps = &pps;
-	desc.frame_num = 0;
-	desc.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
-	desc.num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
-	desc.slice_count = 1;
-	desc.is_reference = true;
-	desc.num_ref_frames = sps.max_num_ref_frames;
-
-	picture = malloc(slice_size);
-	memcpy(picture, slice_nal, slice_size);
-	buffers[0] = start_code;
-	sizes[0] = sizeof(start_code);
-	buffers[1] = picture;
-	sizes[1] = slice_size;
-
-	/* With -n, the same picture again and again: every one has to come out right (checked below), and the rate is the decoder's. */
 	t0 = now_ms();
-	for (n = 0; n < count; n++) {
-		codec->begin_frame(codec, target, &desc.base);
-		codec->decode_bitstream(codec, target, &desc.base, 2, buffers, sizes);
-		if (codec->end_frame(codec, target, &desc.base)) {
-			fprintf(stderr, "uvdtest: end_frame failed\n");
-			return 1;
-		}
-		if (!fence || !codec->fence_wait(codec, fence, 5000ull * 1000 * 1000)) {
-			fprintf(stderr, "uvdtest: the decoder did not finish in 5 s (picture %u)\n", n);
-			return 1;
-		}
-	}
-	printf("decoded %u pictures in %.1f ms (%.2f ms each)\n", count, now_ms() - t0,
-	       (now_ms() - t0) / count);
+	for (pass = 0; pass < count; pass++) {
+		struct ref refs[16];
+		unsigned num_refs = 0, prev_frame_num = 0, frame_num_offset = 0, pic;
+		int prev_poc_msb = 0, prev_poc_lsb = 0;
 
-	target->get_resources(target, res);
-	{
-		unsigned stride_y, stride_uv;
-		const uint8_t *y, *uv;
-		unsigned long bad = 0, worst = 0, first = (unsigned long)-1;
-		unsigned x, row;
-		const uint8_t *ref_y = ref, *ref_u = ref + out_w * out_h, *ref_v = ref_u + out_w * out_h / 4;
-		FILE *out = out_path ? fopen(out_path, "wb") : NULL;
+		for (pic = 0; pic < num_slices; pic++) {
+			struct slice *sl = &slices[pic];
+			struct pipe_video_buffer *target = pool[pool_next++ % pool_size];
+			int poc_msb = 0, poc[2] = { 0, 0 };
+			unsigned long bad, first;
+			unsigned k;
 
-		y = raw_plane(screen, res[0], &stride_y);
-		uv = res[1] ? raw_plane(screen, res[1], &stride_uv) : NULL;
-		if (!y || !uv) {
-			fprintf(stderr, "uvdtest: cannot map the decoded picture\n");
-			return 1;
-		}
-		for (row = 0; row < out_h; row++)
-			for (x = 0; x < out_w; x++) {
-				unsigned sy = row + 2 * crop[2], sx = x + 2 * crop[0];
-				int d = y[sy * stride_y + sx] - ref_y[row * out_w + x];
+			if (parse_slice(sl, &sps, &pps))
+				return 1;
+			if (sl->idr)
+				num_refs = 0;
 
-				if (d) {
-					if (first == (unsigned long)-1)
-						first = row * out_w + x;
-					bad++;
-					if ((unsigned long)abs(d) > worst)
-						worst = abs(d);
+			/* Picture order count (8.2.1). */
+			if (sps.pic_order_cnt_type == 2) {
+				if (sl->idr)
+					frame_num_offset = 0;
+				else if (prev_frame_num > sl->frame_num)
+					frame_num_offset += 1u << (sps.log2_max_frame_num_minus4 + 4);
+				poc[0] = poc[1] = sl->idr ? 0 : 2 * (int)(frame_num_offset + sl->frame_num) -
+							       (sl->nal_ref_idc ? 0 : 1);
+				prev_frame_num = sl->frame_num;
+			} else {
+				int max_lsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
+
+				if (sl->idr)
+					prev_poc_msb = prev_poc_lsb = 0;
+				if ((int)sl->poc_lsb < prev_poc_lsb && prev_poc_lsb - (int)sl->poc_lsb >= max_lsb / 2)
+					poc_msb = prev_poc_msb + max_lsb;
+				else if ((int)sl->poc_lsb > prev_poc_lsb && (int)sl->poc_lsb - prev_poc_lsb > max_lsb / 2)
+					poc_msb = prev_poc_msb - max_lsb;
+				else
+					poc_msb = prev_poc_msb;
+				poc[0] = poc_msb + sl->poc_lsb;
+				poc[1] = poc[0] + sl->delta_poc_bottom;
+				if (sl->nal_ref_idc) {
+					prev_poc_msb = poc_msb;
+					prev_poc_lsb = sl->poc_lsb;
 				}
 			}
-		printf("luma: %lu of %u samples differ (largest difference %lu%s)\n", bad, out_w * out_h,
-		       worst, bad ? "" : ", identical");
-		if (bad)
-			printf("first difference at luma sample %lu (x %lu, y %lu)\n", first, first % out_w,
-			       first / out_w);
-		{
-			unsigned long bad_u = 0, bad_v = 0;
 
-			for (row = 0; row < out_h / 2; row++)
-				for (x = 0; x < out_w / 2; x++) {
-					unsigned sy = row + crop[2], sx = x + crop[0];
-					const uint8_t *p = uv + sy * stride_uv + sx * 2;
+			memset(&desc, 0, sizeof(desc));
+			desc.base.profile = templ.profile;
+			desc.base.entry_point = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
+			desc.base.out_fence = &fence;
+			desc.pps = &pps;
+			desc.frame_num = sl->frame_num;
+			desc.num_ref_idx_l0_active_minus1 = sl->num_ref_idx_l0_active_minus1;
+			desc.num_ref_idx_l1_active_minus1 = sl->num_ref_idx_l1_active_minus1;
+			desc.slice_count = 1;
+			desc.field_order_cnt[0] = poc[0];
+			desc.field_order_cnt[1] = poc[1];
+			desc.is_reference = sl->nal_ref_idc != 0;
+			desc.num_ref_frames = sps.max_num_ref_frames;
+			for (k = 0; k < num_refs; k++) {
+				desc.frame_num_list[k] = refs[k].frame_num;
+				desc.field_order_cnt_list[k][0] = refs[k].poc[0];
+				desc.field_order_cnt_list[k][1] = refs[k].poc[1];
+				desc.top_is_reference[k] = desc.bottom_is_reference[k] = true;
+				desc.ref[k] = refs[k].target;
+			}
 
-					bad_u += p[0] != ref_u[row * (out_w / 2) + x];
-					bad_v += p[1] != ref_v[row * (out_w / 2) + x];
-				}
-			printf("chroma: %lu U and %lu V of %u samples each differ\n", bad_u, bad_v,
-			       out_w * out_h / 4);
-			bad += bad_u + bad_v;
+			buffers[0] = start_code;
+			sizes[0] = sizeof(start_code);
+			buffers[1] = sl->nal;
+			sizes[1] = sl->size;
+			codec->begin_frame(codec, target, &desc.base);
+			codec->decode_bitstream(codec, target, &desc.base, 2, buffers, sizes);
+			if (codec->end_frame(codec, target, &desc.base)) {
+				fprintf(stderr, "uvdtest: end_frame failed (picture %u)\n", pic);
+				return 1;
+			}
+			if (!fence || !codec->fence_wait(codec, fence, 5000ull * 1000 * 1000)) {
+				fprintf(stderr, "uvdtest: the decoder did not finish in 5 s (picture %u)\n", pic);
+				return 1;
+			}
+			bad = compare(screen, target, ref + (size_t)pic * frame_bytes, width, height, crop, out_w, out_h,
+				      pass == count - 1 ? out : NULL, &first);
+			if (bad == (unsigned long)-1)
+				return 1;
+			if (bad && total_bad < 16)
+				printf("picture %u (%s, frame_num %u, poc %d): %lu samples differ%s\n", pic,
+				       sl->slice_type == 2 ? "I" : sl->slice_type == 0 ? "P" : "other", sl->frame_num,
+				       poc[0], bad, first != (unsigned long)-1 ? ", luma too" : "");
+			total_bad += bad;
+
+			/* The sliding window of reference pictures, the newest first. */
+			if (sl->nal_ref_idc) {
+				unsigned keep = sps.max_num_ref_frames ? sps.max_num_ref_frames : 1;
+
+				if (num_refs == keep)
+					num_refs--;
+				memmove(&refs[1], &refs[0], num_refs * sizeof(refs[0]));
+				refs[0].frame_num = sl->frame_num;
+				refs[0].poc[0] = poc[0];
+				refs[0].poc[1] = poc[1];
+				refs[0].target = target;
+				num_refs++;
+			}
 		}
-		if (out) {
-			for (row = 0; row < height; row++)
-				fwrite(y + row * stride_y, 1, width, out);
-			for (row = 0; row < height / 2; row++)
-				fwrite(uv + row * stride_uv, 1, width, out);
-			fclose(out);
-		}
-		printf("%s\n", bad ? "FAIL: the card's picture differs from ffmpeg's" : "PASS: identical to ffmpeg's");
-		codec->destroy(codec);
-		return bad != 0;
 	}
+	printf("decoded %u pictures in %.1f ms (%.2f ms each)\n", count * num_slices, now_ms() - t0,
+	       (now_ms() - t0) / (count * num_slices));
+	printf("%s\n", total_bad ? "FAIL: the card's pictures differ from ffmpeg's" : "PASS: every picture identical to ffmpeg's");
+	if (out)
+		fclose(out);
+	codec->destroy(codec);
+	return total_bad != 0;
 }
