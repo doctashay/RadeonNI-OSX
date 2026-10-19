@@ -45,6 +45,9 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 		 TimeValue64 displayTime, TimeValue64 displayDuration, ICMValidTimeFlags validTime, void *reserved,
 		 void *sourceFrameRefCon)
 {
+	if (getenv("QTDECODE_TRACE"))
+		fprintf(stderr, "tracking: result %ld flags 0x%lx pb %p time %lld valid 0x%lx\n", (long)result,
+			(unsigned long)flags, (void *)pb, (long long)displayTime, (unsigned long)validTime);
 	if (result) {
 		gErrors++;
 		fprintf(stderr, "tracking callback: error %ld\n", (long)result);
@@ -257,6 +260,8 @@ int main(int argc, char **argv)
 		ft.value.lo = (UInt32)(sampleTime + offset);
 		ft.decodeTime = sampleTime;
 		ft.flags = icmFrameTimeIsNonScheduledDisplayTime | icmFrameTimeHasDecodeTime;
+		if (getenv("QTDECODE_NOFLAGS"))
+			ft.flags = 0;
 		err = ICMDecompressionSessionDecodeFrame(session, buffer, got, NULL, &ft, NULL);
 		if (err) {
 			fprintf(stderr, "decode frame %u: %ld\n", samples, (long)err);
