@@ -132,8 +132,11 @@ Test without installing anything: `tools/guest/qtdecode.c` (builds on the G5) re
 is in the time stamps; the raw .h264 muxed into MP4 by ffmpeg has none). Results on the G5 (Leopard, QuickTime 7.7): all 12 vectors with frame pictures
 identical sample for sample, 1280x720 and 1920x1080 with B pyramids too, and the interlaced one declined; Apple's own decoder on the same streams: bit-exact
 for the small ones but not at 720p and 1080p (16 of 40 and 2 of 30 pictures differ: it skips loop filtering on some pictures), and slower (73 ms against 48 ms a
-1080p sample, test overhead included). Not yet tried: the component installed, so that QuickTime and its programs choose it themselves (which of two
-decompressors for 'avc1' QuickTime picks is not documented; `/Library/QuickTime` is the place), colours and display in QuickTime Player, Tiger.
+1080p sample, test overhead included). Installed in `/Library/QuickTime` of the G5's Leopard volume (the user's yes, 2026-10-19): QuickTime picks the component on its own for the streams it takes
+(log lines `RadeonNIAVC: taking ...` in system.log) and, when it declines (interlaced coding), uses Apple's decoder as before. Decoding through QuickTime, nothing
+compared (`qtdecode movie -`, 30 s clips of 720p30 and 1080p24 with B pyramids): 14.1 ms a picture (71 a second) at 720p against 30.8 ms (32 a second) with Apple's
+decoder, 29.3 ms (34 a second) at 1080p against 69.5 ms (14 a second): 1080p24 plays in real time only with the component. Not yet tried: colours and display in
+QuickTime Player (the user's eyes: `~/Movies/RadeonNI-test/` on the G5 has a colour-bar clip and 720p and 1080p motion clips), CPU load while playing, Tiger.
 
 ## Why
 

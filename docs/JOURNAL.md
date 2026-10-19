@@ -7253,4 +7253,8 @@ not lose them). Result: 12 vectors identical to ffmpeg's sample for sample, 720p
 the card. Apple's software decoder on the same 720p/1080p files is not bit-exact (16 of 40 and 2 of 30 pictures: it skips the loop filter on some) and slower.
 Left: install it (needs the user's yes: it changes H.264 decoding for every QuickTime program), see which decompressor QuickTime picks, colours and playback in
 QuickTime Player (the user's eyes), Tiger, field pictures, PowerVLC.
+Installed with the user's yes (`scripts/qt-component.sh install`, /Library/QuickTime on the G5's Leopard volume): `qtdecode` without forcing anything shows QuickTime choosing the component
+for the supported streams (bit-exact at 128x96 and 720p) and Apple's decoder for the interlaced one (declined). Through QuickTime, no comparison (30 s clips with B pyramids): 720p30 14.1 ms a
+picture with the component against 30.8 ms with Apple's decoder; 1080p24 29.3 ms against 69.5 ms (34 against 14 pictures a second). Test clips for the user's eyes in `~/Movies/RadeonNI-test/`
+on the G5 (colour bars tagged BT.709, 720p and 1080p motion).
 
