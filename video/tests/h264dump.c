@@ -85,14 +85,14 @@ int main(int argc, char **argv)
 	if (!data || fread(data, 1, size, f) != (size_t)size)
 		return 1;
 	fclose(f);
-	h = rdnvd_h264_new(&cb, NULL);
-	r = rdnvd_h264_feed_annexb(h, data, size, 0);
+	h = rdnvd_h264_parser_new(&cb, NULL);
+	r = rdnvd_h264_parser_feed_annexb(h, data, size, 0);
 	if (r)
 		fprintf(stderr, "feed: %d\n", r);
-	r = rdnvd_h264_flush(h, 0);
+	r = rdnvd_h264_parser_flush(h, 0);
 	if (r)
 		fprintf(stderr, "flush: %d\n", r);
-	rdnvd_h264_free(h);
+	rdnvd_h264_parser_free(h);
 	fprintf(stderr, "decoded %u, output %u, released %u, still held %u\n", decoded, outputs, released, live);
 	return decoded == outputs && !live ? 0 : 1;
 }

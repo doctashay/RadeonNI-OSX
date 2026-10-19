@@ -1384,7 +1384,7 @@ static int handle_nal(struct rdnvd_h264 *h, const uint8_t *nal, size_t size, uin
 
 /* ---- the interface --------------------------------------------------------- */
 
-struct rdnvd_h264 *rdnvd_h264_new(const struct rdnvd_h264_callbacks *cb, void *user)
+struct rdnvd_h264 *rdnvd_h264_parser_new(const struct rdnvd_h264_callbacks *cb, void *user)
 {
 	struct rdnvd_h264 *h = calloc(1, sizeof(*h));
 
@@ -1396,16 +1396,16 @@ struct rdnvd_h264 *rdnvd_h264_new(const struct rdnvd_h264_callbacks *cb, void *u
 	return h;
 }
 
-void rdnvd_h264_free(struct rdnvd_h264 *h)
+void rdnvd_h264_parser_free(struct rdnvd_h264 *h)
 {
 	if (!h)
 		return;
-	rdnvd_h264_flush(h, 1);
+	rdnvd_h264_parser_flush(h, 1);
 	free(h->data);
 	free(h);
 }
 
-int rdnvd_h264_avcc(struct rdnvd_h264 *h, const uint8_t *avcc, size_t size)
+int rdnvd_h264_parser_avcc(struct rdnvd_h264 *h, const uint8_t *avcc, size_t size)
 {
 	size_t pos = 6;
 	unsigned count, i, round;
@@ -1438,7 +1438,7 @@ int rdnvd_h264_avcc(struct rdnvd_h264 *h, const uint8_t *avcc, size_t size)
 	return (avcc[4] & 3) + 1;
 }
 
-int rdnvd_h264_feed_annexb(struct rdnvd_h264 *h, const uint8_t *data, size_t size, uint64_t pts)
+int rdnvd_h264_parser_feed_annexb(struct rdnvd_h264 *h, const uint8_t *data, size_t size, uint64_t pts)
 {
 	size_t i = 0;
 	int err = RDNVD_H264_OK, r;
@@ -1467,7 +1467,7 @@ int rdnvd_h264_feed_annexb(struct rdnvd_h264 *h, const uint8_t *data, size_t siz
 	return err;
 }
 
-int rdnvd_h264_feed_avcc(struct rdnvd_h264 *h, const uint8_t *data, size_t size, unsigned nal_length_size,
+int rdnvd_h264_parser_feed_avcc(struct rdnvd_h264 *h, const uint8_t *data, size_t size, unsigned nal_length_size,
 			 uint64_t pts)
 {
 	size_t pos = 0;
@@ -1491,12 +1491,12 @@ int rdnvd_h264_feed_avcc(struct rdnvd_h264 *h, const uint8_t *data, size_t size,
 	return err;
 }
 
-int rdnvd_h264_end_au(struct rdnvd_h264 *h)
+int rdnvd_h264_parser_end_au(struct rdnvd_h264 *h)
 {
 	return finish_picture(h);
 }
 
-int rdnvd_h264_flush(struct rdnvd_h264 *h, int drop)
+int rdnvd_h264_parser_flush(struct rdnvd_h264 *h, int drop)
 {
 	int err = RDNVD_H264_OK;
 

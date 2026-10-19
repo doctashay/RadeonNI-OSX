@@ -138,19 +138,19 @@ struct rdnvd_h264_callbacks {
 
 struct rdnvd_h264;
 
-struct rdnvd_h264 *rdnvd_h264_new(const struct rdnvd_h264_callbacks *cb, void *user);
-void rdnvd_h264_free(struct rdnvd_h264 *h);
+struct rdnvd_h264 *rdnvd_h264_parser_new(const struct rdnvd_h264_callbacks *cb, void *user);
+void rdnvd_h264_parser_free(struct rdnvd_h264 *h);
 
 /* The configuration record of an MP4/QuickTime avcC box: its SPS and PPS go in; returns the NAL length size (1-4) or an error. */
-int rdnvd_h264_avcc(struct rdnvd_h264 *h, const uint8_t *avcc, size_t size);
+int rdnvd_h264_parser_avcc(struct rdnvd_h264 *h, const uint8_t *avcc, size_t size);
 /* NAL units after start codes (00 00 01); or, with nal_length_size 1 to 4, length prefixed. `pts` goes with the pictures that complete in it. */
-int rdnvd_h264_feed_annexb(struct rdnvd_h264 *h, const uint8_t *data, size_t size, uint64_t pts);
-int rdnvd_h264_feed_avcc(struct rdnvd_h264 *h, const uint8_t *data, size_t size, unsigned nal_length_size,
+int rdnvd_h264_parser_feed_annexb(struct rdnvd_h264 *h, const uint8_t *data, size_t size, uint64_t pts);
+int rdnvd_h264_parser_feed_avcc(struct rdnvd_h264 *h, const uint8_t *data, size_t size, unsigned nal_length_size,
 			 uint64_t pts);
 /* The data fed so far ends an access unit: decode the picture that is complete. */
-int rdnvd_h264_end_au(struct rdnvd_h264 *h);
+int rdnvd_h264_parser_end_au(struct rdnvd_h264 *h);
 /* End of the stream or a seek: decode what is pending, output everything (drop = 1: forget instead of output). */
-int rdnvd_h264_flush(struct rdnvd_h264 *h, int drop);
+int rdnvd_h264_parser_flush(struct rdnvd_h264 *h, int drop);
 
 #ifdef __cplusplus
 }

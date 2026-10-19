@@ -73,15 +73,33 @@ executable(
   install : false,
 )
 
-# The video decoder test: one H.264 picture through pipe_video_codec on the
-# card (it needs the card: there is no software stand-in for UVD).
+# rdnvd: the card's video decoder for programs (rdnvd.h): Mesa's r600 UVD code behind a plain C
+# interface, with the H.264 layer of video/. Only the rdnvd_* entry points are exported.
+rdnvd_sources = [rdn_sources, files('rdnvd.c', 'video/rdnvd_h264.c')]
+rdnvd_link_with = [libr600, libmesa, libgallium, libgalliumvl, librdnwinsys]
+rdnvd_args = []
+if host_machine.system() == 'darwin'
+  rdnvd_args = ['-Wl,-exported_symbols_list,' + meson.current_source_dir() / 'rdnvd.exports']
+endif
+shared_library(
+  'rdnvd',
+  rdnvd_sources,
+  gnu_symbol_visibility : 'hidden',
+  link_args : [ld_args_gc_sections, rdn_device_link_args, rdnvd_args],
+  include_directories : rdn_inc,
+  link_with : rdnvd_link_with,
+  dependencies : rdn_deps,
+  install : false,
+)
+
+# The video decoder test: a stream through rdnvd on the card, every picture against ffmpeg's decode
+# (it needs the card: there is no software stand-in for UVD).
 executable(
   'rdn_uvdtest',
-  [rdn_sources, files('tests/rdn_uvdtest.c')],
+  [rdnvd_sources, files('tests/rdn_uvdtest.c')],
   include_directories : rdn_inc,
   link_args : rdn_device_link_args,
-  link_whole : rdn_link_whole,
-  link_with : rdn_link_with,
+  link_with : rdnvd_link_with,
   dependencies : rdn_deps,
   install : false,
 )
