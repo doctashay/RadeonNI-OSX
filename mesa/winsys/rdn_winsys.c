@@ -30,6 +30,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
+#include <unistd.h>
 
 #include "radeon_drm_winsys.h"
 #include "rdn_winsys.h"
@@ -1131,6 +1133,25 @@ static struct {
  */
 #define RDN_UVD_GPCOM_VCPU_DATA0 0xEF10
 #define RDN_UVD_GPCOM_VCPU_DATA1 0xEF14
+#define RDN_UVD_GPCOM_VCPU_CMD 0xEF0C
+
+/*
+ * Looking at what the decoder's firmware makes of the commands: with RDN_UVD_DEBUG, or the file /tmp/rdnavc.debug, each
+ * stream is waited for and the start of its message and of the firmware's feedback is logged (syslog).
+ */
+struct rdn_uvd_dbg {
+   struct rdn_bo *bo[8];
+   unsigned offset[8], cmd[8], n;
+};
+
+static bool rdn_uvd_debug(void)
+{
+   static int on = -1;
+
+   if (on < 0)
+      on = getenv("RDN_UVD_DEBUG") != NULL || access("/tmp/rdnavc.debug", F_OK) == 0;
+   return on;
+}
 
 /*
  * Replace the buffer references of a stream by addresses, as the radeon
@@ -1139,10 +1160,12 @@ static struct {
  * the low and high words of the 40-bit address. False if the stream is not
  * made of register writes or names a buffer the decoder cannot reach.
  */
-static bool rdn_uvd_relocate(struct rdn_cs *cs, struct radeon_cmdbuf *rcs)
+static bool rdn_uvd_relocate(struct rdn_cs *cs, struct radeon_cmdbuf *rcs, struct rdn_uvd_dbg *dbg)
 {
    uint32_t *w = rcs->current.buf;
    unsigned i = 0, data0 = ~0u;
+   struct rdn_bo *last_bo = NULL;
+   unsigned last_off = 0;
 
    while (i < rcs->current.cdw) {
       unsigned type = w[i] >> 30;
@@ -1175,9 +1198,16 @@ static bool rdn_uvd_relocate(struct rdn_cs *cs, struct radeon_cmdbuf *rcs)
             if (bo->region == RDN_GART || bo->region == RDN_USER || w[data0] >= bo->base.size)
                return false;
             address = rdn_buffer_get_virtual_address(&bo->base) + w[data0];
+            last_bo = bo;
+            last_off = w[data0];
             w[data0] = (uint32_t)address;
             w[at] = (uint32_t)(address >> 32);
             data0 = ~0u;
+         } else if (reg == RDN_UVD_GPCOM_VCPU_CMD && dbg && last_bo && dbg->n < 8) {
+            dbg->bo[dbg->n] = last_bo;
+            dbg->offset[dbg->n] = last_off;
+            dbg->cmd[dbg->n++] = w[at] >> 1;
+            last_bo = NULL;
          }
       }
       i += 1 + count;
@@ -1193,9 +1223,11 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    struct rdn_pending_ib *ib;
    struct rdn_fence *fence;
    struct rdn_busy busy = { 0, false, true };
+   struct rdn_uvd_dbg dbg;
    uint64_t offset, ib_size;
    int r = 0;
 
+   memset(&dbg, 0, sizeof(dbg));
    /* Pad to 16 words, as radeon_drm_cs.c does for the decoder. */
    while (rcs->current.cdw & 15)
       rcs->current.buf[rcs->current.cdw++] = 0x80000000; /* type2 nop packet */
@@ -1213,7 +1245,7 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
       /* Nothing to run. */
       FREE(ib);
       fence->reached = true;
-   } else if (!rdn_uvd_relocate(cs, rcs)) {
+   } else if (!rdn_uvd_relocate(cs, rcs, &dbg)) {
       fprintf(stderr, "rdn: video decoder commands refused: they name memory it cannot reach\n");
       FREE(ib);
       fence->reached = true;
@@ -1252,8 +1284,28 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
          ib->busy = busy;
          list_addtail(&ib->list, &ws->pending_ibs);
          simple_mtx_unlock(&ws->lock);
-         if (rdn_sync_mode() & 1)
+         if ((rdn_sync_mode() & 1) || rdn_uvd_debug())
             rdn_fence_wait(ws, fence, OS_TIMEOUT_INFINITE);
+         if (rdn_uvd_debug()) {
+            unsigned k;
+
+            ws->dev->sync_for_cpu(ws->dev);
+            for (k = 0; k < dbg.n; k++) {
+               struct rdn_bo *bo = dbg.bo[k];
+               const uint8_t *p;
+
+               if (bo->region == RDN_GART || bo->region == RDN_USER || dbg.cmd[k] > 3)
+                  continue;
+               if (dbg.cmd[k] == 1 || dbg.cmd[k] == 2)
+                  continue;
+               p = (const uint8_t *)ws->dev->aperture + bo->offset + dbg.offset[k];
+               syslog(LOG_NOTICE, "RadeonNIAVC: uvd %s at 0x%llx: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+                      dbg.cmd[k] == 0 ? "message" : "feedback",
+                      (unsigned long long)(bo->offset + dbg.offset[k]), p[0], p[1], p[2], p[3], p[4], p[5], p[6],
+                      p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19], p[20],
+                      p[21], p[22], p[23]);
+            }
+         }
       }
    }
 
