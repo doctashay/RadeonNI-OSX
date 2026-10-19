@@ -943,6 +943,15 @@ static int do_uvdonly(struct linux_card *lc, struct rdn_card *card, uint32_t fla
 			 getenv("RDN_VCPU_OFF") ? (uint32_t)strtoul(getenv("RDN_VCPU_OFF"), NULL, 0) : 0x40000,
 			 200u << 20, 4096, flags);
 	printf("uvd init returned %d; UVD_STATUS %08x\n", r, (unsigned)rdn_rreg(card, UVD_STATUS));
+	if (getenv("RDN_MIN")) {
+		/* Linux's firmware changes 40 bytes at offset 320 of its image and writes a word after it when it runs */
+		uint32_t base = getenv("RDN_VCPU_OFF") ? (uint32_t)strtoul(getenv("RDN_VCPU_OFF"), NULL, 0) : 0x40000, k;
+
+		printf("fw window after the start: +fw_size %08x; offset 320..:", (unsigned)rdn_vram_read32(&accel, base + fw_size));
+		for (k = 0; k < 10; k++)
+			printf(" %08x", (unsigned)rdn_vram_read32(&accel, base + 320 + k * 4));
+		printf("\n");
+	}
 	if (!r) {
 		uint32_t ib = (200u << 20) + 0x20000;
 
