@@ -23,6 +23,13 @@ below are the paper check and the failed first attempts, kept for the record; th
 5. Ring: submissions padded to 16 dwords with `UVD_NO_OP` (the controller fetches in 16-dword blocks); the
    fence of the evergreen hardware is `uvd_v2_2_fence_emit` (`UVD_CONTEXT_ID` = sequence number, the VCPU stores
    it at the DATA0/DATA1 address on command 0, command 2 traps).
+3b. **The RLC microcode (`BTC_rlc.bin`, 768 big-endian words) must be uploaded before `RLC_CNTL` = 1**, as `evergreen_rlc_resume`
+   does (`RLC_CNTL` = 0, the eight RLC_HB/MC/UCODE_CNTL registers to 0, 768 x `RLC_UCODE_ADDR`/`RLC_UCODE_DATA`, address 0, enable).
+   The card keeps that microcode across a warm reboot and a bus reset and loses it only with power. On the server it was
+   already there from earlier uploads, so "RLC_CNTL = 1 alone" seemed to be enough; after the card had been out of power
+   (moved to the G5) the VCPU never started (firmware window untouched, `UVD_STATUS` 0). Kext: personality key `FW_RLC`
+   (`RDN_UVD=1` in `scripts/kext.sh`), `rdn_uvd_set_rlc_ucode()`. Found 2026-10-19 on the G5 after ruling out Leopard vs Tiger,
+   Open Firmware's POST, clocks, MC microcode and its order, the firmware blob, byte order, display traffic, Quartz Extreme.
 In code: `RDN_UVD_F_MINIMAL` (and `RDN_UVD_F_LMI`) in `hw/rdn_uvd.c`; `rdnuvd init 3072` in the guest.
 `UVD_STATUS` bit 1 alone is not proof (it also appears when the firmware does not run); the firmware modifies its own
 window (40 bytes at image offset 320 become 7e706b85 611a2c7d 3062109e 30260b85 00031e40, as under radeon) and the ring test

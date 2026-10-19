@@ -649,6 +649,9 @@ IOReturn RadeonNIAccel::submit(UInt32 offset, UInt32 words, UInt32 *fence)
  */
 IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 {
+	/* No flags: the start that works (docs/UVD.md); other values select the older variants, for experiments. */
+	if (!flags)
+		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;
 	uint32_t ref = 0;
 	UInt32 vcpuBytes;

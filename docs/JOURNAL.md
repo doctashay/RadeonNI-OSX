@@ -7163,3 +7163,14 @@ answer; a Linux test with the window in GTT could not be made (radeon's allocati
 Left: the G5 (VRAM relocation under a scan-out that Open Firmware left running needs care: the kext's start-up on a
 posted card), the UVD message layer (create/decode/destroy session; `radeon_uvd.c` and Mesa's `radeon_uvd.c`), the
 winsys in Mesa, the PowerVLC `vlc_va` module and the QuickTime component.
+
+2026-10-19 (G5): UVD WORKS ON THE REAL G5 (Tiger 10.4.11 volume, Tiger-built kext; Leopard to follow). The cause of the G5-only failure
+was the RLC microcode: the card retains it across warm reboots and loses it with power, so every server test (the card
+had had `BTC_rlc.bin` uploaded earlier that day) passed with `RLC_CNTL` = 1 alone and the G5 (the card had been unpowered while
+moved) did not. The minimisation of 2026-10-18 therefore wrongly dropped the upload. With `FW_RLC` in the personality and
+`rdn_uvd_set_rlc_ucode`, `rdnuvd init` on the G5: `UVD_STATUS` 2, ring test succeeded, `rdnuvd test` fence reached. Ruled out on the G5
+on the way (none made a difference): Leopard vs Tiger, Open Firmware hook (use-nvramrc? false: the kext's own cold POST), a second ASIC_Init, boot
+clocks, MC microcode on/off and order, the firmware blob (md5), firmware byte order (addr ^ 3, ^ 2), display reads on/off (the
+screen goes pink then black meanwhile), Quartz Extreme/GL personality keys, hot-plug/DPMS threads, the UVD PLL state at POST (same as Linux's trace).
+Lesson: a test that only passes on a card that has been through other drivers is not a cold test; the card keeps RLC (and
+probably other SRAM) state until it loses power.
