@@ -233,6 +233,14 @@ int main(int argc, char **argv)
 							  kICMDecompressionSessionOptionsPropertyID_DisplayOrderRequired,
 							  sizeof(order), &order);
 	}
+	{
+		/* Apple's decoder skips work (the loop filter on some pictures) at lower accuracy: ask for all of it */
+		CodecQ accuracy = codecMaxQuality;
+
+		ICMDecompressionSessionOptionsSetProperty(options, kQTPropertyClass_ICMDecompressionSessionOptions,
+							  kICMDecompressionSessionOptionsPropertyID_Accuracy,
+							  sizeof(accuracy), &accuracy);
+	}
 	if (component_path || force_apple) {
 		ComponentDescription cd = { decompressorComponentType, 'avc1', component_path ? 'RdNI' : 'appl', 0, 0 };
 		Component c = FindNextComponent(NULL, &cd);
