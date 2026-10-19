@@ -184,6 +184,8 @@ pascal ComponentResult RDNAVC_GetDecompressLatency(RDNAVCGlobals *storage, TimeR
 	memset(latency, 0, sizeof(*latency));
 	latency->value.lo = (pictures + 1) * 1000 / 24;
 	latency->scale = 1000;
+	if (debug())
+		say("GetDecompressLatency: %u pictures, %ld ms", pictures, (long)latency->value.lo);
 	return noErr;
 }
 
