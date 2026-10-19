@@ -377,9 +377,13 @@ static int dev_uvd_fence_wait(struct rdn_device *dev, uint32_t fence, uint64_t t
 	uint64_t ms = timeout_ns / 1000000;
 	int reached = 0;
 
-	/* As for the 3D engine (RDN_FENCE_SPIN): look for a while before the kext's sleeping wait. */
+	/*
+	 * Look for a while before the kext's sleeping wait, whose polls are a millisecond or more
+	 * apart: a small picture is decoded in well under that. RDN_FENCE_SPIN (microseconds) as for
+	 * the 3D engine; 2 ms without it.
+	 */
 	if (spin_us < 0)
-		spin_us = env_number("RDN_FENCE_SPIN");
+		spin_us = getenv("RDN_FENCE_SPIN") ? env_number("RDN_FENCE_SPIN") : 2000;
 	if (spin_us && timeout_ns) {
 		uint64_t start = now_us();
 
