@@ -7240,3 +7240,17 @@ plane is a 8-bit render target in system memory: about 20 ms a megabyte) and now
 buffer), which also keeps the chroma bytes in order. Left: the consumers (PowerVLC is not installed on the G5 now; the zips are in `media/`), pipelining
 decode and read-out (the card does both at once), PAFF, long-term references, kext checks of the command addresses.
 
+## 2026-10-19 (G5, night): the QuickTime component decodes through QuickTime itself, bit-exactly
+
+The user chose the QuickTime component first. `quicktime/` (see `docs/UVD.md`, "The QuickTime component"): a sub-codec of the base image decompressor, built on the G5
+with Xcode's gcc/Rez, the registration modelled on DeRez of Apple's QuickTimeH264.component. `tools/guest/qtdecode.c` decodes an MP4 through an ICMDecompressionSession
+with the component registered for that process only (no install) and compares with ffmpeg. Bumps on the way, each a fact for the next component: the ICM's
+non-scheduled display mode needs `ICMDecompressionSessionSetNonScheduledDisplayTime` (a flush reports every still-queued frame as an error -1); the session
+reads the source data later (own buffer per sample); ffmpeg's raw-.h264-to-MP4 copy has no B-picture reordering in its time stamps, so the "display order" was decode
+order (vectors are now encoded into MP4 first); and QuickTime drops the anchor pictures of a B pyramid unless the sub-codec says
+`subCodecSupportsScheduledBackwardsPlaybackWithDifferenceFrames` (queue size, latency, frame types and the other capabilities made no difference; Apple's own decoder does
+not lose them). Result: 12 vectors identical to ffmpeg's sample for sample, 720p and 1080p with B pyramids too; interlaced declined in Preflight without opening
+the card. Apple's software decoder on the same 720p/1080p files is not bit-exact (16 of 40 and 2 of 30 pictures: it skips the loop filter on some) and slower.
+Left: install it (needs the user's yes: it changes H.264 decoding for every QuickTime program), see which decompressor QuickTime picks, colours and playback in
+QuickTime Player (the user's eyes), Tiger, field pictures, PowerVLC.
+

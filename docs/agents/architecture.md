@@ -53,6 +53,8 @@ Moved out of CLAUDE.md. Read before changing code in `hw/`, `kext/`, `gld/`,
   patch 0014 for the message byte order), `video/rdnvd_h264.c` is the H.264 layer without any card or Mesa in it
   (parameter sets, slice headers, POC, reference marking, DPB, output order) and `mesa/target/rdnvd.c` is the library
   (`rdnvd.h`) that ties them together; `mesa/tests/rdn_uvdtest.c` is its test.
+- `quicktime/` is the QuickTime image decompressor component for H.264 on top of `rdnvd` (built on the G5 with
+  `scripts/qt-component.sh`; tested with `tools/guest/qtdecode.c`).
 - `kext/RadeonNI/RadeonNIAccel.cpp` is the accelerator service and its user
   client; `hw/rdn_user.h` is the interface user space sees.
   `mesa/target/rdn_device_darwin.c` is Mesa's side of it. `mesa/darwin8/`

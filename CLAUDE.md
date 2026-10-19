@@ -36,8 +36,8 @@ machine: Power Mac G5 Late 2005. Development runs Tiger under
 - **Phase 2 (acceleration) works**: Mesa 26.2.4 `r600` on the card behind a
   `gld*` GL bundle and a kernel half in `hw/`; Quartz Extreme, Core Image
   and full-screen/windowed GL games run on the G5.
-- Phase 3 (video decode, `docs/UVD.md`): UVD runs on the G5 and the `rdnvd` library decodes H.264
-  bit-exactly; PowerVLC and QuickTime consumers are not built.
+- Phase 3 (video decode, `docs/UVD.md`): UVD runs on the G5, the `rdnvd` library decodes H.264 bit-exactly and
+  a QuickTime component (`quicktime/`) uses it (tested through QuickTime, not installed); PowerVLC is not built.
 - The real G5 holds the card and runs the installed kext. The user plays
   games on it: never `killall` a program there, and a window server restart
   needs the user's yes.

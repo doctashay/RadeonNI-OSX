@@ -105,6 +105,36 @@ system memory at some 50 MB/s and turns the chroma bytes around; the DMA copy is
 MMCO (implemented from the spec), frame number gaps, a change of resolution inside a stream, the length-prefixed and `avcC` input,
 field pictures (refused).
 
+## The QuickTime component (2026-10-19)
+
+`quicktime/` builds `RadeonNIAVC.component`: an image decompressor ('imdc') for 'avc1' (H.264), a sub-codec of QuickTime's base image
+decompressor, on top of `rdnvd`. Build on the G5 with its own Xcode (gcc 4.0 with the 10.4u SDK, so one build runs on Tiger and
+Leopard; Rez makes the registration resource): `scripts/qt-component.sh build` (sends the sources, `rdnvd.h` and
+`librdnvd.dylib` to `~/qt-build`; the library keeps the bundle's copy beside the executable, install name `@loader_path`; Tiger has no @rpath).
+Registration is a `thng` resource in `Contents/Resources/RadeonNIAVC.rsrc` (data fork) in the layout Apple's own H.264 decoder has (found
+with DeRez on its component): 'imdc'/'avc1'/'RdNI', flags 0x10000420 (thread safe, `codecInfoDoes32|codecInfoDoesTemporal`), a 'dlle'
+resource naming the entry `RDNAVC_ComponentDispatch`, 'thnr'/'cpix' listing the pixel format it draws ('2vuy'). The dispatch uses
+`ComponentDispatchHelper.c` from the SDK (included from there, not copied) with our own selector table (`RadeonNIAVCDispatch.h`).
+How it works (found from the SDK headers and Apple's retired ExampleIPBCodec sample, then by testing):
+- `Preflight`: reads the `avcC` of the image description, asks `rdnvd_h264_supported()` (no card touched), then opens a session with it
+  (the decoder and its memory are made now). Anything the card does not decode (not 4:2:0 at 8 bits, interlaced coding, over level 4.2,
+  no card, no UVD firmware, not enough video memory) returns `codecUnimpErr`, so QuickTime uses another decompressor. Offers '2vuy' only.
+- `BeginBand` gives the frame type from the sample's first slice (IDR key, non-reference droppable, else difference). `DecodeBand` (QuickTime 7:
+  samples in decoding order) runs `rdnvd_h264_decode_au()` and keeps that sample's picture in the per-frame record; `DrawBand` (display order)
+  reads it into QuickTime's buffer as 2vuy (`rdnvd_frame_read_2vuy`: CP DMA to system memory, then U Y V Y words, chroma rows repeated);
+  `EndBand` releases it. One process-wide lock around rdnvd.
+- Capabilities (`Initialize`): out-of-order display times, DecodeBand for all frames, multi-buffer aware, decode smoothing, draw in decoding
+  order, and **`subCodecSupportsScheduledBackwardsPlaybackWithDifferenceFrames`**: without it QuickTime drops the anchor of a B pyramid
+  (decoded five pictures before it is shown, 8 of 40 pictures lost) as "needs requeueing"; found by switching every capability on and off.
+- QuickTime does not copy the data given to `ICMDecompressionSessionDecodeFrame`: a program that reuses its buffer gets garbage.
+Test without installing anything: `tools/guest/qtdecode.c` (builds on the G5) registers the bundle for its own process, forces it, decodes an MP4 through an
+`ICMDecompressionSession` and compares every picture with ffmpeg's decode (`scripts/uvd-testvec.sh` now encodes into MP4 first, so the display order
+is in the time stamps; the raw .h264 muxed into MP4 by ffmpeg has none). Results on the G5 (Leopard, QuickTime 7.7): all 12 vectors with frame pictures
+identical sample for sample, 1280x720 and 1920x1080 with B pyramids too, and the interlaced one declined; Apple's own decoder on the same streams: bit-exact
+for the small ones but not at 720p and 1080p (16 of 40 and 2 of 30 pictures differ: it skips loop filtering on some pictures), and slower (73 ms against 48 ms a
+1080p sample, test overhead included). Not yet tried: the component installed, so that QuickTime and its programs choose it themselves (which of two
+decompressors for 'avc1' QuickTime picks is not documented; `/Library/QuickTime` is the place), colours and display in QuickTime Player, Tiger.
+
 ## Why
 
 PowerVLC 2.1.0 on the G5 decodes H.264 on the CPU (ffmpeg). 1080p H.264 drops nearly every frame
