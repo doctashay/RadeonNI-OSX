@@ -21,6 +21,7 @@
 #include "util/u_endian.h"
 #include "util/u_inlines.h"
 #include "r600/r600_pipe_common.h"
+#include "r600/r600_pipe.h"
 
 #include "rdnvd.h"
 #include "video/rdnvd_h264.h"
@@ -32,6 +33,8 @@ extern struct pipe_screen *osmesa_create_screen(void);
 struct rdnvd {
 	struct pipe_screen *screen;
 	struct pipe_context *ctx;
+	/* System memory (the GART) the card copies a picture into for the CPU to read. */
+	struct pipe_resource *staging;
 };
 
 /* A decoded picture: a video buffer, and who holds it (the parser while it is a reference or waits for output, the caller). */
@@ -386,6 +389,7 @@ RDNVD_PUBLIC void rdnvd_close(struct rdnvd *d)
 {
 	if (!d)
 		return;
+	pipe_resource_reference(&d->staging, NULL);
 	d->ctx->destroy(d->ctx);
 	free(d);
 }
@@ -463,6 +467,50 @@ static double now_ms(void)
 	return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+/*
+ * The card's DMA engine copies the two planes' bytes as they are into system memory (3 MB a picture of
+ * 1080p in about a millisecond), and the CPU reads that. The 3D engine's copy of an 8-bit texture into
+ * system memory is some 20 ms per megabyte, and turns the two bytes of a chroma texel around.
+ */
+static int frame_read_dma(struct rdnvd_frame *frame, struct pipe_resource *res[3], uint8_t *y, size_t y_stride,
+			  uint8_t *uv, size_t uv_stride)
+{
+	struct frame_buf *f = (struct frame_buf *)frame;
+	struct rdnvd *d = f->d;
+	struct r600_texture *ty = r600_as_texture(res[0]), *tc = r600_as_texture(res[1]);
+	const struct legacy_surf_level *ly = &ty->surface.u.legacy.level[0], *lc = &tc->surface.u.legacy.level[0];
+	unsigned y_pitch = ly->nblk_x, c_pitch = lc->nblk_x * 2;
+	unsigned y_size = y_pitch * frame->coded_height, c_size = c_pitch * (frame->coded_height / 2);
+	unsigned c_at = (y_size + 255) & ~255u, total = c_at + c_size;
+	struct pipe_transfer *xfer;
+	const uint8_t *src;
+	unsigned row;
+	unsigned cw = (frame->width + 1) / 2, ch = (frame->height + 1) / 2;
+
+	if (!d->staging || d->staging->width0 < total) {
+		pipe_resource_reference(&d->staging, NULL);
+		d->staging = pipe_buffer_create(d->screen, 0, PIPE_USAGE_STAGING, total + (total >> 2));
+		if (!d->staging)
+			return RDNVD_NO_MEMORY;
+	}
+	r600_cp_dma_copy_buffer((struct r600_context *)d->ctx, d->staging, 0, res[0],
+				(uint64_t)ly->offset_256B * 256, y_size);
+	r600_cp_dma_copy_buffer((struct r600_context *)d->ctx, d->staging, c_at, res[1],
+				(uint64_t)lc->offset_256B * 256, c_size);
+	/* Mapping for reading flushes the commands and waits for them. */
+	src = pipe_buffer_map_range(d->ctx, d->staging, 0, total, PIPE_MAP_READ, &xfer);
+	if (!src)
+		return RDNVD_FAILED;
+	for (row = 0; row < frame->height; row++)
+		memcpy(y + row * y_stride, src + (size_t)(row + frame->crop_top) * y_pitch + frame->crop_left,
+		       frame->width);
+	for (row = 0; row < ch; row++)
+		memcpy(uv + row * uv_stride,
+		       src + c_at + (size_t)(row + frame->crop_top / 2) * c_pitch + (frame->crop_left / 2) * 2, cw * 2);
+	pipe_buffer_unmap(d->ctx, xfer);
+	return 0;
+}
+
 RDNVD_PUBLIC int rdnvd_frame_read(struct rdnvd_frame *frame, uint8_t *y, size_t y_stride, uint8_t *uv,
 				  size_t uv_stride)
 {
@@ -485,6 +533,19 @@ RDNVD_PUBLIC int rdnvd_frame_read(struct rdnvd_frame *frame, uint8_t *y, size_t 
 	f->buf->get_resources(f->buf, res);
 	if (!res[0] || !res[1])
 		return RDNVD_FAILED;
+	{
+		static int dma = -1;
+
+		if (dma < 0)
+			dma = ((struct r600_common_screen *)f->d->screen)->has_cp_dma && !getenv("RDNVD_READ_BLIT");
+		if (dma) {
+			int r = frame_read_dma(frame, res, y, y_stride, uv, uv_stride);
+
+			if (profile)
+				fprintf(stderr, "rdnvd read (DMA): %.2f ms\n", now_ms() - t0);
+			return r;
+		}
+	}
 
 	u_box_2d(frame->crop_left, frame->crop_top, frame->width, frame->height, &box);
 	src = ctx->texture_map(ctx, res[0], 0, PIPE_MAP_READ, &box, &xfer);
