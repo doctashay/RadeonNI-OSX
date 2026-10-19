@@ -7258,3 +7258,17 @@ for the supported streams (bit-exact at 128x96 and 720p) and Apple's decoder for
 picture with the component against 30.8 ms with Apple's decoder; 1080p24 29.3 ms against 69.5 ms (34 against 14 pictures a second). Test clips for the user's eyes in `~/Movies/RadeonNI-test/`
 on the G5 (colour bars tagged BT.709, 720p and 1080p motion).
 
+## 2026-10-19 (G5, early morning): the user's first look: corrupt, then green. Causes and fixes
+
+Reported after the install: the 1080p clip is "artifacted", the rainbow works for a second and then flickers to green. system.log showed QuickTime Player taking the stream four times (four instances) and
+quicklookd (the Finder's thumbnails) taking others; `qtdecode` twice at once reproduced it (every picture wrong, no error); two `rdn_uvdtest` at once too, so not QuickTime. Winsys: "commands refused"
+for buffers in system memory: the visible heap (222 MB) was exhausted by one decoder and a half (125 MB at 1080p each) and new buffers overflowed into the GART silently. A first fix put the DPB in hidden
+video memory (patch 0015 as first written): pictures all wrong, and afterwards every decode on the card failed (a wrapped write? the firmware window itself checked out: 69 bytes differ, the usual) until the G5
+was restarted: reverted; the decoder reaches only the first 256 MB. Second cause, found after that restart: after roughly ten sessions the card decodes nothing; `rdn_uvdtest -L n` showed the firmware's ten slots
+filling up with sessions of programs that quit without destroying them. Fixes (see docs/UVD.md, "What went wrong in QuickTime Player"): decoder made at the first picture, `rdnvd_h264_room()` in Preflight, pictures made with
+the decoder, shareable video buffers (patch 0015), no GART overflow for shareable buffers, and in the kext a per-client follow-up of create/destroy messages that ends the leftovers when a client goes (a first version
+restarted the block when the last client left: QuickLook's daemon never leaves). G5 restarted three times for this with the user's yes; the user then said to stop asking about restarts.
+Checked: leaks of 8, 11, 12 sessions and a fresh program decodes right afterwards (and "ended n sessions" in the log); two 1080p decoders at once: the first exact, the second declined (library: refused with an error;
+QuickTime: Apple's decoder); `qtdecode -t` (scheduled real-time playback) exact for 128x96 to 1080p. Also: the PC lost the server's name (a VPN replaced resolv.conf): `~/.ssh/config` has `HostName arch-server.local`
+for it now (copy of the old file next to it).
+

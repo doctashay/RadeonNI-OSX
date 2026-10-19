@@ -138,6 +138,27 @@ compared (`qtdecode movie -`, 30 s clips of 720p30 and 1080p24 with B pyramids):
 decoder, 29.3 ms (34 a second) at 1080p against 69.5 ms (14 a second): 1080p24 plays in real time only with the component. Not yet tried: colours and display in
 QuickTime Player (the user's eyes: `~/Movies/RadeonNI-test/` on the G5 has a colour-bar clip and 720p and 1080p motion clips), CPU load while playing, Tiger.
 
+### What went wrong in QuickTime Player, and the rules that came out of it (2026-10-19)
+
+The user's first look at the installed component (1080p clip): corrupt pictures, then green. Reproduced headlessly (two 1080p decodes at once), causes:
+1. **Memory.** Everything the decoder touches must lie in the first 256 MB of video memory (the aperture): hidden video memory does not work (tried with the picture
+   buffer there: pictures all wrong; the decoder masks addresses to its segment). The kext's visible heap is 222 MB; a 1080p decoder takes about 125 MB (Mesa's legacy
+   sizing: 17 pictures and their contexts, 53+27 MB, plus the pictures it hands out and four bitstream buffers), a 720p one about 50 MB. QuickTime Player opens four
+   component instances for one movie. When the heap was full the winsys put new buffers in system memory behind the GART, which the decoder cannot read, and the decode
+   "succeeded" with garbage. Now: the decoder is made by the first picture (`rdnvd_h264_prepare`, called from BeginBand), not by Preflight; Preflight asks
+   `rdnvd_h264_room()` (can the card take a decoder of this size now: tries the two allocations and frees them) and declines, so QuickTime uses Apple's decoder; the pictures
+   the decoder will hand out are made when it is (a stream is refused at the start, not at its fifth picture); r600's video buffers are marked shareable (Mesa patch
+   0015, `PIPE_BIND_SHARED`) and the winsys never overflows a shareable buffer into the GART (the allocation fails instead). One 1080p decoder at a time on this card
+   (a second program decoding 1080p gets Apple's decoder); several 720p ones fit.
+2. **Sessions.** The firmware has ten decoder sessions, made by messages from the programs. QuickTime programs end without closing their decoders (quicklookd, QuickTime Player
+   at quit), and a session nobody destroys stays: after ten, the next decoder silently decodes nothing (pictures never written). A restart of the block when the last client
+   leaves is not enough (QuickLook's daemon keeps a connection open). The kext now follows each client's create and destroy messages (`uvdScan`: the message address is in GPCOM_VCPU_DATA0/1,
+   the write of 0 to GPCOM_VCPU_CMD says it is there; type at byte 4, stream handle at byte 8, little-endian) and, when a client goes, ends its leftover sessions with
+   a destroy message of its own (`uvdDestroy`, like Linux's radeon_uvd_get_destroy_msg). `rdn_uvdtest -L n` leaks n sessions to test it.
+3. Testing: `qtdecode -t` plays a movie against a running time base through an ICMDecompressionSession (scheduled, threads, pictures late or dropped, each checked by its own
+   display time): all pictures shown in time and identical to ffmpeg's up to 1080p, also with Apple's decoder as the control. `tools/guest/qtplay.c` (movie with a visual
+   context) shows pixel buffers whose values are not the decoder's (QuickTime converts them), so it cannot compare; it is kept for timing.
+
 ## Why
 
 PowerVLC 2.1.0 on the G5 decodes H.264 on the CPU (ffmpeg). 1080p H.264 drops nearly every frame
