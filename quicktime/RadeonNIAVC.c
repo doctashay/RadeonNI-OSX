@@ -211,6 +211,24 @@ pascal ComponentResult RDNAVC_Initialize(RDNAVCGlobals *storage, ImageSubCodecDe
 		 */
 		cap->subCodecSupportsDecodeSmoothing = true;
 		cap->subCodecSupportsDrawInDecodeOrder = true;
+		if (getenv("RDNAVC_CAPS")) {
+			int v = atoi(getenv("RDNAVC_CAPS"));
+
+			cap->subCodecSupportsScheduledBackwardsPlaybackWithDifferenceFrames = (v & 1) != 0;
+			cap->subCodecNeedsHelpReportingNonDisplayableFrames = (v & 2) != 0;
+			if (v & 4)
+				cap->baseCodecShouldCallDecodeBandForAllFrames = false;
+			if (v & 8)
+				cap->subCodecSupportsDecodeSmoothing = false;
+			if (v & 16)
+				cap->subCodecSupportsDrawInDecodeOrder = false;
+			if (v & 32)
+				cap->canAsync = false;
+			if (v & 64)
+				cap->subCodecIsMultiBufferAware = false;
+			if (v & 128)
+				cap->subCodecSupportsOutOfOrderDisplayTimes = false;
+		}
 	}
 	return noErr;
 }
