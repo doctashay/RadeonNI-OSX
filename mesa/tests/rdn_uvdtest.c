@@ -11,7 +11,9 @@
  * 1280x720 decoder (what the QuickTime component does when a program opens a movie: each asks takes the memory and gives it back).
  * -A decodes one access unit at a time with rdnvd_h264_decode_au and reads each picture out as it is decoded, as the QuickTime
  * component does (pictures come in decoding order and are compared with the reference by their order of appearance in the stream's
- * display order, so only streams without B pictures can be checked: the result then says how many came out right); -g ms waits that
+ * display order, so only streams without B pictures can be checked: the result then says how many came out right); -P ms waits that long
+ * after every access unit and prints the time of day and the verdict of each (one session for a long time, to watch it while other things
+ * happen on the machine); -g ms waits that
  * long after the first access unit (QuickTime Player decodes a movie's first picture when it opens it, and the rest when play is pressed) (what QuickTime programs do: the card's
  * firmware holds ten sessions, and the kext starts the block again when the last program that used it is gone).
  *
@@ -24,6 +26,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "rdnvd.h"
@@ -134,7 +137,7 @@ int main(int argc, char **argv)
 {
 	const char *stream_path = NULL, *ref_path = NULL, *out_path = NULL;
 	unsigned count = 1, pass, nal_length_size = 0, pictures = 0;
-	int leak = 0, room = 0, per_au = 0, gap_ms = 0;
+	int leak = 0, room = 0, per_au = 0, gap_ms = 0, pace_ms = 0;
 	size_t stream_size, ref_size;
 	uint8_t *stream, *ref;
 	struct rdnvd *d;
@@ -155,6 +158,8 @@ int main(int argc, char **argv)
 			per_au = 1;
 		else if (!strcmp(argv[a], "-g") && a + 1 < argc)
 			gap_ms = atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-P") && a + 1 < argc)
+			pace_ms = atoi(argv[++a]);
 		else if (!stream_path)
 			stream_path = argv[a];
 		else if (!ref_path)
@@ -263,6 +268,18 @@ int main(int argc, char **argv)
 					printf("first access unit decoded in %.1f ms; waiting %d ms\n", now_ms() - tdec, gap_ms);
 					fflush(stdout);
 					usleep((useconds_t)gap_ms * 1000);
+				}
+				if (pace_ms) {
+					/* one session for a long time, no restart of the block: a line with the time of day for each access unit */
+					struct timeval tv;
+					struct tm *t;
+
+					gettimeofday(&tv, NULL);
+					t = localtime(&tv.tv_sec);
+					printf("%02d:%02d:%02d.%03d au %u %s\n", t->tm_hour, t->tm_min, t->tm_sec, (int)(tv.tv_usec / 1000), au,
+					       r || !frame ? "NOT DECODED" : "ok");
+					fflush(stdout);
+					usleep((useconds_t)pace_ms * 1000);
 				}
 				au++;
 				au_start = next;
