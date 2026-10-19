@@ -81,6 +81,7 @@ struct rdnvd_session {
 	size_t replay_bytes;
 	int replay_valid;			/* 0 once too much came without an IDR picture: nothing to start over from */
 	int stalled;				/* the firmware did not answer the decode that was just run */
+	unsigned failed_recoveries;		/* starting over in a row that did not bring the decoder back */
 };
 
 /* ---- surfaces ---------------------------------------------------------------- */
@@ -756,15 +757,23 @@ RDNVD_PUBLIC int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *da
 
 	replay_add(s, data, size, nal_length_size);
 	r = decode_unit(s, data, size, nal_length_size);
-	/* a stalled firmware is started again and shown the stream again, a few times at most */
+	/*
+	 * A stalled firmware is started again and shown the stream again, a few times at most. When that has not helped
+	 * three times in a row it is not tried again (each start takes a second): the data is decoded once, and anything
+	 * that works brings the tries back.
+	 */
 	for (attempt = 0; s->stalled; attempt++) {
-		if (attempt == 3) {
+		if (attempt == 3 || s->failed_recoveries >= 3) {
 			s->stalled = 0;
 			r = RDNVD_FAILED;
 			break;
 		}
 		r = recover(s);
+		if (s->stalled || r)
+			s->failed_recoveries++;
 	}
+	if (!r)
+		s->failed_recoveries = 0;
 	/* The picture of this data (not of display order): the first one decoded. */
 	*frame = s->captured ? &s->captured->frame : NULL;
 	if (s->captured) {
