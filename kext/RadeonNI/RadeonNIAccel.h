@@ -164,9 +164,6 @@ private:
 	UInt32 fUvdFlags;
 	uint32_t fUvdRef;
 	bool fUvdDirty;
-	/* When the program last asked for a reset, and with what level: the same ask again soon is answered with a deeper one. */
-	UInt64 fUvdResetAtMs;
-	UInt32 fUvdResetLevel;
 	/* A page of video memory for messages of the kext's own. */
 	UInt32 fUvdScratch;
 	/* The session messages in a stream of commands: type (0 create, 2 destroy) and handle of each. */

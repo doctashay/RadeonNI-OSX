@@ -628,13 +628,6 @@ static void vcpu_stop(struct rdn_uvd *uvd)
 		   CSM_SOFT_RESET | CXW_SOFT_RESET | TAP_SOFT_RESET | LMI_UMC_SOFT_RESET);
 		mdelay(card, 5);
 	}
-	if (reset_level >= 2) {
-		/* the whole block, as evergreen_gpu_soft_reset() does for a UVD that hung */
-		wr_p(card, SRBM_SOFT_RESET_UVD_REG, SOFT_RESET_UVD, ~SOFT_RESET_UVD);
-		mdelay(card, 1);
-		wr_p(card, SRBM_SOFT_RESET_UVD_REG, 0, ~SOFT_RESET_UVD);
-		mdelay(card, 5);
-	}
 	/* disable VCPU clock */
 	wr(card, UVD_VCPU_CNTL, 0x0);
 	/* unstall UMC and register bus */

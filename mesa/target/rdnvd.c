@@ -739,14 +739,18 @@ static int recover(struct rdnvd_session *s)
 		return RDNVD_FAILED;
 	syslog(LOG_NOTICE, "RadeonNIAVC: the video decoder stopped answering; starting it again and showing it %u pictures again",
 	       s->replay_n);
-	rdnvd_h264_parser_free(s->parser);
-	s->parser = NULL;
 	codec_close(s);
+	/* when the firmware cannot be started the session stays as it is (parser and all): the next data makes a decoder again */
 	if (!rdn_target_uvd_reset(&epoch))
 		return RDNVD_FAILED;
-	s->parser = rdnvd_h264_parser_new(&session_callbacks, s);
-	if (!s->parser)
-		return RDNVD_NO_MEMORY;
+	{
+		struct rdnvd_h264 *parser = rdnvd_h264_parser_new(&session_callbacks, s);
+
+		if (!parser)
+			return RDNVD_NO_MEMORY;
+		rdnvd_h264_parser_free(s->parser);
+		s->parser = parser;
+	}
 	if (s->avcc) {
 		if (rdnvd_h264_parser_avcc(s->parser, s->avcc, s->avcc_size) < 0)
 			return RDNVD_BAD_STREAM;

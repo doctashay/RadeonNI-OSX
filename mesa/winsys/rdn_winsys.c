@@ -1298,6 +1298,12 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
          }
          memcpy((uint8_t *)ws->dev->aperture + offset, rcs->current.buf,
                 rcs->current.cdw * 4);
+         /*
+          * The video memory window is write-combined (uncached, not guarded): the kext's eieio does not order its
+          * stores against the doorbell, only sync does. The decoder reads its commands, the message and the
+          * bitstream as soon as the doorbell rings; a stale read of any of them can wedge it.
+          */
+         __sync_synchronize();
          r = ws->dev->uvd_submit(ws->dev, offset, rcs->current.cdw, &fence->number);
          if (r)
             ws->dev->free(ws->dev, offset);

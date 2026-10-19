@@ -7,13 +7,20 @@
  */
 
 #include <IOKit/IOLib.h>
-#include <kern/clock.h>
 #include <IOKit/graphics/IOGraphicsInterfaceTypes.h>
 
 #include "RadeonNI.h"
 #include "RadeonNIAccel.h"
 #include "RadeonNISurface.h"
 #include "rdn_uvd_reg.h"
+
+/* sync: orders every earlier store, also to write-combined memory, before the next one (eieio orders only guarded I/O) */
+static inline void rdnStoreBarrier(void)
+{
+#if defined(__ppc__) || defined(__ppc64__)
+	__asm__ __volatile__("sync" : : : "memory");
+#endif
+}
 
 OSDefineMetaClassAndStructors(RadeonNIAGPShim, IOAGPDevice)
 
@@ -952,6 +959,7 @@ void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch
 		ib[5] = 0;
 		for (j = 6; j < 16; j++)
 			ib[j] = RDN_UVD_PACKET0(UVD_NO_OP, 0);
+		rdnStoreBarrier();
 		if (rdn_uvd_ib_submit(&fUvd, rdn_vram_addr(&fAccel, fUvdScratch + 1024), 16, &seq)) {
 			IOLog("RadeonNI: UVD: could not end a program's session\n");
 			break;
@@ -1006,6 +1014,8 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 		if (fUvd.flags & RDN_UVD_F_PLL)
 			IOLog("RadeonNI: UVD clocks %s\n", r ? "did not come up" : "up");
 	}
+	/* the program's stores to the write-combined window must be in the card before the doorbell (eieio does not order them) */
+	rdnStoreBarrier();
 	if (!r)
 		r = rdn_uvd_ib_submit(&fUvd, rdn_vram_addr(&fAccel, offset), words, &seq);
 	if (!r) {
@@ -1053,21 +1063,7 @@ IOReturn RadeonNIAccel::uvdReset(UInt32 *epoch)
 		IOLockLock(fLock);
 	}
 	fUvdDirty = true;
-	{
-		/* a program that asks again soon found the last reset not enough: the whole block this time (level 2) */
-		uint64_t abstime, nanos;
-		UInt64 now;
-		UInt32 level = 1;
-
-		clock_get_uptime(&abstime);
-		absolutetime_to_nanoseconds(abstime, &nanos);
-		now = nanos / 1000000ULL;
-		if (fUvdResetAtMs && now - fUvdResetAtMs < 20000)
-			level = 2;
-		fUvdResetAtMs = now;
-		fUvdResetLevel = level;
-		uvdRestart(level);
-	}
+	uvdRestart(1);
 	*epoch = fUvdEpoch;
 	IOLockUnlock(fLock);
 	return fUvdUp ? kIOReturnSuccess : kIOReturnIOError;
