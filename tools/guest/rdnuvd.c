@@ -173,10 +173,11 @@ static int do_test(void)
 	kr = IOConnectMethodScalarIScalarO(conn, RDN_UC_UVD_FENCE_WAIT, 2, 1, fence, 1000, &reached);
 	printf("fence wait: kern_return 0x%x, %s\n", kr, reached ? "reached" : "NOT reached in 1 s");
 	if (!reg(UVD_CONTEXT_ID, &v))
+		/* the fence packets that follow the buffer (uvd_v2_2_fence_emit) leave their sequence number here */
 		printf("UVD_CONTEXT_ID = 0x%08x (%s)\n", (unsigned)v,
-		       v == 0x600DF00D ? "the buffer ran" : "the buffer did not run");
+		       v == (unsigned)fence ? "the fence ran, after the buffer" : "the fence did not run");
 	IOConnectMethodScalarIScalarO(conn, RDN_UC_FREE, 1, 0, off);
-	return reached && v == 0x600DF00D ? 0 : 1;
+	return reached && v == (unsigned)fence ? 0 : 1;
 }
 
 int main(int argc, char **argv)
