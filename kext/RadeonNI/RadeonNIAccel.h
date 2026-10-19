@@ -94,10 +94,16 @@ public:
 	IOReturn regRead(UInt32 offset, UInt32 *value);
 	/* UVD, only with the personality's FW_UVD (hw/rdn_user.h). */
 	IOReturn uvdInit(UInt32 flags, UInt32 *status);
-	/* `handles` and `count`: the client's sessions (stream handles of the messages it has sent, not yet destroyed). */
-	IOReturn uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UInt32 *handles, UInt32 *count);
+	/*
+	 * `handles` and `count`: the client's sessions (stream handles of the messages it has sent, not yet destroyed), made in
+	 * the firmware epoch `*epoch`; if the firmware has been started again since, they are void (count goes to 0).
+	 */
+	IOReturn uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UInt32 *handles, UInt32 *count, UInt32 *epoch);
+	/* Start the firmware again now, whatever runs; the new epoch. */
+	IOReturn uvdReset(UInt32 *epoch);
+	UInt32 uvdEpoch(void) { return fUvdEpoch; }
 	/* End sessions a program made and left (it died, or ended without destroying them). */
-	void uvdDestroy(const UInt32 *handles, UInt32 count);
+	void uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch);
 	bool uvdFenceWait(UInt32 fence, UInt32 timeoutMs);
 	/* The clients that have decoded: the clocks stay up while there is one. */
 	void uvdUser(bool add);
@@ -152,13 +158,18 @@ private:
 	struct rdn_uvd fUvd;
 	bool fUvdUp, fUvdFailed, fUvdClocksUp;
 	UInt32 fUvdLastSeq, fUvdUsers;
+	/* The sessions alive in the firmware (all programs'), and which start of the firmware this is. */
+	UInt32 fUvdLive, fUvdEpoch;
 	/* How the block was started (to start it again), and whether any program has used it since. */
 	UInt32 fUvdFlags;
 	uint32_t fUvdRef;
 	bool fUvdDirty;
 	/* A page of video memory for messages of the kext's own. */
 	UInt32 fUvdScratch;
-	void uvdScan(UInt32 offset, UInt32 words, UInt32 *handles, UInt32 *count);
+	/* The session messages in a stream of commands: type (0 create, 2 destroy) and handle of each. */
+	struct UvdMsg { UInt32 type, handle; };
+	enum { kMaxUvdMsgs = 8 };
+	UInt32 uvdFind(UInt32 offset, UInt32 words, UvdMsg *msgs);
 	IOBufferMemoryDescriptor *fUvdGartMem;
 	UInt32 fUvdGartAt;
 	/* The power state the card was last put in (hw/rdn_pm.h). */
@@ -258,6 +269,8 @@ public:
 	IOReturn methodUvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence);
 	IOReturn methodUvdFenceWait(UInt32 fence, UInt32 timeoutMs, UInt32 *reached);
 	IOReturn methodUvdInfo(UInt32 *up, UInt32 *vcpuOffset, UInt32 *ringOffset);
+	IOReturn methodUvdReset(UInt32 *epoch);
+	IOReturn methodUvdEpoch(UInt32 *epoch);
 	IOReturn methodAllocHidden(UInt32 size, UInt32 align, UInt32 *offset);
 	IOReturn methodHiddenInfo(UInt32 *offset, UInt32 *size);
 	IOReturn methodGartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages);
@@ -282,6 +295,8 @@ private:
 	enum { kMaxUvdSessions = 32 };
 	UInt32 fUvdHandles[kMaxUvdSessions];
 	UInt32 fUvdHandleCount;
+	/* The firmware epoch they were made in. */
+	UInt32 fUvdHandleEpoch;
 
 	void freeAll(void);
 };

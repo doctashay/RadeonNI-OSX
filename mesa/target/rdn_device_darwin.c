@@ -354,6 +354,28 @@ static int dev_uvd_init(struct rdn_device *dev)
 	return 0;
 }
 
+static int dev_uvd_epoch(struct rdn_device *dev, uint32_t *epoch)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	int e = 0;
+
+	if (IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_EPOCH, 0, 1, &e))
+		return -1;
+	*epoch = (uint32_t)e;
+	return 0;
+}
+
+static int dev_uvd_reset(struct rdn_device *dev, uint32_t *epoch)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	int e = 0;
+
+	if (IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_RESET, 0, 1, &e))
+		return -1;
+	*epoch = (uint32_t)e;
+	return 0;
+}
+
 static int dev_uvd_submit(struct rdn_device *dev, uint64_t offset, uint32_t words,
 			  uint32_t *fence)
 {
@@ -692,6 +714,11 @@ struct rdn_device *rdn_device_open(void)
 		if (!getenv("RDN_NO_UVD") &&
 		    !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_INFO, 0, 3, &up, &vcpu, &ring)) {
 			d->base.uvd_init = dev_uvd_init;
+			/* an older kext lacks these: the library then cannot recover a stalled decoder */
+			if (!IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_EPOCH, 0, 1, &up)) {
+				d->base.uvd_epoch = dev_uvd_epoch;
+				d->base.uvd_reset = dev_uvd_reset;
+			}
 			d->base.uvd_submit = dev_uvd_submit;
 			d->base.uvd_fence_wait = dev_uvd_fence_wait;
 		}

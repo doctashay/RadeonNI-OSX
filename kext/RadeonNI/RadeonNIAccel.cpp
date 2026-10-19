@@ -815,10 +815,13 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 }
 
 /*
- * The firmware holds ten sessions, made by programs' messages; QuickTime programs end without closing their
- * decoders, and a session nobody destroys stays: after ten the next decoder silently decodes nothing. When the last
- * program that decoded is gone nothing is in use, so the block is started again (about half a second).
- * Called with fLock held and no fences pending.
+ * The firmware holds ten sessions, made by programs' messages, and it can stop answering a session's decode commands
+ * (a long pause of its session with other programs busy on the machine did it, and a session nobody destroys stays):
+ * the commands run and the fences come, but nothing is decoded. Starting the block again (about half a second) clears
+ * all of that, so it is done whenever a new generation of decoders begins (the first session when none is alive), when
+ * the last program that decoded is gone, and when a program whose decoder stopped asks for it. Each start is a new
+ * epoch; sessions of an older one are gone. Called with fLock held; nothing happens if no program has used the block
+ * since the last start (fUvdDirty).
  */
 void RadeonNIAccel::uvdRestart(void)
 {
@@ -836,38 +839,42 @@ void RadeonNIAccel::uvdRestart(void)
 	r = rdn_uvd_init(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
 			 fUvd.vcpu_offset, fUvd.ring_offset, 4096, fUvdFlags);
 	IOFree(fw, fwSize);
+	/* the sessions are gone, whether it started again or not; a started block has its clocks on, the next command says so */
+	fUvdLive = 0;
+	fUvdEpoch++;
+	fUvdClocksUp = false;
 	if (r) {
 		fUvdUp = false;
 		IOLog("RadeonNI: UVD did not start again (%d)\n", r);
 		return;
 	}
-	IOLog("RadeonNI: UVD restarted: no program is decoding\n");
+	IOLog("RadeonNI: UVD restarted (epoch %lu)\n", (unsigned long)fUvdEpoch);
 }
 
 /*
- * What the messages in a program's command stream do to its sessions. The stream is register writes: the message's
- * address goes to GPCOM_VCPU_DATA0 and DATA1, and a write of 0 to GPCOM_VCPU_CMD says "the message is there". Its
- * first words, little-endian, are its size, its type (0 create, 2 destroy) and the stream handle. Called with fLock held.
+ * The session messages in a program's command stream. The stream is register writes: the message's address goes to
+ * GPCOM_VCPU_DATA0 and DATA1, and a write of 0 to GPCOM_VCPU_CMD says "the message is there". Its first words,
+ * little-endian, are its size, its type (0 create, 2 destroy) and the stream handle. Reads only; called with fLock held.
  */
-void RadeonNIAccel::uvdScan(UInt32 offset, UInt32 words, UInt32 *handles, UInt32 *count)
+UInt32 RadeonNIAccel::uvdFind(UInt32 offset, UInt32 words, UvdMsg *msgs)
 {
 	volatile UInt32 *w = (volatile UInt32 *)((UInt8 *)fAccel.aperture + offset);
-	UInt32 i = 0, data0 = 0, data1 = 0;
+	UInt32 i = 0, data0 = 0, data1 = 0, n = 0;
 
 	while (i < words) {
-		UInt32 pkt = w[i], type = pkt >> 30, n, reg, j;
+		UInt32 pkt = w[i], type = pkt >> 30, count, reg, j;
 
 		if (type == 2) {
 			i++;
 			continue;
 		}
 		if (type != 0)
-			return;
-		n = ((pkt >> 16) & 0x3fff) + 1;
+			return n;
+		count = ((pkt >> 16) & 0x3fff) + 1;
 		reg = (pkt & 0xffff) << 2;
-		if (i + 1 + n > words)
-			return;
-		for (j = 0; j < n; j++, reg += 4) {
+		if (i + 1 + count > words)
+			return n;
+		for (j = 0; j < count; j++, reg += 4) {
 			UInt32 value = w[i + 1 + j];
 
 			if (reg == UVD_GPCOM_VCPU_DATA0) {
@@ -878,43 +885,34 @@ void RadeonNIAccel::uvdScan(UInt32 offset, UInt32 words, UInt32 *handles, UInt32
 				uint64_t addr = ((uint64_t)data1 << 32) | data0;
 				uint64_t at = addr - fAccel.vram_base;
 				volatile UInt8 *m;
-				UInt32 type_, handle, k;
+				UInt32 type_;
 
 				if (addr < fAccel.vram_base || at + 12 > fAccel.aperture_size)
 					continue;
 				m = (volatile UInt8 *)fAccel.aperture + at;
 				type_ = m[4] | m[5] << 8 | m[6] << 16 | (UInt32)m[7] << 24;
-				handle = m[8] | m[9] << 8 | m[10] << 16 | (UInt32)m[11] << 24;
-				IOLog("RadeonNI: trace uvd message type %lu handle 0x%lx\n", (unsigned long)type_, (unsigned long)handle);
-				if (type_ == 0) {
-					for (k = 0; k < *count; k++)
-						if (handles[k] == handle)
-							break;
-					if (k == *count && *count < 32)
-						handles[(*count)++] = handle;
-				} else if (type_ == 2) {
-					for (k = 0; k < *count; k++)
-						if (handles[k] == handle) {
-							handles[k] = handles[--(*count)];
-							break;
-						}
+				if ((type_ == 0 || type_ == 2) && n < kMaxUvdMsgs) {
+					msgs[n].type = type_;
+					msgs[n].handle = m[8] | m[9] << 8 | m[10] << 16 | (UInt32)m[11] << 24;
+					n++;
 				}
 			}
 		}
-		i += 1 + n;
+		i += 1 + count;
 	}
+	return n;
 }
 
 /*
  * Linux's radeon_uvd_get_destroy_msg(): a message of 0xde4 bytes whose type is 2 and whose third word is the handle,
- * in a stream that only names it.
+ * in a stream that only names it. Only for sessions of the epoch the firmware is in.
  */
-void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count)
+void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch)
 {
 	UInt32 i;
 
 	IOLockLock(fLock);
-	if (!fUvdUp || !fUvdScratch || (fUvdFlags & RDN_UVD_F_GART)) {
+	if (!fUvdUp || !fUvdScratch || (fUvdFlags & RDN_UVD_F_GART) || epoch != fUvdEpoch) {
 		IOLockUnlock(fLock);
 		return;
 	}
@@ -952,6 +950,8 @@ void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count)
 		fUvdLastSeq = seq;
 		fUvdDirty = true;
 		(void)rdn_uvd_fence_wait(&fUvd, seq, 100);
+		if (fUvdLive)
+			fUvdLive--;
 	}
 	if (count)
 		IOLog("RadeonNI: UVD: ended %lu session(s) a program left\n", (unsigned long)count);
@@ -959,10 +959,13 @@ void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count)
 }
 
 IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UInt32 *handles,
-				  UInt32 *count)
+				  UInt32 *count, UInt32 *epoch)
 {
 	uint32_t seq = 0;
 	int r = 0;
+	UvdMsg msgs[kMaxUvdMsgs];
+	UInt32 n, i, k;
+	bool creates = false;
 
 	if (offset < HEAP_OFFSET || (offset & 3) || !words ||
 	    words > (fAccel.aperture_size - offset) / 4)
@@ -971,6 +974,22 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 	if (!fUvdUp) {
 		IOLockUnlock(fLock);
 		return kIOReturnNotReady;
+	}
+	n = uvdFind(offset, words, msgs);
+	for (i = 0; i < n; i++)
+		if (msgs[i].type == 0)
+			creates = true;
+	/* a new generation of decoders: nobody else's session is alive, so the firmware starts clean (and not in the middle of a command) */
+	if (creates && !fUvdLive && fUvdDirty && rdn_uvd_fence_done(&fUvd, fUvdLastSeq))
+		uvdRestart();
+	if (!fUvdUp) {
+		IOLockUnlock(fLock);
+		return kIOReturnNotReady;
+	}
+	/* the program's sessions are void if the firmware was started again since it made them */
+	if (*epoch != fUvdEpoch) {
+		*count = 0;
+		*epoch = fUvdEpoch;
 	}
 	if (!fUvdClocksUp) {
 		r = rdn_uvd_wake(&fUvd);
@@ -983,13 +1002,52 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 	if (!r) {
 		fUvdLastSeq = seq;
 		fUvdDirty = true;
-		uvdScan(offset, words, handles, count);
+		for (i = 0; i < n; i++) {
+			for (k = 0; k < *count; k++)
+				if (handles[k] == msgs[i].handle)
+					break;
+			if (msgs[i].type == 0) {
+				if (k == *count && *count < kMaxUvdSessions) {
+					handles[(*count)++] = msgs[i].handle;
+					fUvdLive++;
+				}
+			} else if (k < *count) {
+				handles[k] = handles[--(*count)];
+				if (fUvdLive)
+					fUvdLive--;
+			}
+		}
 	}
 	IOLockUnlock(fLock);
 	if (r)
 		return kIOReturnIOError;
 	*fence = seq;
 	return kIOReturnSuccess;
+}
+
+/*
+ * A program's decoder stopped answering: start the firmware again now. Waits (a little) for what is running, then does
+ * it whatever else is going on; the other programs' sessions are gone, and they find out by the epoch.
+ */
+IOReturn RadeonNIAccel::uvdReset(UInt32 *epoch)
+{
+	UInt32 waited = 0;
+
+	IOLockLock(fLock);
+	if (!fUvdUp) {
+		IOLockUnlock(fLock);
+		return kIOReturnNotReady;
+	}
+	while (!rdn_uvd_fence_done(&fUvd, fUvdLastSeq) && waited++ < 200) {
+		IOLockUnlock(fLock);
+		IOSleep(1);
+		IOLockLock(fLock);
+	}
+	fUvdDirty = true;
+	uvdRestart();
+	*epoch = fUvdEpoch;
+	IOLockUnlock(fLock);
+	return fUvdUp ? kIOReturnSuccess : kIOReturnIOError;
 }
 
 bool RadeonNIAccel::uvdFenceWait(UInt32 fence, UInt32 timeoutMs)
@@ -1017,7 +1075,6 @@ bool RadeonNIAccel::uvdFenceWait(UInt32 fence, UInt32 timeoutMs)
 void RadeonNIAccel::uvdUser(bool add)
 {
 	IOLockLock(fLock);
-	IOLog("RadeonNI: trace uvd user %s, users were %lu\n", add ? "added" : "removed", (unsigned long)fUvdUsers);
 	if (add) {
 		fUvdUsers++;
 	} else if (fUvdUsers && !--fUvdUsers && fUvdUp && fUvdClocksUp) {
@@ -1663,7 +1720,6 @@ bool RadeonNIUserClient::initWithTask(task_t owningTask, void *securityID,
 	if (!super::initWithTask(owningTask, securityID, type))
 		return false;
 	fTask = owningTask;
-	IOLog("RadeonNI: trace client %p task %p opened\n", this, owningTask);
 	fOffsets = (UInt32 *)IOMalloc(kMaxAllocations * sizeof(UInt32));
 	fCount = 0;
 	fUvdUser = false;
@@ -1689,7 +1745,7 @@ void RadeonNIUserClient::freeAll(void)
 	fAccel->syncForCPU();
 	/* sessions this client made and never ended: the firmware has ten, and they would stay until the block is restarted */
 	if (fUvdHandleCount) {
-		fAccel->uvdDestroy(fUvdHandles, fUvdHandleCount);
+		fAccel->uvdDestroy(fUvdHandles, fUvdHandleCount, fUvdHandleEpoch);
 		fUvdHandleCount = 0;
 	}
 	for (i = 0; i < fCount; i++)
@@ -1704,8 +1760,6 @@ void RadeonNIUserClient::freeAll(void)
 
 IOReturn RadeonNIUserClient::clientClose(void)
 {
-	IOLog("RadeonNI: trace client %p task %p closing (uvd handles %lu, uvd user %d)\n", this, fTask,
-	      (unsigned long)fUvdHandleCount, (int)fUvdUser);
 	freeAll();
 	terminate();
 	return kIOReturnSuccess;
@@ -1776,21 +1830,14 @@ IOExternalMethod *RadeonNIUserClient::getTargetAndMethodForIndex(
 		  kIOUCScalarIScalarO, 2, 1 },
 		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdInfo,
 		  kIOUCScalarIScalarO, 0, 3 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdReset,
+		  kIOUCScalarIScalarO, 0, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdEpoch,
+		  kIOUCScalarIScalarO, 0, 1 },
 	};
 
 	if (index >= RDN_UC_METHOD_COUNT)
 		return 0;
-	/* trace of what the clients do to the card (not the calls that are many and plain: submit, fence waits, register reads, copies, allocation) */
-	{
-		static const char *const names[RDN_UC_METHOD_COUNT] = {
-			"get-info", "", "", "", "", "", "surface-region", "surface-buffer", "surface-list", "surface-locked",
-			"power", "", "alloc-hidden", "hidden-info", "gart-info", "gart-bind", "gart-unbind", "screen-fill",
-			"screen-copy", "uvd-init", "uvd-submit", "", "uvd-info"
-		};
-
-		if (names[index][0])
-			IOLog("RadeonNI: trace client %p task %p %s\n", this, fTask, names[index]);
-	}
 	*target = this;
 	return (IOExternalMethod *)&methods[index];
 }
@@ -1832,9 +1879,6 @@ IOReturn RadeonNIUserClient::methodAlloc(UInt32 size, UInt32 align,
 	r = fAccel->allocVram(size, align, offset);
 	if (r == kIOReturnSuccess)
 		fOffsets[fCount++] = *offset;
-	if (size >= (4u << 20))
-		IOLog("RadeonNI: trace client %p alloc %lu KB -> %s 0x%lx\n", this, (unsigned long)(size >> 10),
-		      r == kIOReturnSuccess ? "at" : "FAILED", (unsigned long)(r == kIOReturnSuccess ? *offset : 0));
 	return r;
 }
 
@@ -1941,13 +1985,31 @@ IOReturn RadeonNIUserClient::methodUvdInit(UInt32 flags, UInt32 *status)
 IOReturn RadeonNIUserClient::methodUvdSubmit(UInt32 offset, UInt32 words,
 					     UInt32 *fence)
 {
-	IOReturn ret = fAccel->uvdSubmit(offset, words, fence, fUvdHandles, &fUvdHandleCount);
+	IOReturn ret = fAccel->uvdSubmit(offset, words, fence, fUvdHandles, &fUvdHandleCount, &fUvdHandleEpoch);
 
 	if (ret == kIOReturnSuccess && !fUvdUser) {
 		fUvdUser = true;
 		fAccel->uvdUser(true);
 	}
 	return ret;
+}
+
+IOReturn RadeonNIUserClient::methodUvdReset(UInt32 *epoch)
+{
+	IOReturn ret = fAccel->uvdReset(epoch);
+
+	if (ret == kIOReturnSuccess) {
+		/* this program's sessions went with the rest */
+		fUvdHandleCount = 0;
+		fUvdHandleEpoch = *epoch;
+	}
+	return ret;
+}
+
+IOReturn RadeonNIUserClient::methodUvdEpoch(UInt32 *epoch)
+{
+	*epoch = fAccel->uvdEpoch();
+	return kIOReturnSuccess;
 }
 
 IOReturn RadeonNIUserClient::methodUvdFenceWait(UInt32 fence, UInt32 timeoutMs,

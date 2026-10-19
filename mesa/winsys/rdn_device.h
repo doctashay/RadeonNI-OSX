@@ -130,6 +130,9 @@ struct rdn_device {
     * only looks.
     */
    int (*uvd_init)(struct rdn_device *dev);
+   /* The firmware's epoch (it changes when the firmware is started again), and starting it again now; NULL without the kext's support. */
+   int (*uvd_epoch)(struct rdn_device *dev, uint32_t *epoch);
+   int (*uvd_reset)(struct rdn_device *dev, uint32_t *epoch);
    int (*uvd_submit)(struct rdn_device *dev, uint64_t offset, uint32_t words,
                      uint32_t *fence);
    int (*uvd_fence_wait)(struct rdn_device *dev, uint32_t fence,

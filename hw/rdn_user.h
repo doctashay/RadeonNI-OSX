@@ -141,6 +141,16 @@ enum {
 	RDN_UC_UVD_FENCE_WAIT,
 	/* scalars out: 1 if the engine is up, its VCPU region's offset, the ring's offset */
 	RDN_UC_UVD_INFO,
+	/*
+	 * Start the block's firmware again now, whatever is running: every session of every program is gone. Out: the new
+	 * epoch (below). A program whose decoder stopped answering uses it; its own sessions have to be made again.
+	 */
+	RDN_UC_UVD_RESET,
+	/*
+	 * Out: the epoch of the firmware, a number that changes each time it is started again (by the kext when a new decoder
+	 * starts with no other decoder running, or by RDN_UC_UVD_RESET). Sessions made in an older epoch are gone.
+	 */
+	RDN_UC_UVD_EPOCH,
 	RDN_UC_METHOD_COUNT
 };
 
