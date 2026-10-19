@@ -2,7 +2,7 @@
 # Small H.264 test vectors for rdn_uvdtest and h264dump: a synthetic test pattern encoded by x264
 # and its decode by ffmpeg (yuv420p, all the pictures, in display order).
 #   scripts/uvd-testvec.sh <outdir> <name> [width height frames]
-# Writes <outdir>/<name>.h264 and <outdir>/<name>.yuv. Names (what the stream has):
+# Writes <outdir>/<name>.mp4, <name>.h264 (Annex B) and <name>.yuv. Names (what the stream has):
 #   i        one IDR picture, Baseline
 #   p        Baseline I and P, 3 references
 #   cabac    Main, CABAC, 2 references
@@ -56,7 +56,10 @@ noloop)  x="$x:bframes=2:ref=3:no-deblock=1:constrained-intra=1" ;;
 *) echo "unknown vector $name" >&2; exit 1 ;;
 esac
 [ -n "$vf" ] && vf="-vf $vf"
+# encoded into an MP4 first (its time stamps carry the display order of B pictures), the Annex B stream and the
+# decode (in display order) come from that
 ffmpeg -hide_banner -loglevel error -y -f lavfi -i "$src" $vf -frames:v "$frames" -pix_fmt yuv420p \
-    -c:v libx264 -profile:v $prof -x264-params "$x" -f h264 "$out/$name.h264"
-ffmpeg -hide_banner -loglevel error -y -i "$out/$name.h264" -pix_fmt yuv420p -f rawvideo "$out/$name.yuv"
+    -c:v libx264 -profile:v $prof -x264-params "$x" -movflags +faststart "$out/$name.mp4"
+ffmpeg -hide_banner -loglevel error -y -i "$out/$name.mp4" -c copy -bsf:v h264_mp4toannexb -f h264 "$out/$name.h264"
+ffmpeg -hide_banner -loglevel error -y -i "$out/$name.mp4" -pix_fmt yuv420p -f rawvideo "$out/$name.yuv"
 echo "$name: $(stat -c %s "$out/$name.h264") bytes of stream, $(stat -c %s "$out/$name.yuv") of yuv"
