@@ -96,6 +96,8 @@ public:
 	IOReturn uvdInit(UInt32 flags, UInt32 *status);
 	IOReturn uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence);
 	bool uvdFenceWait(UInt32 fence, UInt32 timeoutMs);
+	/* The clients that have decoded: the clocks stay up while there is one. */
+	void uvdUser(bool add);
 	IOReturn uvdInfo(UInt32 *up, UInt32 *vcpuOffset, UInt32 *ringOffset);
 	IOMemoryDescriptor *apertureMemory(void);
 	UInt32 apertureBytes(void);
@@ -144,7 +146,7 @@ private:
 	/* UVD: set up by the first RDN_UC_UVD_INIT, never at start. */
 	struct rdn_uvd fUvd;
 	bool fUvdUp, fUvdFailed, fUvdClocksUp;
-	UInt32 fUvdLastSeq;
+	UInt32 fUvdLastSeq, fUvdUsers;
 	IOBufferMemoryDescriptor *fUvdGartMem;
 	UInt32 fUvdGartAt;
 	/* The power state the card was last put in (hw/rdn_pm.h). */
@@ -262,6 +264,8 @@ private:
 	/* What this client allocated, so that it can be freed when it goes. */
 	UInt32 *fOffsets;
 	UInt32 fCount;
+	/* Has submitted UVD work: counted in RadeonNIAccel::uvdUser(). */
+	bool fUvdUser;
 
 	void freeAll(void);
 };

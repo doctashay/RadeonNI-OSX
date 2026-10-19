@@ -651,7 +651,7 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 {
 	/* No flags: the start that works (docs/UVD.md); other values select the older variants, for experiments. */
 	if (!flags)
-		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI;
+		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI | RDN_UVD_F_PLL;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;
 	uint32_t ref = 0;
 	UInt32 vcpuBytes;
@@ -825,6 +825,8 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence)
 	if (!fUvdClocksUp) {
 		r = rdn_uvd_wake(&fUvd);
 		fUvdClocksUp = r == 0;
+		if (fUvd.flags & RDN_UVD_F_PLL)
+			IOLog("RadeonNI: UVD clocks %s\n", r ? "did not come up" : "up");
 	}
 	if (!r)
 		r = rdn_uvd_ib_submit(&fUvd, rdn_vram_addr(&fAccel, offset), words, &seq);
@@ -845,16 +847,41 @@ bool RadeonNIAccel::uvdFenceWait(UInt32 fence, UInt32 timeoutMs)
 	for (;;) {
 		IOLockLock(fLock);
 		done = fUvdUp && rdn_uvd_fence_done(&fUvd, fence);
-		if (done && fUvdLastSeq == fence && fUvdClocksUp) {
-			(void)rdn_uvd_idle(&fUvd);
-			fUvdClocksUp = false;
-		}
 		IOLockUnlock(fLock);
 		if (done || waited >= timeoutMs)
 			return done;
 		IOSleep(1);
 		waited++;
 	}
+}
+
+/*
+ * The clocks go up with a client's first command stream and stay up while
+ * a client that has submitted one is open: raising them takes a few
+ * hundred milliseconds, and a decoder submits every frame. The last
+ * client to go lowers them, once its work is done.
+ */
+void RadeonNIAccel::uvdUser(bool add)
+{
+	IOLockLock(fLock);
+	if (add) {
+		fUvdUsers++;
+	} else if (fUvdUsers && !--fUvdUsers && fUvdUp && fUvdClocksUp) {
+		UInt32 waited = 0;
+
+		while (!rdn_uvd_fence_done(&fUvd, fUvdLastSeq) && waited++ < 200) {
+			IOLockUnlock(fLock);
+			IOSleep(1);
+			IOLockLock(fLock);
+		}
+		if (!fUvdUsers && rdn_uvd_fence_done(&fUvd, fUvdLastSeq)) {
+			(void)rdn_uvd_idle(&fUvd);
+			fUvdClocksUp = false;
+			if (fUvd.flags & RDN_UVD_F_PLL)
+				IOLog("RadeonNI: UVD clocks down\n");
+		}
+	}
+	IOLockUnlock(fLock);
 }
 
 IOReturn RadeonNIAccel::uvdInfo(UInt32 *up, UInt32 *vcpuOffset, UInt32 *ringOffset)
@@ -1483,6 +1510,7 @@ bool RadeonNIUserClient::initWithTask(task_t owningTask, void *securityID,
 	fTask = owningTask;
 	fOffsets = (UInt32 *)IOMalloc(kMaxAllocations * sizeof(UInt32));
 	fCount = 0;
+	fUvdUser = false;
 	return fOffsets != 0;
 }
 
@@ -1506,6 +1534,10 @@ void RadeonNIUserClient::freeAll(void)
 		fAccel->freeVram(fOffsets[i]);
 	fCount = 0;
 	fAccel->gartUnbindAll(this);
+	if (fUvdUser) {
+		fUvdUser = false;
+		fAccel->uvdUser(false);
+	}
 }
 
 IOReturn RadeonNIUserClient::clientClose(void)
@@ -1731,7 +1763,13 @@ IOReturn RadeonNIUserClient::methodUvdInit(UInt32 flags, UInt32 *status)
 IOReturn RadeonNIUserClient::methodUvdSubmit(UInt32 offset, UInt32 words,
 					     UInt32 *fence)
 {
-	return fAccel->uvdSubmit(offset, words, fence);
+	IOReturn ret = fAccel->uvdSubmit(offset, words, fence);
+
+	if (ret == kIOReturnSuccess && !fUvdUser) {
+		fUvdUser = true;
+		fAccel->uvdUser(true);
+	}
+	return ret;
 }
 
 IOReturn RadeonNIUserClient::methodUvdFenceWait(UInt32 fence, UInt32 timeoutMs,

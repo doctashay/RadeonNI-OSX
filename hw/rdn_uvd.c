@@ -619,7 +619,8 @@ static void vcpu_stop(struct rdn_uvd *uvd)
 
 int rdn_uvd_wake(struct rdn_uvd *uvd)
 {
-	if (uvd->flags & (RDN_UVD_F_NO_PLL | RDN_UVD_F_MINIMAL))
+	if ((uvd->flags & RDN_UVD_F_NO_PLL) ||
+	    ((uvd->flags & RDN_UVD_F_MINIMAL) && !(uvd->flags & RDN_UVD_F_PLL)))
 		return 0;
 	if (uvd->flags & RDN_UVD_F_LOW_CLOCKS)
 		return rdn_uvd_set_clocks(uvd->accel->card, uvd->ref_freq, 10000, 10000);
@@ -661,7 +662,7 @@ static void uvd_dump(struct rdn_uvd *uvd, const char *why)
 
 int rdn_uvd_idle(struct rdn_uvd *uvd)
 {
-	if (uvd->flags & RDN_UVD_F_MINIMAL)
+	if ((uvd->flags & RDN_UVD_F_MINIMAL) && !(uvd->flags & RDN_UVD_F_PLL))
 		return 0;
 	return rdn_uvd_set_clocks(uvd->accel->card, uvd->ref_freq, 0, 0);
 }
@@ -745,8 +746,8 @@ int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 	/* uvd_v2_2_resume() runs before uvd_v1_0_init() raises the clocks */
 	if (!(flags & RDN_UVD_F_PLL_FIRST))
 		program_memory(uvd);
-	/* raise clocks while booting up the VCPU */
-	r = rdn_uvd_wake(uvd);
+	/* raise clocks while booting up the VCPU (the minimal start leaves that to the first command stream) */
+	r = (flags & RDN_UVD_F_MINIMAL) ? 0 : rdn_uvd_wake(uvd);
 	if (r)
 		goto done;
 	if (flags & RDN_UVD_F_PLL_FIRST)
@@ -785,7 +786,7 @@ done:
 		wr(card, 0x644, uvd->pm_sclk);
 	}
 	/* lower clocks again */
-	if (!(r && (flags & RDN_UVD_F_KEEP_CLOCKS)))
+	if (!(flags & RDN_UVD_F_MINIMAL) && !(r && (flags & RDN_UVD_F_KEEP_CLOCKS)))
 		(void)rdn_uvd_idle(uvd);
 	return r;
 }
