@@ -375,9 +375,13 @@ static void program_memory(struct rdn_uvd *uvd)
 		 */
 		uint64_t at = uvd_addr(uvd, uvd->vcpu_gpu);
 
-		wr(card, UVD_VCPU_CACHE_OFFSET0, (uint32_t)(at >> 3));
+		wr(card, UVD_VCPU_CACHE_OFFSET0, (uint32_t)(at >> 3) & 0x0fffffff);
 		wr(card, UVD_VCPU_CACHE_SIZE0, PAGE_UP(uvd->fw_size + 4) >> 3);
 		wr(card, UVD_VCPU_CHIP_ID_REG, RDN_UVD_CHIP_ID_TURKS);
+		if (uvd->flags & RDN_UVD_F_EXT) {
+			wr(card, UVD_LMI_ADDR_EXT, (uint32_t)(((at >> 28) & 0xF) << 12 | ((at >> 28) & 0xF)));
+			wr(card, UVD_LMI_EXT40_ADDR, (uint32_t)((at >> 32) & 0xFF) | (0x9 << 16) | (0x1u << 31));
+		}
 		return;
 	}
 	uint64_t gpu = uvd_addr(uvd, uvd->vcpu_gpu);
