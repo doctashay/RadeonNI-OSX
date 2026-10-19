@@ -73,6 +73,19 @@ executable(
   install : false,
 )
 
+# The video decoder test: one H.264 picture through pipe_video_codec on the
+# card (it needs the card: there is no software stand-in for UVD).
+executable(
+  'rdn_uvdtest',
+  [rdn_sources, files('tests/rdn_uvdtest.c')],
+  include_directories : rdn_inc,
+  link_args : rdn_device_link_args,
+  link_whole : rdn_link_whole,
+  link_with : rdn_link_with,
+  dependencies : rdn_deps,
+  install : false,
+)
+
 # The OpenGL driver bundle for Mac OS X: Apple's driver interface on the
 # outside (gld/RadeonNIGLDriver.c), Mesa inside. The dispatch glue is
 # generated from the SDK's header, at the place the toolchain container

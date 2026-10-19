@@ -120,6 +120,22 @@ struct rdn_device {
    void (*sync_for_cpu)(struct rdn_device *dev);
 
    /*
+    * Optional: the video decoder (UVD); all three are NULL when the device
+    * has none. uvd_init() starts it unless it is up; 0 when it is up
+    * afterwards. uvd_submit() runs `words` UVD command words stored at `offset`,
+    * in the CPU's byte order, like submit(), and returns a fence; the
+    * buffers the commands name must lie in video memory, in the 256 MB
+    * the decoder's firmware is in. Its fences are numbered apart from
+    * submit()'s. uvd_fence_wait() is like fence_wait(); a timeout of 0
+    * only looks.
+    */
+   int (*uvd_init)(struct rdn_device *dev);
+   int (*uvd_submit)(struct rdn_device *dev, uint64_t offset, uint32_t words,
+                     uint32_t *fence);
+   int (*uvd_fence_wait)(struct rdn_device *dev, uint32_t fence,
+                         uint64_t timeout_ns);
+
+   /*
     * Optional: read the screen's size, place and pitch again (a mode set
     * changes them; `screen` is kept as the device last read it).
     */

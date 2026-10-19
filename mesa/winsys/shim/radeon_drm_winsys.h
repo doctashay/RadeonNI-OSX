@@ -49,6 +49,11 @@ struct radeon_drm_winsys {
    /* The newest fence known to have been reached. */
    uint32_t last_done;
    bool have_last_done;
+   /* The same for the video decoder's fences (numbered apart), and whether it is up and ever used. */
+   uint32_t uvd_last_done;
+   bool have_uvd_last_done;
+   bool uvd_ready;
+   bool uvd_used;
    uint64_t allocated_bytes;
    /*
     * RDN_STATS: what is allocated now, by where it is (enum rdn_place)

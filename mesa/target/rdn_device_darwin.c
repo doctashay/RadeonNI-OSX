@@ -334,6 +334,56 @@ static bool fence_wait_ms(struct darwin_device *d, uint32_t fence, uint32_t ms)
 	return reached != 0;
 }
 
+/*
+ * The video decoder (UVD). The kext has the methods only when its
+ * personality has the firmware; the decoder is started by the first
+ * command stream that wants it.
+ */
+static int dev_uvd_init(struct rdn_device *dev)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	int up = 0, vcpu = 0, ring = 0, status = 0;
+
+	if (!IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_INFO, 0, 3, &up, &vcpu, &ring) &&
+	    up)
+		return 0;
+	if (IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_INIT, 1, 1, 0, &status)) {
+		fprintf(stderr, "rdn: the video decoder did not start\n");
+		return -1;
+	}
+	return 0;
+}
+
+static int dev_uvd_submit(struct rdn_device *dev, uint64_t offset, uint32_t words,
+			  uint32_t *fence)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	int seq = 0;
+
+	if (IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_SUBMIT, 2, 1,
+					  (int)offset, (int)words, &seq))
+		return -1;
+	*fence = (uint32_t)seq;
+	return 0;
+}
+
+static int dev_uvd_fence_wait(struct rdn_device *dev, uint32_t fence, uint64_t timeout_ns)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	uint64_t ms = timeout_ns / 1000000;
+	int reached = 0;
+
+	/* As for the 3D engine: "forever" still ends. */
+	if (ms > 10000)
+		ms = 10000;
+	if (timeout_ns && !ms)
+		ms = 1;
+	if (IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_FENCE_WAIT, 2, 1,
+					  (int)fence, (int)ms, &reached))
+		return -1;
+	return reached ? 0 : -1;
+}
+
 static bool dev_fence_done(struct rdn_device *dev, uint32_t fence)
 {
 	return fence_wait_ms((struct darwin_device *)dev, fence, 0);
@@ -614,6 +664,17 @@ struct rdn_device *rdn_device_open(void)
 	d->base.fence_wait = dev_fence_wait;
 	d->base.sync_for_cpu = dev_sync_for_cpu;
 	d->base.destroy = dev_destroy;
+	/* A kext without the decoder's firmware refuses the method. */
+	{
+		int up = 0, vcpu = 0, ring = 0;
+
+		if (!getenv("RDN_NO_UVD") &&
+		    !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_INFO, 0, 3, &up, &vcpu, &ring)) {
+			d->base.uvd_init = dev_uvd_init;
+			d->base.uvd_submit = dev_uvd_submit;
+			d->base.uvd_fence_wait = dev_uvd_fence_wait;
+		}
+	}
 	d->base.surface_region = dev_surface_region;
 	d->base.screen_refresh = dev_screen_refresh;
 	d->base.surface_buffer = dev_surface_buffer;

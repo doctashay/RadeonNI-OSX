@@ -12,6 +12,14 @@
  * Surface layouts come from Mesa's own radeon_drm_surface.c and
  * radeon_surface.c, built unchanged (see shim/).
  *
+ * The video decoder (UVD) is a second command stream type, with fences of
+ * its own. r600's radeon_uvd.c names the buffers it uses the way the radeon
+ * kernel driver takes them (the offset in the buffer and four times the
+ * buffer's place in the stream's list); the addresses are filled in when the
+ * stream is flushed, as the kernel does. The two rings do not know of each
+ * other, so a stream waits (on the CPU) for the other ring's work on the
+ * buffers it names before it is submitted.
+ *
  * Not here: buffer sharing between processes, a second (DMA) ring, any
  * checking of the command stream.
  *
@@ -39,6 +47,8 @@ uint32_t rdn_shim_tiling_config;
 
 /* Command words per stream; r600 flushes itself well below this. */
 #define RDN_CS_MAX_DW (64 * 1024)
+/* A video decoder stream is a few dozen words per picture. */
+#define RDN_UVD_CS_MAX_DW 4096
 
 /*
  * Where a buffer's memory is: video memory the CPU maps through the
@@ -54,6 +64,8 @@ struct rdn_fence {
    uint32_t number;
    bool submitted;
    bool reached;
+   /* The video decoder's numbering. */
+   bool uvd;
 };
 
 /*
@@ -65,6 +77,8 @@ struct rdn_fence {
 struct rdn_busy {
    uint32_t number;
    bool used;
+   /* Of the video decoder's numbering. */
+   bool uvd;
 };
 
 struct rdn_bo {
@@ -75,6 +89,8 @@ struct rdn_bo {
    /* The last submissions that use it at all, and that write to it. */
    struct rdn_busy last_use;
    struct rdn_busy last_write;
+   /* The last video decoder submission that uses it (read or write). */
+   struct rdn_busy last_uvd;
    /* Memory that is not from the allocator (the screen). */
    bool foreign;
    enum rdn_place region;
@@ -106,6 +122,8 @@ struct rdn_cs {
    void (*flush_cs)(void *ctx, unsigned flags, struct pipe_fence_handle **fence);
    void *flush_data;
    struct rdn_fence *next_fence;
+   /* A stream of video decoder commands. */
+   bool uvd;
 };
 
 struct rdn_cached {
@@ -156,22 +174,31 @@ static struct rdn_fence *rdn_fence_new(void)
    return fence;
 }
 
-/* True once the GPU has finished command buffer `number`. */
-static bool rdn_number_wait(struct radeon_drm_winsys *ws, uint32_t number,
+/*
+ * True once the GPU has finished command buffer `number` (of the video
+ * decoder's, with `uvd`).
+ */
+static bool rdn_number_wait(struct radeon_drm_winsys *ws, uint32_t number, bool uvd,
                             uint64_t timeout_ns)
 {
+   uint32_t *last_done = uvd ? &ws->uvd_last_done : &ws->last_done;
+   bool *have_last_done = uvd ? &ws->have_uvd_last_done : &ws->have_last_done;
+
    /* They finish in the order of their numbers: no need to ask. */
-   if (ws->have_last_done && (int32_t)(number - ws->last_done) <= 0)
+   if (*have_last_done && (int32_t)(number - *last_done) <= 0)
       return true;
-   if (timeout_ns == 0) {
+   if (uvd) {
+      if (ws->dev->uvd_fence_wait(ws->dev, number, timeout_ns))
+         return false;
+   } else if (timeout_ns == 0) {
       if (!ws->dev->fence_done(ws->dev, number))
          return false;
    } else if (ws->dev->fence_wait(ws->dev, number, timeout_ns)) {
       return false;
    }
-   if (!ws->have_last_done || (int32_t)(number - ws->last_done) > 0) {
-      ws->last_done = number;
-      ws->have_last_done = true;
+   if (!*have_last_done || (int32_t)(number - *last_done) > 0) {
+      *last_done = number;
+      *have_last_done = true;
    }
    return true;
 }
@@ -179,7 +206,7 @@ static bool rdn_number_wait(struct radeon_drm_winsys *ws, uint32_t number,
 static bool rdn_busy_wait(struct radeon_drm_winsys *ws, const struct rdn_busy *busy,
                           uint64_t timeout_ns)
 {
-   return !busy->used || rdn_number_wait(ws, busy->number, timeout_ns);
+   return !busy->used || rdn_number_wait(ws, busy->number, busy->uvd, timeout_ns);
 }
 
 static bool rdn_fence_wait(struct radeon_drm_winsys *ws, struct rdn_fence *fence,
@@ -189,7 +216,7 @@ static bool rdn_fence_wait(struct radeon_drm_winsys *ws, struct rdn_fence *fence
       return true;
    if (!fence->submitted)
       return false;
-   if (!rdn_number_wait(ws, fence->number, timeout_ns))
+   if (!rdn_number_wait(ws, fence->number, fence->uvd, timeout_ns))
       return false;
    fence->reached = true;
    return true;
@@ -442,11 +469,15 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
     * alone (buffers the CPU keeps writing: vertices, constants, staging
     * copies) goes to the program's own memory behind the GART, if that is
     * on: ordinary cached memory instead of the aperture. The rest, and
-    * whatever does not fit where it should, goes in the aperture.
+    * whatever does not fit where it should, goes in the aperture. So does
+    * what r600 marks as shareable (it leaves out RADEON_FLAG_NO_INTERPROCESS_SHARING):
+    * the video decoder's message and bitstream buffers are such, and the
+    * decoder reads its messages from the 256 MB of video memory it lives in.
     */
    if ((flags & RADEON_FLAG_NO_CPU_ACCESS) && ws->dev->alloc_hidden)
       want = RDN_HIDDEN;
-   else if (domain == RADEON_DOMAIN_GTT && ws->dev->gart_alloc)
+   else if (domain == RADEON_DOMAIN_GTT && ws->dev->gart_alloc &&
+            (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING))
       want = RDN_GART;
    else
       want = RDN_VISIBLE;
@@ -544,8 +575,10 @@ static void rdn_buffer_destroy(struct radeon_winsys *rws, struct pb_buffer_lean 
       /*
        * The GPU may still be using the memory. Waiting for it here would
        * stop the program at every buffer it drops while drawing, so the
-       * memory is kept, with the fence after which it is free.
+       * memory is kept, with the fence after which it is free. (The cache
+       * notes one fence: the video decoder's is waited for.)
        */
+      rdn_busy_wait(ws, &bo->last_uvd, OS_TIMEOUT_INFINITE);
       simple_mtx_lock(&ws->lock);
       rdn_cache_put(ws, bo->offset, bo->base.size, bo->region, &bo->last_use);
       ws->allocated_bytes -= bo->base.size;
@@ -626,10 +659,23 @@ static bool rdn_buffer_wait(struct radeon_winsys *rws, struct pb_buffer_lean *bu
 {
    struct rdn_bo *bo = rdn_bo(buf);
 
-   /* A reader only has to wait for writers. */
+   /* A reader only has to wait for writers (the video decoder's work counts as both). */
    return rdn_busy_wait(rdn_winsys(rws),
                         (usage & RADEON_USAGE_WRITE) ? &bo->last_use : &bo->last_write,
-                        timeout);
+                        timeout) &&
+          rdn_busy_wait(rdn_winsys(rws), &bo->last_uvd, timeout);
+}
+
+static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
+                        struct pipe_fence_handle **pfence);
+
+/* What a stream does before the CPU maps a buffer that it refers to. */
+static void rdn_cs_flush_for_map(struct radeon_cmdbuf *rcs, struct rdn_cs *cs, unsigned flags)
+{
+   if (cs->flush_cs)
+      cs->flush_cs(cs->flush_data, flags, NULL);
+   else
+      rdn_cs_flush(rcs, flags, NULL);
 }
 
 static void *rdn_buffer_map(struct radeon_winsys *rws, struct pb_buffer_lean *buf,
@@ -650,14 +696,14 @@ static void *rdn_buffer_map(struct radeon_winsys *rws, struct pb_buffer_lean *bu
 
       if (usage & PIPE_MAP_DONTBLOCK) {
          if (cs && rdn_cs_is_buffer_referenced(rcs, buf, conflicts)) {
-            cs->flush_cs(cs->flush_data, RADEON_FLUSH_ASYNC_START_NEXT_GFX_IB_NOW, NULL);
+            rdn_cs_flush_for_map(rcs, cs, RADEON_FLUSH_ASYNC_START_NEXT_GFX_IB_NOW);
             return NULL;
          }
          if (!rdn_buffer_wait(rws, buf, 0, wait_usage))
             return NULL;
       } else {
          if (cs && rdn_cs_is_buffer_referenced(rcs, buf, conflicts))
-            cs->flush_cs(cs->flush_data, RADEON_FLUSH_START_NEXT_GFX_IB_NOW, NULL);
+            rdn_cs_flush_for_map(rcs, cs, RADEON_FLUSH_START_NEXT_GFX_IB_NOW);
          rdn_buffer_wait(rws, buf, OS_TIMEOUT_INFINITE, wait_usage);
       }
       /* The aperture's cache of host accesses; system memory has none. */
@@ -834,23 +880,40 @@ static bool rdn_cs_create(struct radeon_cmdbuf *rcs, struct radeon_winsys_ctx *c
                                         struct pipe_fence_handle **fence),
                           void *flush_ctx)
 {
+   struct radeon_drm_winsys *ws = (struct radeon_drm_winsys *)ctx;
+   unsigned max_dw = RDN_CS_MAX_DW;
    struct rdn_cs *cs;
 
-   /* One ring: the 3D command processor. */
-   if (ip_type != AMD_IP_GFX)
+   /* The 3D command processor, and the video decoder if there is one. */
+   if (ip_type == AMD_IP_UVD) {
+      bool ready;
+
+      if (!ws->dev->uvd_submit)
+         return false;
+      simple_mtx_lock(&ws->lock);
+      /* Started by the first stream that wants it. */
+      ready = ws->uvd_ready || !ws->dev->uvd_init(ws->dev);
+      ws->uvd_ready = ready;
+      simple_mtx_unlock(&ws->lock);
+      if (!ready)
+         return false;
+      max_dw = RDN_UVD_CS_MAX_DW;
+   } else if (ip_type != AMD_IP_GFX) {
       return false;
+   }
    cs = CALLOC_STRUCT(rdn_cs);
    if (!cs)
       return false;
    memset(rcs, 0, sizeof(*rcs));
-   cs->ws = (struct radeon_drm_winsys *)ctx;
-   rcs->current.buf = MALLOC(RDN_CS_MAX_DW * 4);
+   cs->ws = ws;
+   cs->uvd = ip_type == AMD_IP_UVD;
+   rcs->current.buf = MALLOC(max_dw * 4);
    if (!rcs->current.buf || !rdn_cs_hash_resize(cs, RDN_CS_HASH)) {
       FREE(rcs->current.buf);
       FREE(cs);
       return false;
    }
-   rcs->current.max_dw = RDN_CS_MAX_DW;
+   rcs->current.max_dw = max_dw;
    cs->flush_cs = flush;
    cs->flush_data = flush_ctx;
    rcs->priv = cs;
@@ -868,7 +931,9 @@ static void rdn_cs_release_buffers(struct rdn_cs *cs, const struct rdn_busy *bus
    for (i = 0; i < cs->num_buffers; i++) {
       struct rdn_cs_buffer *b = &cs->buffers[i];
 
-      if (busy) {
+      if (busy && busy->uvd) {
+         b->bo->last_uvd = *busy;
+      } else if (busy) {
          b->bo->last_use = *busy;
          if (b->usage & RADEON_USAGE_WRITE)
             b->bo->last_write = *busy;
@@ -1024,11 +1089,180 @@ static void rdn_throttle(struct radeon_drm_winsys *ws)
    }
 }
 
+/*
+ * With the lock held: video memory for a command buffer of `size` bytes,
+ * once the earlier ones have made room.
+ */
+static int rdn_ib_alloc(struct radeon_drm_winsys *ws, uint64_t size, uint64_t *offset)
+{
+   int r;
+
+   rdn_reap_ibs(ws, false);
+   rdn_cache_trim(ws, false);
+   rdn_throttle(ws);
+   r = rdn_cache_get(ws, size, 4096, RDN_VISIBLE, offset) ? 0 :
+       ws->dev->alloc(ws->dev, size, 4096, offset);
+   if (r) {
+      /* Wait for the earlier ones to finish and try once more. */
+      rdn_reap_ibs(ws, true);
+      rdn_cache_trim(ws, true);
+      r = ws->dev->alloc(ws->dev, size, 4096, offset);
+   }
+   return r;
+}
+
 /* RDN_STATS: what went to the GPU. */
 static struct {
    uint64_t flushes, bytes;
    unsigned most_buffers;
 } rdn_cs_stats;
+
+/*
+ * Video decoder streams
+ */
+
+/*
+ * The registers r600's radeon_uvd.c writes a command's buffer address and
+ * kind to (RUVD_GPCOM_VCPU_DATA0, _DATA1).
+ */
+#define RDN_UVD_GPCOM_VCPU_DATA0 0xEF10
+#define RDN_UVD_GPCOM_VCPU_DATA1 0xEF14
+
+/*
+ * Replace the buffer references of a stream by addresses, as the radeon
+ * kernel driver does (radeon_uvd_cs_reloc): DATA0 holds the offset in the
+ * buffer and DATA1 four times its index in the stream's list; they become
+ * the low and high words of the 40-bit address. False if the stream is not
+ * made of register writes or names a buffer the decoder cannot reach.
+ */
+static bool rdn_uvd_relocate(struct rdn_cs *cs, struct radeon_cmdbuf *rcs)
+{
+   uint32_t *w = rcs->current.buf;
+   unsigned i = 0, data0 = ~0u;
+
+   while (i < rcs->current.cdw) {
+      unsigned type = w[i] >> 30;
+      unsigned count, reg, j;
+
+      if (type == 2) {
+         i++;
+         continue;
+      }
+      if (type != 0)
+         return false;
+      count = ((w[i] >> 16) & 0x3fff) + 1;
+      reg = (w[i] & 0xffff) << 2;
+      if (i + 1 + count > rcs->current.cdw)
+         return false;
+      for (j = 0; j < count; j++, reg += 4) {
+         unsigned at = i + 1 + j;
+
+         if (reg == RDN_UVD_GPCOM_VCPU_DATA0) {
+            data0 = at;
+         } else if (reg == RDN_UVD_GPCOM_VCPU_DATA1) {
+            unsigned index = w[at] / 4;
+            uint64_t address;
+            struct rdn_bo *bo;
+
+            if (data0 == ~0u || index >= cs->num_buffers)
+               return false;
+            bo = cs->buffers[index].bo;
+            /* Only video memory: the program's own memory is out of the decoder's reach. */
+            if (bo->region == RDN_GART || bo->region == RDN_USER || w[data0] >= bo->base.size)
+               return false;
+            address = rdn_buffer_get_virtual_address(&bo->base) + w[data0];
+            w[data0] = (uint32_t)address;
+            w[at] = (uint32_t)(address >> 32);
+            data0 = ~0u;
+         }
+      }
+      i += 1 + count;
+   }
+   return true;
+}
+
+static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
+                            struct pipe_fence_handle **pfence)
+{
+   struct rdn_cs *cs = (struct rdn_cs *)rcs->priv;
+   struct radeon_drm_winsys *ws = cs->ws;
+   struct rdn_pending_ib *ib;
+   struct rdn_fence *fence;
+   struct rdn_busy busy = { 0, false, true };
+   uint64_t offset, ib_size;
+   int r = 0;
+
+   /* Pad to 16 words, as radeon_drm_cs.c does for the decoder. */
+   while (rcs->current.cdw & 15)
+      rcs->current.buf[rcs->current.cdw++] = 0x80000000; /* type2 nop packet */
+
+   fence = rdn_fence_new();
+   ib = CALLOC_STRUCT(rdn_pending_ib);
+   if (!fence || !ib) {
+      FREE(ib);
+      FREE(fence);
+      return -ENOMEM;
+   }
+   fence->uvd = true;
+
+   if (!rcs->current.cdw) {
+      /* Nothing to run. */
+      FREE(ib);
+      fence->reached = true;
+   } else if (!rdn_uvd_relocate(cs, rcs)) {
+      fprintf(stderr, "rdn: video decoder commands refused: they name memory it cannot reach\n");
+      FREE(ib);
+      fence->reached = true;
+      r = -EINVAL;
+   } else {
+      /* What the 3D engine did to these buffers (or still reads of them) first. */
+      for (unsigned i = 0; i < cs->num_buffers; i++) {
+         struct rdn_bo *bo = cs->buffers[i].bo;
+
+         rdn_busy_wait(ws, (cs->buffers[i].usage & RADEON_USAGE_WRITE) ? &bo->last_use :
+                                                                         &bo->last_write,
+                       OS_TIMEOUT_INFINITE);
+      }
+      ib_size = align64(rcs->current.cdw * 4, 4096);
+      simple_mtx_lock(&ws->lock);
+      r = rdn_ib_alloc(ws, ib_size, &offset);
+      if (!r) {
+         memcpy((uint8_t *)ws->dev->aperture + offset, rcs->current.buf,
+                rcs->current.cdw * 4);
+         r = ws->dev->uvd_submit(ws->dev, offset, rcs->current.cdw, &fence->number);
+         if (r)
+            ws->dev->free(ws->dev, offset);
+      }
+      if (r) {
+         simple_mtx_unlock(&ws->lock);
+         fprintf(stderr, "rdn: video decoder command submission failed (%d)\n", r);
+         FREE(ib);
+         fence->reached = true;
+      } else {
+         fence->submitted = true;
+         ws->uvd_used = true;
+         busy.number = fence->number;
+         busy.used = true;
+         ib->offset = offset;
+         ib->size = ib_size;
+         ib->busy = busy;
+         list_addtail(&ib->list, &ws->pending_ibs);
+         simple_mtx_unlock(&ws->lock);
+         if (rdn_sync_mode() & 1)
+            rdn_fence_wait(ws, fence, OS_TIMEOUT_INFINITE);
+      }
+   }
+
+   rdn_cs_release_buffers(cs, r ? NULL : &busy);
+   rcs->current.cdw = 0;
+   rcs->used_vram_kb = 0;
+   rcs->used_gart_kb = 0;
+
+   if (pfence)
+      rdn_fence_set((struct rdn_fence **)pfence, fence);
+   rdn_fence_set(&fence, NULL);
+   return r;
+}
 
 static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
                         struct pipe_fence_handle **pfence)
@@ -1037,9 +1271,12 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    struct radeon_drm_winsys *ws = cs->ws;
    struct rdn_pending_ib *ib;
    struct rdn_fence *fence;
-   struct rdn_busy busy = { 0, false };
+   struct rdn_busy busy = { 0, false, false };
    uint64_t offset, ib_size;
    int r;
+
+   if (cs->uvd)
+      return rdn_uvd_cs_flush(rcs, flags, pfence);
 
    /* Pad to 8 words, as the command processor fetches (radeon_drm_cs.c). */
    while (rcs->current.cdw & 7)
@@ -1058,18 +1295,13 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    /* In steps of 64 KB, so that the cache has one of the size again. */
    ib_size = align64(rcs->current.cdw * 4, 64 * 1024);
 
+   /* What the video decoder is doing to these buffers comes first. */
+   if (ws->uvd_used)
+      for (unsigned i = 0; i < cs->num_buffers; i++)
+         rdn_busy_wait(ws, &cs->buffers[i].bo->last_uvd, OS_TIMEOUT_INFINITE);
+
    simple_mtx_lock(&ws->lock);
-   rdn_reap_ibs(ws, false);
-   rdn_cache_trim(ws, false);
-   rdn_throttle(ws);
-   r = rdn_cache_get(ws, ib_size, 4096, RDN_VISIBLE, &offset) ? 0 :
-       ws->dev->alloc(ws->dev, ib_size, 4096, &offset);
-   if (r) {
-      /* Wait for the earlier ones to finish and try once more. */
-      rdn_reap_ibs(ws, true);
-      rdn_cache_trim(ws, true);
-      r = ws->dev->alloc(ws->dev, ib_size, 4096, &offset);
-   }
+   r = rdn_ib_alloc(ws, ib_size, &offset);
    if (!r) {
       /*
        * The words are in the CPU's byte order, which the device expects.
@@ -1228,6 +1460,8 @@ static void rdn_init_info(struct radeon_drm_winsys *ws)
    info->ip[AMD_IP_GFX].ver_major = 5;
    info->ip[AMD_IP_GFX].ib_alignment = 4096;
    info->ip[AMD_IP_SDMA].num_queues = 0;
+   /* r600 offers the decoder when this is not 0. */
+   info->ip[AMD_IP_UVD].num_queues = ws->dev->uvd_submit ? 1 : 0;
 
    info->has_userptr = ws->dev->gart_bind_user != NULL;
    /*
