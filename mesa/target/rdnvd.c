@@ -488,6 +488,31 @@ RDNVD_PUBLIC struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_
 	return s;
 }
 
+extern bool rdn_target_vram_alloc(uint32_t bytes, uint32_t *offset);
+extern void rdn_target_vram_free(uint32_t offset);
+
+RDNVD_PUBLIC int rdnvd_h264_room(struct rdnvd *d, unsigned width, unsigned height)
+{
+	unsigned w = (width + 15) & ~15u, h = (height + 15) & ~15u, mbs = w / 16 * (h / 16);
+	uint64_t image = (((uint64_t)((w + 31) & ~31u) * h * 3 / 2) + 1023) & ~1023ull;
+	/* Mesa's decoder: 17 pictures and their contexts in one buffer, the pictures it hands out, four bitstream buffers */
+	uint64_t dpb = image * 17 + (uint64_t)mbs * 192 * 17 + (uint64_t)mbs * 32 + 65536;
+	uint64_t rest = image * 8 + 4ull * w * h * 2 + (1 << 20);
+	uint32_t a, b;
+	int ok = 0;
+
+	if (dpb > 0x7fffffff || rest > 0x7fffffff)
+		return 0;
+	if (rdn_target_vram_alloc((uint32_t)dpb, &a)) {
+		if (rdn_target_vram_alloc((uint32_t)rest, &b)) {
+			rdn_target_vram_free(b);
+			ok = 1;
+		}
+		rdn_target_vram_free(a);
+	}
+	return ok;
+}
+
 RDNVD_PUBLIC int rdnvd_h264_prepare(struct rdnvd_session *s)
 {
 	const struct rdnvd_h264_sps *sps = rdnvd_h264_parser_first_sps(s->parser);

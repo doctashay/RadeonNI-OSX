@@ -242,6 +242,7 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 	Handle avcc = NULL;
 	unsigned nal = 0;
 	OSErr err;
+	int room;
 
 	cap->bandMin = (**desc).height;
 	cap->bandInc = cap->bandMin;
@@ -282,6 +283,19 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 	pthread_mutex_unlock(&gLock);
 	if (!storage->session) {
 		say("declined: %ldx%ld stream not taken by the card", (long)(**desc).width, (long)(**desc).height);
+		return codecUnimpErr;
+	}
+	/* another decoder (this program's or another's) may have the card's video memory the decoder reaches */
+	pthread_mutex_lock(&gLock);
+	room = rdnvd_h264_room(gDevice, (unsigned)(**desc).width, (unsigned)(**desc).height);
+	pthread_mutex_unlock(&gLock);
+	if (!room) {
+		say("declined: no video memory for a %ldx%ld decoder now (another decoder has it)", (long)(**desc).width,
+		    (long)(**desc).height);
+		pthread_mutex_lock(&gLock);
+		rdnvd_h264_close(storage->session);
+		storage->session = NULL;
+		pthread_mutex_unlock(&gLock);
 		return codecUnimpErr;
 	}
 	storage->nalLengthSize = nal;

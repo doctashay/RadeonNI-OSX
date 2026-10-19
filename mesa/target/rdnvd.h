@@ -69,6 +69,11 @@ void rdnvd_close(struct rdnvd *d);
 struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_t *avcc, size_t avcc_size,
 				      rdnvd_output_fn output, void *user, unsigned *nal_length_size);
 /*
+ * Whether the card has the video memory for another decoder of this picture size now (some 125 MB at 1080p, 50 MB at
+ * 720p, all of it in the 256 MB the decoder reaches: one 1080p decoder at a time). Looks, takes nothing.
+ */
+int rdnvd_h264_room(struct rdnvd *d, unsigned width, unsigned height);
+/*
  * Makes the decoder (and takes its video memory) now, for a session opened with an avcC record; otherwise it is made
  * when the first picture comes. 0, or an error: another decoder may have the card's memory.
  */
