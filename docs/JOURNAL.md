@@ -7115,3 +7115,23 @@ then uvd_v1_0_init.
 - Earlier full-trace replays failed because they replayed Linux's own POST, which leaves VRAM unreadable
   (reads return garbage); the POST must come from `rdn_tool post`.
 Next: delta-debug the 2,191 writes down to the ones that matter.
+
+2026-10-18 evening (x86 host): THE UVD VCPU BOOTS FROM OUR CODE, from a cold POSTed card, and the ring test passes.
+How: cold-start delta debugging (reboot per test; a secondary bus reset leaves state behind and gave
+false results) of radeon's 2,191 post-POST register writes (radeon 6.18.57 built out of tree with skip bits, minimal
+configuration, run on a card WE posted, mmiotrace) down to 9 writes plus the firmware in VRAM:
+  MC_VM_FB_LOCATION = 0x003f0000 and HDP_NONSURFACE_BASE = 0 (VRAM at MC address 0: our POST leaves it at
+  0xF00000000, above 4 GB, where the VCPU's window does not work), UVD_VCPU_CACHE_OFFSET0 = 0x8000 and
+  SIZE0 = 0x6600 (window 0 only), UVD_VCPU_CHIP_ID = 0x01000011, RLC_CNTL = 1 (RLC_ENABLE), UVD_CGC_GATE = 0,
+  UVD_VCPU_CNTL = 0x200, UVD_SOFT_RESET = 0.
+Details that mattered: the RLC enable must come AFTER the memory window and chip id (evergreen_startup order:
+uvd_v2_2_resume before the RLC resume in r600_irq_init) and the RLC needs a few hundred ms before the VCPU is
+released; nothing else of radeon's init (PLL, LMI control, interrupt handler, GART, GFX init, MC microcode,
+RLC ucode upload) is needed for the VCPU to boot.
+`rdn_tool` `RDN_MIN=1` (`RDN_UVD_F_MINIMAL`; `RDN_MIN_LMI=1` adds the LMI/MPC writes): the firmware executes
+(40 bytes at image offset 320 change to exactly Linux's post-boot values), `UVD_STATUS` 2.
+The ring test failed until the submission was padded to 16 dwords with UVD_NO_OP like radeon's
+`ring->align_mask`: the ring controller fetches in 16-dword blocks (WPTR read back 0 for a 2-dword write).
+Earlier failures explained: our flow never moved VRAM below 4 GB, then started the RLC before the window.
+Open: the IB/fence test (`uvd IB: -60`, fence write-back), the LMI block (needed or not), porting to the kext
+and the G5 (big-endian: ring words, the LMI swap), then the QEMU Tiger guest, then the VA-API/decoder layer.
