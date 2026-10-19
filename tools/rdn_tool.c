@@ -955,6 +955,8 @@ static int do_uvdonly(struct linux_card *lc, struct rdn_card *card, uint32_t fla
 	if (!r) {
 		uint32_t ib = (200u << 20) + 0x20000;
 
+		printf("fence word after init: %08x\n", (unsigned)rdn_vram_read32(&accel, (200u << 20) + 4096));
+		rdn_vram_write32(&accel, (200u << 20) + 4096, 0);
 		rdn_vram_write32(&accel, ib, RDN_UVD_PACKET0(UVD_CONTEXT_ID, 0));
 		rdn_vram_write32(&accel, ib + 4, 0x600DF00D);
 		r = rdn_uvd_wake(&uvd);
