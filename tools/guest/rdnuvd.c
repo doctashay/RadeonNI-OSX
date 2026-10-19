@@ -10,6 +10,7 @@
  *   rdnuvd test          init if needed, then run one indirect buffer that
  *                        writes UVD_CONTEXT_ID, wait for its fence, read it back
  *   rdnuvd regs          UVD_STATUS and the registers rdn_uvd.c programs
+ *   rdnuvd bw            how fast the CPU reads and writes video memory through the aperture, by access width
  *   rdnuvd dump <fw>     after a failed init: allocate the same amount of video
  *                        memory (the kext freed its region, and freeing does not
  *                        clear it) and compare its start with the firmware file
@@ -139,6 +140,63 @@ static int do_dump(const char *path)
 	return bad != 0;
 }
 
+#include <sys/time.h>
+
+static double now_s(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return tv.tv_sec + tv.tv_usec / 1e6;
+}
+
+/* Reads and writes of one video-memory buffer by the CPU, MB/s, for each access width. */
+static int do_bw(void)
+{
+	enum { BYTES = 4 << 20 };
+	int off = 0;
+	volatile uint8_t *m8;
+	volatile uint32_t *m32;
+	volatile double *m64;
+	double t;
+	unsigned long sum = 0;
+	size_t i;
+
+	if (IOConnectMethodScalarIScalarO(conn, RDN_UC_ALLOC, 2, 1, BYTES, 4096, &off)) {
+		fprintf(stderr, "no video memory\n");
+		return 1;
+	}
+	m8 = (volatile uint8_t *)aperture + off;
+	m32 = (volatile uint32_t *)m8;
+	m64 = (volatile double *)m8;
+	t = now_s();
+	for (i = 0; i < BYTES; i++)
+		m8[i] = (uint8_t)i;
+	printf("write, 8-bit stores:  %6.1f MB/s\n", BYTES / (now_s() - t) / 1e6);
+	t = now_s();
+	for (i = 0; i < BYTES / 4; i++)
+		m32[i] = (uint32_t)i;
+	printf("write, 32-bit stores: %6.1f MB/s\n", BYTES / (now_s() - t) / 1e6);
+	t = now_s();
+	for (i = 0; i < BYTES / 8; i++)
+		m64[i] = (double)i;
+	printf("write, 64-bit stores: %6.1f MB/s\n", BYTES / (now_s() - t) / 1e6);
+	t = now_s();
+	for (i = 0; i < BYTES / 16; i++)
+		sum += m8[i];
+	printf("read, 8-bit loads:    %6.1f MB/s\n", BYTES / 16 / (now_s() - t) / 1e6);
+	t = now_s();
+	for (i = 0; i < BYTES / 4 / 4; i++)
+		sum += m32[i];
+	printf("read, 32-bit loads:   %6.1f MB/s\n", BYTES / 4 / (now_s() - t) / 1e6);
+	t = now_s();
+	for (i = 0; i < BYTES / 8 / 2; i++)
+		sum += (unsigned long)m64[i];
+	printf("read, 64-bit loads:   %6.1f MB/s  (sum %lu)\n", BYTES / 2 / (now_s() - t) / 1e6, sum);
+	IOConnectMethodScalarIScalarO(conn, RDN_UC_FREE, 1, 0, off);
+	return 0;
+}
+
 static int init_flags;
 
 static int do_init(void)
@@ -196,10 +254,12 @@ int main(int argc, char **argv)
 		return do_test();
 	else if (!strcmp(cmd, "dump") && argc > 2)
 		return do_dump(argv[2]);
+	else if (!strcmp(cmd, "bw"))
+		return do_bw();
 	else if (!strcmp(cmd, "regs"))
 		show_regs();
 	else {
-		fprintf(stderr, "usage: rdnuvd info | init | test | regs | dump <firmware>\n");
+		fprintf(stderr, "usage: rdnuvd info | init | test | regs | bw | dump <firmware>\n");
 		return 2;
 	}
 	return 0;
