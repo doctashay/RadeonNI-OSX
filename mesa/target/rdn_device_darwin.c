@@ -367,11 +367,28 @@ static int dev_uvd_submit(struct rdn_device *dev, uint64_t offset, uint32_t word
 	return 0;
 }
 
+static long env_number(const char *name);
+static uint64_t now_us(void);
+
 static int dev_uvd_fence_wait(struct rdn_device *dev, uint32_t fence, uint64_t timeout_ns)
 {
+	static long spin_us = -1;
 	struct darwin_device *d = (struct darwin_device *)dev;
 	uint64_t ms = timeout_ns / 1000000;
 	int reached = 0;
+
+	/* As for the 3D engine (RDN_FENCE_SPIN): look for a while before the kext's sleeping wait. */
+	if (spin_us < 0)
+		spin_us = env_number("RDN_FENCE_SPIN");
+	if (spin_us && timeout_ns) {
+		uint64_t start = now_us();
+
+		do
+			if (!IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_FENCE_WAIT, 2, 1, (int)fence, 0,
+							   &reached) && reached)
+				return 0;
+		while (now_us() - start < (uint64_t)spin_us);
+	}
 
 	/* As for the 3D engine: "forever" still ends. */
 	if (ms > 10000)
