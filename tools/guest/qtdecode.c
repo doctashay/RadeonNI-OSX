@@ -4,7 +4,7 @@
  * buffers and compare every picture, in display order, with ffmpeg's decode of the same stream (yuv420p).
  * Nothing is shown on the screen.
  *
- *   qtdecode movie.mp4 reference.yuv [-c RadeonNIAVC.component] [-a]
+ *   qtdecode movie.mp4 reference.yuv|- [-c RadeonNIAVC.component] [-a]      (- : no reference, only count and time)
  *
  * -c  registers that component for this program only (nothing is installed) and makes the session use it;
  * -a  makes it use Apple's own H.264 decoder (a control: the program's own checks must pass with it too);
@@ -31,6 +31,7 @@ static const unsigned char *gRef;
 static size_t gRefSize;
 static unsigned gFrames, gBad, gWidth, gHeight;
 static unsigned gErrors;
+static int gNoRef;
 static double gT0;
 
 static double now_ms(void)
@@ -63,6 +64,10 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 		unsigned long bad = 0, bad_y = 0, bad_c = 0, bad_r = 0;
 		OSType fmt = CVPixelBufferGetPixelFormatType(pb);
 
+		if (gNoRef) {
+			gFrames++;
+			return;
+		}
 		if ((size_t)(gFrames + 1) * frame_bytes > gRefSize) {
 			gFrames++;
 			gBad++;
@@ -170,18 +175,22 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: qtdecode movie.mp4 reference.yuv [-c component] [-a]\n");
 		return 2;
 	}
-	f = fopen(ref_path, "rb");
-	if (!f)
-		return 1;
-	fseek(f, 0, SEEK_END);
-	size = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	ref = malloc(size);
-	if (!ref || fread(ref, 1, size, f) != (size_t)size)
-		return 1;
-	fclose(f);
-	gRef = ref;
-	gRefSize = size;
+	if (strcmp(ref_path, "-")) {
+		f = fopen(ref_path, "rb");
+		if (!f)
+			return 1;
+		fseek(f, 0, SEEK_END);
+		size = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		ref = malloc(size);
+		if (!ref || fread(ref, 1, size, f) != (size_t)size)
+			return 1;
+		fclose(f);
+		gRef = ref;
+		gRefSize = size;
+	} else {
+		gNoRef = 1;	/* only count the pictures and time them */
+	}
 
 	err = EnterMovies();
 	if (err) {
