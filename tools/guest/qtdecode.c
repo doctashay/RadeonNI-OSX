@@ -57,7 +57,7 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 		unsigned w = gWidth, h = gHeight, x, row;
 		size_t frame_bytes = (size_t)w * h * 3 / 2;
 		const unsigned char *ry, *ru, *rv;
-		unsigned long bad = 0;
+		unsigned long bad = 0, bad_y = 0, bad_c = 0, bad_r = 0;
 		OSType fmt = CVPixelBufferGetPixelFormatType(pb);
 
 		if ((size_t)(gFrames + 1) * frame_bytes > gRefSize) {
@@ -87,17 +87,18 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 				for (x = 0; x < w / 2; x++) {
 					unsigned u = p[4 * x], y0 = p[4 * x + 1], v = p[4 * x + 2], y1 = p[4 * x + 3];
 
-					bad += y0 != ry[row * w + 2 * x] || y1 != ry[row * w + 2 * x + 1];
-					bad += u != ru[(row / 2) * (w / 2) + x] || v != rv[(row / 2) * (w / 2) + x];
-					bad += pe[4 * x] != u || pe[4 * x + 2] != v;	/* the pair of rows alike */
+					bad_y += y0 != ry[row * w + 2 * x] || y1 != ry[row * w + 2 * x + 1];
+					bad_c += u != ru[(row / 2) * (w / 2) + x] || v != rv[(row / 2) * (w / 2) + x];
+					bad_r += pe[4 * x] != u || pe[4 * x + 2] != v;	/* the pair of rows alike */
 				}
 			}
 		}
 		CVPixelBufferUnlockBaseAddress(pb, 0);
+		bad = bad_y + bad_c + bad_r;
 		if (bad) {
 			if (gBad < 8)
-				printf("picture %u (display time %lld): %lu samples differ\n", gFrames,
-				       (long long)displayTime, bad);
+				printf("picture %u (display time %lld): luma pairs %lu, chroma pairs %lu, chroma rows unlike %lu "
+				       "(of %u pairs)\n", gFrames, (long long)displayTime, bad_y, bad_c, bad_r, w / 2 * h);
 			gBad++;
 		}
 		gFrames++;
