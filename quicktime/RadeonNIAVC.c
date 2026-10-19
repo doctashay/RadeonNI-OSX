@@ -184,6 +184,12 @@ pascal ComponentResult RDNAVC_Initialize(RDNAVCGlobals *storage, ImageSubCodecDe
 		cap->subCodecSupportsOutOfOrderDisplayTimes = true;
 		/* every sample is decoded (a picture may be a reference), including the ones that are not drawn */
 		cap->baseCodecShouldCallDecodeBandForAllFrames = true;
+		/*
+		 * Each frame keeps its own picture until it is drawn, so a reference frame may be decoded before the
+		 * one before it is drawn, and a frame may be drawn in decoding order.
+		 */
+		cap->subCodecSupportsDecodeSmoothing = true;
+		cap->subCodecSupportsDrawInDecodeOrder = true;
 	}
 	return noErr;
 }
