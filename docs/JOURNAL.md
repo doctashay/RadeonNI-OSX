@@ -7302,3 +7302,29 @@ other session alive, keeps fence numbers across restarts, counts sessions, new c
 new decoder, replay of the access units since the last IDR, three tries). `RDNVD_FAKE_STALL=n` makes the n-th decode count as a stall.
 After two hangs of the G5 (see memory) and the user's power cycle, the G5 came up without the card in its PCI tree. Nothing was installed.
 
+
+## 2026-10-19 (afternoon, G5 back): the recovery works on the card, but not for QuickTime Player's stall
+
+The card came back after the user had pulled it out by accident (the PCI tree had nothing; nothing of ours was at fault). Installed with the
+user's yes: the kext binary with the restart/epoch/reset code (old binary kept as `RadeonNI.before-stallfix-202610191327`), the QuickTime
+component (old copies in the G5's `/tmp`, lost at a restart), and the user restarted the G5 by hand (the permission check refused my
+`shutdown -r`; a first try of mine had not taken effect).
+- Test 1, faked stall at the third decode (`RDNVD_FAKE_STALL=3`, `rdn_uvdtest -A`): first run failed badly. Every decode after the first restart
+  was "not answered", three tries per access unit restarted the block 174 times in a minute, 2 of 60 pictures right. Fixes: a budget (three
+  failed recoveries in a row end the restarts; later data is decoded once).
+- The debug log showed what was wrong: the decode that was "not answered" had its feedback written some milliseconds after its fence. The
+  first decodes after a restart were answered 8 ms late (`RDNVD_LATE_MS` polling: "a decode was answered after 8 ms"); my check looked once,
+  right after the fence, and called it a stall. A wait after the restart (0 to 500 ms, before and after the decoder is made) changed nothing;
+  waiting for the answer did: faked stall + 250 ms wait: 60 of 60 pictures identical to ffmpeg's, healthy control run unchanged. The wait is the
+  default now (250 ms, `RDNVD_LATE_MS`); the settle delay is gone.
+- Test 2, ten `rdn_uvdtest -A -g 9000` runs with 4 s of cold disk reads in the gap (a different set of files each time): all ten 60/60, no
+  stall, no late answer. The kext restarted the block at each last-user exit as before. So the load trigger of the morning did not show.
+- Test 3, the colorbars clip in QuickTime Player (open, 5 s, play): the first picture is decoded and drawn right; the first decode after the
+  pause (at "play") is not answered, not even after 250 ms; the library restarted the firmware three times (epochs 236 to 238), each time the
+  replayed first picture was not answered either, and every decode until Player quit (13 s later) was not answered. So the stall Player causes
+  is not a firmware state a VCPU restart clears, and the restart code does not repair it. Not fixed: the user's report stands.
+- Open idea (not tried): the kext's "minimal" start resets only the VCPU on a restart (`vcpu_stop`), never the other blocks (LMI, RBC, CSM, CXW,
+  TAP, the decoder); a wedged decoder core would survive it. This morning's note that a dead decoder stayed dead through the kext's restarts
+  until the G5 was restarted fits. Linux's full start puts all of them in reset (`UVD_SOFT_RESET`, SRBM reset) first.
+- Known and harmless: the 15 "Non-aligned pointer being freed" lines at the start of every Leopard program that loads `librdnvd` are the
+  libstdc++ coalescing problem of docs/LEOPARD.md; the library needs the same export list as the GL bundle.

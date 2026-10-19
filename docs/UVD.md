@@ -159,6 +159,16 @@ The user's first look at the installed component (1080p clip): corrupt pictures,
    display time): all pictures shown in time and identical to ffmpeg's up to 1080p, also with Apple's decoder as the control. `tools/guest/qtplay.c` (movie with a visual
    context) shows pixel buffers whose values are not the decoder's (QuickTime converts them), so it cannot compare; it is kept for timing.
 
+### The decoder stalls in QuickTime Player (open issue, 2026-10-19)
+
+After the first picture, Player's "play" is the first decode that the firmware does not answer; nothing decodes until Player quits, and a restart of the firmware
+(three tries) does not bring it back. Headless runs with a gap and disk reads (`rdn_uvdtest -A -g 9000` plus cold reads, ten times) were all right on the new kext.
+What is built and works on the card: the kext restarts the block when a session starts with no other alive and on `RDN_UC_UVD_RESET` (epoch counter, fence numbers go
+on); `rdn_winsys_uvd_answered()` checks the feedback block (`feedback[1] == message[3]`); `rdnvd` waits up to 250 ms for it (`RDNVD_LATE_MS`: the first decodes after a
+restart are answered about 8 ms after their fence, the fence is not proof the picture is there), and on a stall resets, makes a new decoder and replays the access units since
+the last IDR (three tries in a row at most; `RDNVD_FAKE_STALL=n` tries it: 60 of 60 pictures right). What does not work: Player's stall itself. The kext's "minimal" start resets
+only the VCPU on a restart (`vcpu_stop`); a wedged decoder core would survive that, and Linux's full start resets every sub-block first (not tried).
+
 ## Why
 
 PowerVLC 2.1.0 on the G5 decodes H.264 on the CPU (ffmpeg). 1080p H.264 drops nearly every frame
