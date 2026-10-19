@@ -29,6 +29,8 @@
 #include <QuickTime/QuickTime.h>
 #include <CoreServices/CoreServices.h>
 #include <CoreVideo/CoreVideo.h>
+#include <OpenGL/OpenGL.h>
+#include <OpenGL/gl.h>
 
 static const unsigned char *gRef;
 static size_t gRefSize;
@@ -345,6 +347,26 @@ int main(int argc, char **argv)
 			timebase = NewTimeBase();
 			SetTimeBaseRate(timebase, 0);
 			SetTimeBaseValue(timebase, 0, scale);
+		}
+	}
+	if (getenv("QTDECODE_GL")) {
+		/* QuickTime Player has an OpenGL context (its window) in the same program as the decoder: make one */
+		CGLPixelFormatAttribute attrs[] = { kCGLPFAAccelerated, kCGLPFAColorSize, (CGLPixelFormatAttribute)24, (CGLPixelFormatAttribute)0 };
+		CGLPixelFormatObj pix = NULL;
+		CGLContextObj ctx = NULL;
+		GLint npix = 0;
+		CGLError ge = CGLChoosePixelFormat(attrs, &pix, &npix);
+
+		if (!ge && pix)
+			ge = CGLCreateContext(pix, NULL, &ctx);
+		if (!ge && ctx) {
+			CGLSetCurrentContext(ctx);
+			glClearColor(0.2f, 0.4f, 0.6f, 1.0f);
+			glClear(GL_COLOR_BUFFER_BIT);
+			glFinish();
+			printf("OpenGL context made: %s\n", (const char *)glGetString(GL_RENDERER));
+		} else {
+			printf("OpenGL context failed (%d)\n", (int)ge);
 		}
 	}
 	gT0 = now_ms();

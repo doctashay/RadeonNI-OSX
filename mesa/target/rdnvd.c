@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <syslog.h>
+#include <unistd.h>
 
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
@@ -643,6 +645,62 @@ struct staged {
 	unsigned y_pitch, c_at, c_pitch;
 };
 
+/*
+ * Debugging a picture that comes out wrong: with the file /tmp/rdnavc.debug, the picture's luma is also looked at in
+ * video memory itself (through the CPU's window on it) and in the system memory copy the card made of it, and what
+ * the two hold is logged (a count of zero bytes in the first 64 KB, and a sum).
+ */
+static int rdnvd_debug(void)
+{
+	static int on = -1;
+
+	if (on < 0)
+		on = getenv("RDNVD_DEBUG") != NULL || access("/tmp/rdnavc.debug", F_OK) == 0;
+	return on;
+}
+
+extern void *rdn_target_vram_map(uint32_t offset);
+
+static void rawcheck_sum(const uint8_t *p, unsigned n, unsigned *zero, unsigned *sum)
+{
+	unsigned i, z = 0, s = 0;
+
+	for (i = 0; i < n; i++) {
+		z += p[i] == 0;
+		s = s * 31 + p[i];
+	}
+	*zero = z;
+	*sum = s;
+}
+
+static unsigned gRawZero, gRawSum;
+
+static void rawcheck_before(struct rdnvd *d, struct pipe_resource *y, uint64_t byte_offset)
+{
+	struct r600_texture *t = r600_as_texture(y);
+	uint64_t at = t->resource.gpu_address + byte_offset;
+	const uint8_t *p;
+
+	gRawZero = gRawSum = 0;
+	/* the commands that wrote the picture are done before the copy of it is made: ask the context to finish them */
+	d->ctx->flush(d->ctx, NULL, 0);
+	p = rdn_target_vram_map((uint32_t)at);
+	if (p)
+		rawcheck_sum(p, 65536, &gRawZero, &gRawSum);
+}
+
+static void rawcheck_after(struct rdnvd *d, struct pipe_resource *y, uint64_t byte_offset, const uint8_t *staged,
+			   unsigned y_size)
+{
+	struct r600_texture *t = r600_as_texture(y);
+	unsigned zero, sum;
+
+	rawcheck_sum(staged, y_size < 65536 ? y_size : 65536, &zero, &sum);
+	syslog(LOG_NOTICE, "RadeonNIAVC: picture at video memory 0x%llx: in video memory %u zero bytes of 64K, sum %08x; the copy %u zero, sum %08x%s",
+	       (unsigned long long)(t->resource.gpu_address + byte_offset), gRawZero, gRawSum, zero, sum,
+	       gRawSum == sum ? "" : "  <- DIFFERENT");
+}
+
 static int frame_stage_dma(struct rdnvd_frame *frame, struct pipe_resource *res[3], struct staged *st)
 {
 	struct frame_buf *f = (struct frame_buf *)frame;
@@ -661,12 +719,16 @@ static int frame_stage_dma(struct rdnvd_frame *frame, struct pipe_resource *res[
 	}
 	r600_cp_dma_copy_buffer((struct r600_context *)d->ctx, d->staging, 0, res[0],
 				(uint64_t)ly->offset_256B * 256, y_size);
+	if (rdnvd_debug())
+		rawcheck_before(d, res[0], (uint64_t)ly->offset_256B * 256);
 	r600_cp_dma_copy_buffer((struct r600_context *)d->ctx, d->staging, c_at, res[1],
 				(uint64_t)lc->offset_256B * 256, c_size);
 	/* Mapping for reading flushes the commands and waits for them. */
 	st->src = pipe_buffer_map_range(d->ctx, d->staging, 0, total, PIPE_MAP_READ, &st->xfer);
 	if (!st->src)
 		return RDNVD_FAILED;
+	if (rdnvd_debug())
+		rawcheck_after(d, res[0], (uint64_t)ly->offset_256B * 256, st->src, y_size);
 	st->y_pitch = y_pitch;
 	st->c_at = c_at;
 	st->c_pitch = c_pitch;
