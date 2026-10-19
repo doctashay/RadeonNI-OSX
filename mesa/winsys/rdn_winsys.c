@@ -1225,9 +1225,9 @@ int rdn_winsys_uvd_answered(struct radeon_winsys *rws)
    struct radeon_drm_winsys *ws = rdn_winsys(rws);
    const uint8_t *msg, *fb;
 
+   /* asked again while the answer is late: the flag stays until the next stream is submitted */
    if (!ws->uvd_check)
       return 1;
-   ws->uvd_check = false;
    ws->dev->sync_for_cpu(ws->dev);
    msg = (const uint8_t *)ws->dev->aperture + ws->uvd_msg_at;
    fb = (const uint8_t *)ws->dev->aperture + ws->uvd_fb_at;

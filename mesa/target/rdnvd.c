@@ -430,11 +430,25 @@ static int on_decode(void *user, const struct rdnvd_h264_picture *pic, void **su
 			return RDNVD_FAILED;
 		}
 	}
-	if (!getenv("RDNVD_NO_STALL_CHECK") &&
-	    !rdn_winsys_uvd_answered(((struct r600_common_screen *)s->d->screen)->ws)) {
-		s->stalled = 1;
-		frame_unref(f);
-		return RDNVD_FAILED;
+	if (!getenv("RDNVD_NO_STALL_CHECK")) {
+		struct radeon_winsys *ws = ((struct r600_common_screen *)s->d->screen)->ws;
+		/* RDNVD_LATE_MS=n: wait up to n ms for an answer that is late, and say how long it took */
+		const char *e = getenv("RDNVD_LATE_MS");
+		unsigned late = e ? (unsigned)atoi(e) : 0, waited = 0;
+		int answered = rdn_winsys_uvd_answered(ws);
+
+		while (!answered && waited < late) {
+			usleep(2000);
+			waited += 2;
+			answered = rdn_winsys_uvd_answered(ws);
+		}
+		if (late && (waited || !answered))
+			syslog(LOG_NOTICE, "RadeonNIAVC: a decode %s after %u ms", answered ? "was answered" : "was not answered", waited);
+		if (!answered) {
+			s->stalled = 1;
+			frame_unref(f);
+			return RDNVD_FAILED;
+		}
 	}
 	*surface = f;
 	/* rdnvd_h264_decode_au() hands the caller the picture of the data it fed. */
