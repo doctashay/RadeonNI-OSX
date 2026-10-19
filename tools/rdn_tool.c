@@ -848,6 +848,11 @@ static int do_uvd(struct linux_card *lc, struct rdn_card *card, uint32_t flags)
 		if (!r)
 			r = rdn_uvd_fence_wait(&uvd, seq, 1000);
 		printf("uvd IB: %d, UVD_CONTEXT_ID %08x\n", r, (unsigned)rdn_rreg(card, UVD_CONTEXT_ID));
+		printf("uvd IB regs: RPTR %x WPTR %x IB_BASE %08x IB_SIZE %x RB_CNTL %08x fence word %08x seq %u\n",
+		       (unsigned)rdn_rreg(card, 0xf690), (unsigned)rdn_rreg(card, 0xf694),
+		       (unsigned)rdn_rreg(card, 0xf684), (unsigned)rdn_rreg(card, 0xf688),
+		       (unsigned)rdn_rreg(card, 0xf6a4), (unsigned)rdn_vram_read32(&accel, (200u << 20) + 4096),
+		       (unsigned)seq);
 		(void)rdn_uvd_idle(&uvd);
 		rdn_uvd_fini(&uvd);
 	}
