@@ -7361,3 +7361,27 @@ the kext's first restart "UVD restarted (epoch 1, reset level 1)" before it. The
   cache-inhibited memory, `sync` does. The 3D path has lived with that, but the decoder reads its command stream, the decode message and the
   bitstream the moment the doorbell rings, and a stale read of any of them could wedge it (load makes the window wider). Built: `__sync_synchronize()` in the winsys
   just before the kext call, `sync` in the kext before each UVD doorbell (`rdnStoreBarrier()`), both for decode streams and the kext's own destroy messages.
+
+## 2026-10-19 (evening, later): it is not QuickTime; launching an application breaks the decoder; a store barrier and reset levels change nothing
+
+After the sync barrier build (kext + winsys) Player still failed at its first decode. What was learned, in order:
+- Four headless decodes in a row (four level-1 restarts) all pass; `qtdecode` (the QuickTime ICM path, installed component, 150 of 150 right) passes with a pause, with
+  an OpenGL context made before the first picture and with one made after a 5 s pause. So not the sub-block reset, not GL in the process, not a gap.
+- With the component removed (Player on Apple's decoder, no session of ours) a plain headless decode right afterwards failed completely. A probe loop
+  (`rdn_uvdtest -A p20.h264` over and over; each iteration restarts the block twice) passed until Player was launched and failed from then on. So
+  the decoder is broken by something Player does on the machine, not by our component.
+- `tools/guest/winprobe.m` (Cocoa, no QuickTime) with the probe loop watching: started from the shell as a plain window, with a GL window, or with no window: no effect. Launched
+  through LaunchServices (`open -a Calculator`, `open -a winprobe.app`): the probe fails within seconds and stays failed. A bundle with LSUIElement (no Dock icon, no
+  menu bar) and a background launch (`open -g`): no effect. So the trigger is an application becoming the foreground application (menu bar, activation,
+  cursor, Dock), launched normally; in one run (the app started by an AppleScript `activate`) it came at the app's exit instead.
+- With one long decode session paced at 500 ms (`rdn_uvdtest -A -P 500`, no restarts by us): at the launch the decode stalled for 1.2 s and the library's
+  recovery (restart, replay since the IDR) brought it back with every picture right (the first real, not faked, stall repaired on the card);
+  at the app's exit it stalled again and three recoveries did not help. With the recovery off the session went wrong at the launch and a fresh process
+  afterwards failed too. So the hard wedge does not come from our restarts; it needs a restart of the G5.
+- Starting the block with the Linux power-management bits (`rdnuvd init 0x10d80`: PM_GLOBAL, PM_SCLK) hung the 3D engine: the next decode's DMA readback waited for a
+  graphics fence for ever. Do not use those flags.
+- A level 2 reset (SOFT_RESET_UVD) leaves the VCPU dead; removed. The `sync` before the doorbell stays (harmless, plausible, no effect seen).
+- Bugs found and fixed on the way: `recover()` freed the parser before the reset (Player crashed when the reset failed); a dead decoder made Player's
+  main thread wait 250 ms per picture, 150 times over and over (the library now gives up for 2 s, 4 s, up to 30 s and fails data at once; QuickTime then asks
+  for the next picture without pause, 100 % of a core: a failed decode must not be left to QuickTime).
+- The component is not installed on the G5 now (removed for these runs; `~/qt-build` has it, `scripts/qt-component.sh install` puts it back).
