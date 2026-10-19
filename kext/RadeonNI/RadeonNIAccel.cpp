@@ -1007,7 +1007,7 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 				if (handles[k] == msgs[i].handle)
 					break;
 			if (msgs[i].type == 0) {
-				if (k == *count && *count < kMaxUvdSessions) {
+				if (k == *count && *count < 32) {	/* RadeonNIUserClient::kMaxUvdSessions */
 					handles[(*count)++] = msgs[i].handle;
 					fUvdLive++;
 				}
