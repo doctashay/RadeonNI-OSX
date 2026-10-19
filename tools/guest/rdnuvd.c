@@ -10,6 +10,8 @@
  *   rdnuvd test          init if needed, then run one indirect buffer that
  *                        writes UVD_CONTEXT_ID, wait for its fence, read it back
  *   rdnuvd regs          UVD_STATUS and the registers rdn_uvd.c programs
+ *   rdnuvd fwcheck <fw>  compare the firmware in the running decoder's own memory with the file (it changes a few
+ *                        bytes of itself; thousands of other differences mean something wrote over it)
  *   rdnuvd bw            how fast the CPU reads and writes video memory through the aperture, by access width
  *   rdnuvd dump <fw>     after a failed init: allocate the same amount of video
  *                        memory (the kext freed its region, and freeing does not
@@ -197,6 +199,39 @@ static int do_bw(void)
 	return 0;
 }
 
+static int do_fwcheck(const char *path)
+{
+	int up = 0, vcpu = 0, ring = 0;
+	static uint8_t fw[300000];
+	FILE *f = fopen(path, "rb");
+	size_t n, i, bad = 0, first = (size_t)-1, shown = 0;
+	volatile uint8_t *m;
+
+	if (!f || !(n = fread(fw, 1, sizeof(fw), f))) {
+		fprintf(stderr, "cannot read %s\n", path);
+		return 1;
+	}
+	fclose(f);
+	if (IOConnectMethodScalarIScalarO(conn, RDN_UC_UVD_INFO, 0, 3, &up, &vcpu, &ring) || !up) {
+		printf("UVD is not up\n");
+		return 1;
+	}
+	m = (volatile uint8_t *)aperture + vcpu;
+	for (i = 0; i < n; i++)
+		if (m[i] != fw[i]) {
+			if (first == (size_t)-1)
+				first = i;
+			bad++;
+			if (shown < 12 && i % 4 == 0 && (shown == 0 || 1)) {
+				printf("  byte %lu: have %02x want %02x\n", (unsigned long)i, m[i], fw[i]);
+				shown++;
+			}
+		}
+	printf("firmware window at aperture offset 0x%x: %lu of %lu bytes differ (first at %lu)\n", (unsigned)vcpu,
+	       (unsigned long)bad, (unsigned long)n, first == (size_t)-1 ? 0UL : (unsigned long)first);
+	return 0;
+}
+
 static int init_flags;
 
 static int do_init(void)
@@ -254,6 +289,8 @@ int main(int argc, char **argv)
 		return do_test();
 	else if (!strcmp(cmd, "dump") && argc > 2)
 		return do_dump(argv[2]);
+	else if (!strcmp(cmd, "fwcheck") && argc > 2)
+		return do_fwcheck(argv[2]);
 	else if (!strcmp(cmd, "bw"))
 		return do_bw();
 	else if (!strcmp(cmd, "regs"))
