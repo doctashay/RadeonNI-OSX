@@ -170,6 +170,9 @@ static int on_sequence(void *user, const struct rdnvd_h264_sps *sps)
 
 	if (profile == PIPE_VIDEO_PROFILE_UNKNOWN || sps->chroma_format_idc != 1)
 		return RDNVD_UNSUPPORTED;
+	/* Level 5.1's largest frame (4096x2304) is far more than the card is asked for; a bigger one is a damaged stream. */
+	if (sps->width_mbs * sps->height_mbs > 36864 || sps->width_mbs > 256 || sps->height_mbs > 256)
+		return RDNVD_UNSUPPORTED;
 	codec_close(s);
 	memset(&templ, 0, sizeof(templ));
 	templ.profile = profile;

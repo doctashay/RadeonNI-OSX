@@ -395,10 +395,20 @@ static int parse_sps(struct rdnvd_h264 *h, const uint8_t *nal, size_t size)
 			}
 		}
 	}
-	s.log2_max_frame_num_minus4 = (uint8_t)get_ue(&b);
+	{
+		uint32_t log2 = get_ue(&b);
+
+		if (log2 > 12)		/* 7.4.2.1.1: at most 16 bits */
+			return RDNVD_H264_BAD_STREAM;
+		s.log2_max_frame_num_minus4 = (uint8_t)log2;
+	}
 	s.pic_order_cnt_type = (uint8_t)get_ue(&b);
 	if (s.pic_order_cnt_type == 0) {
-		s.log2_max_pic_order_cnt_lsb_minus4 = (uint8_t)get_ue(&b);
+		uint32_t log2 = get_ue(&b);
+
+		if (log2 > 12)
+			return RDNVD_H264_BAD_STREAM;
+		s.log2_max_pic_order_cnt_lsb_minus4 = (uint8_t)log2;
 	} else if (s.pic_order_cnt_type == 1) {
 		uint32_t cycle;
 
