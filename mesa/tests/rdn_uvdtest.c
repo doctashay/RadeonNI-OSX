@@ -29,6 +29,8 @@
 #include "pipe/p_video_state.h"
 #include "util/box.h"
 #include "util/u_inlines.h"
+#include "util/format/u_format.h"
+#include "r600/r600_pipe_common.h"
 
 extern struct pipe_screen *osmesa_create_screen(void);
 
@@ -228,6 +230,24 @@ static uint8_t *read_file(const char *path, size_t *size)
 	return data;
 }
 
+/*
+ * A plane of the decoded picture as it is in memory: from the buffer
+ * itself, not through a transfer. r600 always copies a texture in video
+ * memory with the 3D engine to read it, and on a big-endian host that
+ * swaps the two bytes of every 16-bit texel the GPU did not write (the
+ * decoder wrote these), turning the chroma plane's U and V around.
+ */
+static const uint8_t *raw_plane(struct pipe_screen *screen, struct pipe_resource *res, unsigned *stride)
+{
+	struct r600_common_screen *rscreen = (struct r600_common_screen *)screen;
+	struct r600_texture *rtex = r600_as_texture(res);
+	const struct legacy_surf_level *level = &rtex->surface.u.legacy.level[0];
+	uint8_t *base = rscreen->ws->buffer_map(rscreen->ws, rtex->resource.buf, NULL, PIPE_MAP_READ);
+
+	*stride = level->nblk_x * util_format_get_blocksize(res->format);
+	return base ? base + (uint64_t)level->offset_256B * 256 : NULL;
+}
+
 static double now_ms(void)
 {
 	struct timeval tv;
@@ -411,24 +431,15 @@ int main(int argc, char **argv)
 
 	target->get_resources(target, res);
 	{
-		struct pipe_transfer *xfer_y, *xfer_uv;
-		struct pipe_box box_y, box_uv;
+		unsigned stride_y, stride_uv;
 		const uint8_t *y, *uv;
 		unsigned long bad = 0, worst = 0, first = (unsigned long)-1;
 		unsigned x, row;
 		const uint8_t *ref_y = ref, *ref_u = ref + out_w * out_h, *ref_v = ref_u + out_w * out_h / 4;
 		FILE *out = out_path ? fopen(out_path, "wb") : NULL;
 
-		u_box_2d(0, 0, width, height, &box_y);
-		u_box_2d(0, 0, width / 2, height / 2, &box_uv);
-		/*
-		 * The decoder's bytes as they are in memory. A copy by the 3D engine would
-		 * swap the two bytes of every chroma sample on a big-endian host, as it
-		 * does for any 16-bit format whose memory the GPU did not write.
-		 */
-		y = ctx->texture_map(ctx, res[0], 0, PIPE_MAP_READ | PIPE_MAP_DIRECTLY, &box_y, &xfer_y);
-		uv = res[1] ? ctx->texture_map(ctx, res[1], 0, PIPE_MAP_READ | PIPE_MAP_DIRECTLY, &box_uv,
-					       &xfer_uv) : NULL;
+		y = raw_plane(screen, res[0], &stride_y);
+		uv = res[1] ? raw_plane(screen, res[1], &stride_uv) : NULL;
 		if (!y || !uv) {
 			fprintf(stderr, "uvdtest: cannot map the decoded picture\n");
 			return 1;
@@ -436,7 +447,7 @@ int main(int argc, char **argv)
 		for (row = 0; row < out_h; row++)
 			for (x = 0; x < out_w; x++) {
 				unsigned sy = row + 2 * crop[2], sx = x + 2 * crop[0];
-				int d = y[sy * xfer_y->stride + sx] - ref_y[row * out_w + x];
+				int d = y[sy * stride_y + sx] - ref_y[row * out_w + x];
 
 				if (d) {
 					if (first == (unsigned long)-1)
@@ -457,7 +468,7 @@ int main(int argc, char **argv)
 			for (row = 0; row < out_h / 2; row++)
 				for (x = 0; x < out_w / 2; x++) {
 					unsigned sy = row + crop[2], sx = x + crop[0];
-					const uint8_t *p = uv + sy * xfer_uv->stride + sx * 2;
+					const uint8_t *p = uv + sy * stride_uv + sx * 2;
 
 					bad_u += p[0] != ref_u[row * (out_w / 2) + x];
 					bad_v += p[1] != ref_v[row * (out_w / 2) + x];
@@ -468,14 +479,12 @@ int main(int argc, char **argv)
 		}
 		if (out) {
 			for (row = 0; row < height; row++)
-				fwrite(y + row * xfer_y->stride, 1, width, out);
+				fwrite(y + row * stride_y, 1, width, out);
 			for (row = 0; row < height / 2; row++)
-				fwrite(uv + row * xfer_uv->stride, 1, width, out);
+				fwrite(uv + row * stride_uv, 1, width, out);
 			fclose(out);
 		}
 		printf("%s\n", bad ? "FAIL: the card's picture differs from ffmpeg's" : "PASS: identical to ffmpeg's");
-		ctx->texture_unmap(ctx, xfer_y);
-		ctx->texture_unmap(ctx, xfer_uv);
 		codec->destroy(codec);
 		return bad != 0;
 	}
