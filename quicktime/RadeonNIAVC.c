@@ -194,7 +194,7 @@ pascal ComponentResult RDNAVC_Initialize(RDNAVCGlobals *storage, ImageSubCodecDe
 	cap->decompressRecordSize = sizeof(RDNAVCDecompressRecord);
 	cap->canAsync = true;
 	/* pictures decoded ahead of the one being drawn: a B pyramid holds several back */
-	cap->suggestedQueueSize = getenv("RDNAVC_QUEUE") ? (UInt16)atoi(getenv("RDNAVC_QUEUE")) : 16;
+	cap->suggestedQueueSize = 16;
 	if (debug())
 		say("Initialize: record size %ld (needs more than %ld for the QuickTime 7 fields)", (long)cap->recordSize,
 		    (long)offsetof(ImageSubCodecDecompressCapabilities, baseCodecShouldCallDecodeBandForAllFrames));
@@ -211,24 +211,13 @@ pascal ComponentResult RDNAVC_Initialize(RDNAVCGlobals *storage, ImageSubCodecDe
 		 */
 		cap->subCodecSupportsDecodeSmoothing = true;
 		cap->subCodecSupportsDrawInDecodeOrder = true;
-		if (getenv("RDNAVC_CAPS")) {
-			int v = atoi(getenv("RDNAVC_CAPS"));
-
-			cap->subCodecSupportsScheduledBackwardsPlaybackWithDifferenceFrames = (v & 1) != 0;
-			cap->subCodecNeedsHelpReportingNonDisplayableFrames = (v & 2) != 0;
-			if (v & 4)
-				cap->baseCodecShouldCallDecodeBandForAllFrames = false;
-			if (v & 8)
-				cap->subCodecSupportsDecodeSmoothing = false;
-			if (v & 16)
-				cap->subCodecSupportsDrawInDecodeOrder = false;
-			if (v & 32)
-				cap->canAsync = false;
-			if (v & 64)
-				cap->subCodecIsMultiBufferAware = false;
-			if (v & 128)
-				cap->subCodecSupportsOutOfOrderDisplayTimes = false;
-		}
+		/*
+		 * Without this QuickTime takes pictures decoded long before they are displayed (the anchor of a
+		 * pyramid of B pictures, five pictures ahead here) as undisplayable and drops them (found by
+		 * trying the capabilities one by one: every other one makes no difference). The pictures are
+		 * kept apart, so it is true.
+		 */
+		cap->subCodecSupportsScheduledBackwardsPlaybackWithDifferenceFrames = true;
 	}
 	return noErr;
 }
@@ -259,7 +248,7 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 	cap->extendWidth = 0;
 	cap->extendHeight = 0;
 	/* pictures are drawn in another order than they are decoded (B pictures) */
-	cap->flags2 |= codecSupportsOutOfOrderDisplayTimes;
+	cap->flags2 |= codecSupportsOutOfOrderDisplayTimes | codecSupportsScheduledBackwardsPlaybackWithDifferenceFrames;
 
 	if ((**desc).cType != 'avc1')
 		return codecUnimpErr;
@@ -341,16 +330,6 @@ pascal ComponentResult RDNAVC_BeginBand(RDNAVCGlobals *storage, CodecDecompressP
 	/* already decoded: its display was cancelled and it is back */
 	rec->decoded = p->frameTime && (p->frameTime->flags & icmFrameAlreadyDecoded) != 0;
 	drp->frameType = frame_type((const UInt8 *)drp->codecData, rec->dataSize, storage->nalLengthSize);
-	if (getenv("RDNAVC_FRAMETYPE")) {
-		int v = atoi(getenv("RDNAVC_FRAMETYPE"));
-
-		if (v == 1 && drp->frameType == kCodecFrameTypeDroppableDifference)
-			drp->frameType = kCodecFrameTypeDifference;
-		else if (v == 2)
-			drp->frameType = kCodecFrameTypeKey;
-		else if (v == 3)
-			drp->frameType = kCodecFrameTypeUnknown;
-	}
 	if (debug())
 		say("BeginBand: frame %ld display %lld decode %lld flags 0x%lx type %d size %ld already-decoded %d",
 		    p->frameTime ? (long)p->frameTime->frameNumber : -1L,
