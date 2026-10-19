@@ -42,6 +42,12 @@ bool rdn_target_vram_alloc(uint32_t bytes, uint32_t *offset);
  * there is none; the caller then asks for the aperture's. Freed the same way.
  */
 bool rdn_target_vram_alloc_hidden(uint32_t bytes, uint32_t *offset);
+/*
+ * The video decoder's firmware: its epoch (a number that changes each time it is started again), and starting it again
+ * now. False without the kext's support (an older kext, or no decoder).
+ */
+bool rdn_target_uvd_epoch(uint32_t *epoch);
+bool rdn_target_uvd_reset(uint32_t *epoch);
 void rdn_target_vram_free(uint32_t offset);
 /*
  * Where the CPU finds such memory, with all the GPU has finished writing

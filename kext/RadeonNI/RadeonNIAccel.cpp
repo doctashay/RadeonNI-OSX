@@ -825,7 +825,7 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
  */
 void RadeonNIAccel::uvdRestart(void)
 {
-	UInt32 fwSize = 0;
+	UInt32 fwSize = 0, fenceBase;
 	void *fw;
 	int r;
 
@@ -835,10 +835,16 @@ void RadeonNIAccel::uvdRestart(void)
 	if (!fw)
 		return;
 	fUvdDirty = false;
+	fenceBase = fUvd.fence_emitted;
 	rdn_uvd_fini(&fUvd);
 	r = rdn_uvd_init(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
 			 fUvd.vcpu_offset, fUvd.ring_offset, 4096, fUvdFlags);
 	IOFree(fw, fwSize);
+	/* the fence numbers go on, for programs that remember the newest one they saw reached */
+	if (!r) {
+		rdn_uvd_set_fence_base(&fUvd, fenceBase);
+		fUvdLastSeq = fenceBase;
+	}
 	/* the sessions are gone, whether it started again or not; a started block has its clocks on, the next command says so */
 	fUvdLive = 0;
 	fUvdEpoch++;

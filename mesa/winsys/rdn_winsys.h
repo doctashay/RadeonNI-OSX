@@ -26,6 +26,14 @@ struct pipe_screen_config;
  */
 #define RDN_WINSYS_HANDLE_VRAM 0x7571
 
+/*
+ * After the fence of the newest video decoder stream has been reached: did the firmware answer it? A decode message is
+ * answered by a feedback block whose second word is the message's counter (the message's fourth word); a firmware
+ * that has stopped serving a session runs the commands and the fences and writes nothing. 1 if it answered or there is
+ * nothing to look at (a stream without a decode message), 0 if not. Looks at the stream once.
+ */
+int rdn_winsys_uvd_answered(struct radeon_winsys *ws);
+
 typedef struct pipe_screen *(*rdn_screen_create_t)(struct radeon_winsys *,
                                                    const struct pipe_screen_config *);
 

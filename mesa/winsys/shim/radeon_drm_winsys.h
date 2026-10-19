@@ -54,6 +54,9 @@ struct radeon_drm_winsys {
    bool have_uvd_last_done;
    bool uvd_ready;
    bool uvd_used;
+   /* The newest decoder stream's message and feedback buffers as aperture offsets (rdn_winsys_uvd_answered()). */
+   bool uvd_check;
+   uint64_t uvd_msg_at, uvd_fb_at;
    uint64_t allocated_bytes;
    /*
     * RDN_STATS: what is allocated now, by where it is (enum rdn_place)

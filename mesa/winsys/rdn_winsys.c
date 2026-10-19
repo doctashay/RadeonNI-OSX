@@ -1215,6 +1215,28 @@ static bool rdn_uvd_relocate(struct rdn_cs *cs, struct radeon_cmdbuf *rcs, struc
    return true;
 }
 
+static uint32_t rdn_le32_at(const uint8_t *p)
+{
+   return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+int rdn_winsys_uvd_answered(struct radeon_winsys *rws)
+{
+   struct radeon_drm_winsys *ws = rdn_winsys(rws);
+   const uint8_t *msg, *fb;
+
+   if (!ws->uvd_check)
+      return 1;
+   ws->uvd_check = false;
+   ws->dev->sync_for_cpu(ws->dev);
+   msg = (const uint8_t *)ws->dev->aperture + ws->uvd_msg_at;
+   fb = (const uint8_t *)ws->dev->aperture + ws->uvd_fb_at;
+   /* only a decode message (type 1) is answered */
+   if (rdn_le32_at(msg + 4) != 1)
+      return 1;
+   return rdn_le32_at(fb + 4) == rdn_le32_at(msg + 12);
+}
+
 static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
                             struct pipe_fence_handle **pfence)
 {
@@ -1263,6 +1285,17 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
       simple_mtx_lock(&ws->lock);
       r = rdn_ib_alloc(ws, ib_size, &offset);
       if (!r) {
+         {
+            /*
+             * The feedback's counter is cleared first: what the buffer held from an earlier decode (or an earlier program,
+             * the same addresses come again) must not pass for the firmware's answer to this one.
+             */
+            unsigned k3;
+
+            for (k3 = 0; k3 < dbg.n; k3++)
+               if (dbg.cmd[k3] == 3 && dbg.bo[k3]->region != RDN_GART && dbg.bo[k3]->region != RDN_USER)
+                  memset((uint8_t *)ws->dev->aperture + dbg.bo[k3]->offset + dbg.offset[k3] + 4, 0, 4);
+         }
          memcpy((uint8_t *)ws->dev->aperture + offset, rcs->current.buf,
                 rcs->current.cdw * 4);
          r = ws->dev->uvd_submit(ws->dev, offset, rcs->current.cdw, &fence->number);
@@ -1277,6 +1310,28 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
       } else {
          fence->submitted = true;
          ws->uvd_used = true;
+         {
+            /* where the firmware will find the message and write its feedback, for rdn_winsys_uvd_answered() */
+            struct rdn_bo *msg = NULL, *fb = NULL;
+            unsigned msg_off = 0, fb_off = 0, k2;
+
+            for (k2 = 0; k2 < dbg.n; k2++) {
+               if (dbg.bo[k2]->region == RDN_GART || dbg.bo[k2]->region == RDN_USER)
+                  continue;
+               if (dbg.cmd[k2] == 0) {
+                  msg = dbg.bo[k2];
+                  msg_off = dbg.offset[k2];
+               } else if (dbg.cmd[k2] == 3) {
+                  fb = dbg.bo[k2];
+                  fb_off = dbg.offset[k2];
+               }
+            }
+            ws->uvd_check = msg && fb;
+            if (ws->uvd_check) {
+               ws->uvd_msg_at = msg->offset + msg_off;
+               ws->uvd_fb_at = fb->offset + fb_off;
+            }
+         }
          busy.number = fence->number;
          busy.used = true;
          ib->offset = offset;

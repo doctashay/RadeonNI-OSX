@@ -144,6 +144,11 @@ void rdn_uvd_fini(struct rdn_uvd *uvd);
 int rdn_uvd_ib_submit(struct rdn_uvd *uvd, uint64_t gpu_addr, uint32_t words,
 		      uint32_t *seq);
 bool rdn_uvd_fence_done(struct rdn_uvd *uvd, uint32_t seq);
+/*
+ * Right after rdn_uvd_init() of a block that was used before: continue the fence numbers from `base` (the last one the
+ * old start emitted), so that a program that has seen fence `base` reached does not take a newer one for reached.
+ */
+void rdn_uvd_set_fence_base(struct rdn_uvd *uvd, uint32_t base);
 int rdn_uvd_fence_wait(struct rdn_uvd *uvd, uint32_t seq, uint32_t timeout_ms);
 
 /* The clocks down (nothing in flight) and up again. */

@@ -871,6 +871,13 @@ int rdn_uvd_ib_submit(struct rdn_uvd *uvd, uint64_t gpu_addr, uint32_t words,
 	return 0;
 }
 
+void rdn_uvd_set_fence_base(struct rdn_uvd *uvd, uint32_t base)
+{
+	uvd->fence_emitted = base;
+	put_le32(uvd->ring_cpu + uvd->ring_words * 4, base);
+	rdn_hdp_flush(uvd->accel);
+}
+
 bool rdn_uvd_fence_done(struct rdn_uvd *uvd, uint32_t seq)
 {
 	rdn_hdp_flush(uvd->accel);

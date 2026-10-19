@@ -83,6 +83,18 @@ rdn_target_vram_alloc_hidden(uint32_t bytes, uint32_t *offset)
    return true;
 }
 
+bool
+rdn_target_uvd_epoch(uint32_t *epoch)
+{
+   return the_device && the_device->uvd_epoch && !the_device->uvd_epoch(the_device, epoch);
+}
+
+bool
+rdn_target_uvd_reset(uint32_t *epoch)
+{
+   return the_device && the_device->uvd_reset && !the_device->uvd_reset(the_device, epoch);
+}
+
 void
 rdn_target_vram_free(uint32_t offset)
 {

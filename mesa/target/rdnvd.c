@@ -31,6 +31,8 @@
 #define RDNVD_PUBLIC __attribute__((visibility("default")))
 
 extern struct pipe_screen *osmesa_create_screen(void);
+extern int rdn_winsys_uvd_answered(struct radeon_winsys *ws);
+extern bool rdn_target_uvd_reset(uint32_t *epoch);
 
 struct rdnvd {
 	struct pipe_screen *screen;
@@ -67,6 +69,18 @@ struct rdnvd_session {
 	struct frame_buf *all, *free;
 	struct pipe_fence_handle *fence;
 	int error;				/* the first failure of a callback, for the feed that caused it */
+	/* For starting over when the firmware stops answering (rdnvd_h264_decode_au): */
+	uint8_t *avcc;				/* the configuration record the session was opened with */
+	size_t avcc_size;
+	struct replay_au {			/* the access units since the last IDR picture, in the order they came */
+		uint8_t *data;
+		size_t size;
+		unsigned nal_length_size;
+	} *replay;
+	unsigned replay_n, replay_cap;
+	size_t replay_bytes;
+	int replay_valid;			/* 0 once too much came without an IDR picture: nothing to start over from */
+	int stalled;				/* the firmware did not answer the decode that was just run */
 };
 
 /* ---- surfaces ---------------------------------------------------------------- */
@@ -394,6 +408,28 @@ static int on_decode(void *user, const struct rdnvd_h264_picture *pic, void **su
 		return RDNVD_FAILED;
 	}
 	fence_release(s);
+	/*
+	 * The firmware can stop serving a session: the commands and their fences run, nothing is decoded. Its answer to a
+	 * decode is a feedback block that carries the message's counter; without it the picture was never made.
+	 */
+	{
+		/* RDNVD_FAKE_STALL=n: take the n-th decode of the program for one that was not answered (to try the recovery) */
+		static int fake = -1, decodes;
+
+		if (fake < 0)
+			fake = getenv("RDNVD_FAKE_STALL") ? atoi(getenv("RDNVD_FAKE_STALL")) : 0;
+		if (fake && ++decodes == fake) {
+			s->stalled = 1;
+			frame_unref(f);
+			return RDNVD_FAILED;
+		}
+	}
+	if (!getenv("RDNVD_NO_STALL_CHECK") &&
+	    !rdn_winsys_uvd_answered(((struct r600_common_screen *)s->d->screen)->ws)) {
+		s->stalled = 1;
+		frame_unref(f);
+		return RDNVD_FAILED;
+	}
 	*surface = f;
 	/* rdnvd_h264_decode_au() hands the caller the picture of the data it fed. */
 	if (s->captured_count++ == 0) {
@@ -427,6 +463,8 @@ static void on_release(void *user, void *surface)
 }
 
 /* ---- the interface ------------------------------------------------------------------- */
+
+static const struct rdnvd_h264_callbacks session_callbacks = { on_sequence, on_decode, on_output, on_release };
 
 static int nop_sequence(void *user, const struct rdnvd_h264_sps *sps)
 {
@@ -484,7 +522,6 @@ RDNVD_PUBLIC void rdnvd_close(struct rdnvd *d)
 RDNVD_PUBLIC struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_t *avcc, size_t avcc_size,
 						   rdnvd_output_fn output, void *user, unsigned *nal_length_size)
 {
-	static const struct rdnvd_h264_callbacks cb = { on_sequence, on_decode, on_output, on_release };
 	struct rdnvd_session *s = calloc(1, sizeof(*s));
 
 	if (!s)
@@ -492,7 +529,8 @@ RDNVD_PUBLIC struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_
 	s->d = d;
 	s->output = output;
 	s->user = user;
-	s->parser = rdnvd_h264_parser_new(&cb, s);
+	s->replay_valid = 1;
+	s->parser = rdnvd_h264_parser_new(&session_callbacks, s);
 	if (!s->parser) {
 		free(s);
 		return NULL;
@@ -512,6 +550,11 @@ RDNVD_PUBLIC struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_
 		/* The decoder is made by rdnvd_h264_prepare() or by the first picture: it takes some 100 MB of video memory. */
 		if (nal_length_size)
 			*nal_length_size = (unsigned)r;
+		s->avcc = malloc(avcc_size);
+		if (s->avcc) {
+			memcpy(s->avcc, avcc, avcc_size);
+			s->avcc_size = avcc_size;
+		}
 	}
 	return s;
 }
@@ -571,8 +614,84 @@ RDNVD_PUBLIC int rdnvd_h264_feed(struct rdnvd_session *s, const uint8_t *data, s
 	return r ? r : r2;
 }
 
-RDNVD_PUBLIC int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *data, size_t size,
-				      unsigned nal_length_size, struct rdnvd_frame **frame)
+/* Whether the access unit holds an IDR slice (NAL unit type 5): where decoding can start over. */
+static int au_is_idr(const uint8_t *d, size_t n, unsigned nal_length_size)
+{
+	size_t pos = 0;
+
+	if (nal_length_size) {
+		while (pos + nal_length_size < n) {
+			unsigned i;
+			size_t len = 0;
+
+			for (i = 0; i < nal_length_size; i++)
+				len = len << 8 | d[pos + i];
+			pos += nal_length_size;
+			if (!len || pos >= n)
+				break;
+			if ((d[pos] & 0x1f) == 5)
+				return 1;
+			pos += len;
+		}
+		return 0;
+	}
+	for (; pos + 3 < n; pos++)
+		if (d[pos] == 0 && d[pos + 1] == 0 && d[pos + 2] == 1 && (d[pos + 3] & 0x1f) == 5)
+			return 1;
+	return 0;
+}
+
+static void replay_clear(struct rdnvd_session *s)
+{
+	unsigned i;
+
+	for (i = 0; i < s->replay_n; i++)
+		free(s->replay[i].data);
+	s->replay_n = 0;
+	s->replay_bytes = 0;
+}
+
+/* Keep a copy of the access unit; at most 24 MB and 2000 units without an IDR picture, then nothing is kept. */
+static void replay_add(struct rdnvd_session *s, const uint8_t *data, size_t size, unsigned nal_length_size)
+{
+	if (au_is_idr(data, size, nal_length_size)) {
+		replay_clear(s);
+		s->replay_valid = 1;
+	}
+	if (!s->replay_valid)
+		return;
+	if (s->replay_n >= 2000 || s->replay_bytes + size > (24u << 20)) {
+		replay_clear(s);
+		s->replay_valid = 0;
+		return;
+	}
+	if (s->replay_n == s->replay_cap) {
+		unsigned cap = s->replay_cap ? s->replay_cap * 2 : 64;
+		struct replay_au *r = realloc(s->replay, cap * sizeof(*r));
+
+		if (!r) {
+			replay_clear(s);
+			s->replay_valid = 0;
+			return;
+		}
+		s->replay = r;
+		s->replay_cap = cap;
+	}
+	s->replay[s->replay_n].data = malloc(size);
+	if (!s->replay[s->replay_n].data) {
+		replay_clear(s);
+		s->replay_valid = 0;
+		return;
+	}
+	memcpy(s->replay[s->replay_n].data, data, size);
+	s->replay[s->replay_n].size = size;
+	s->replay[s->replay_n].nal_length_size = nal_length_size;
+	s->replay_n++;
+	s->replay_bytes += size;
+}
+
+/* One access unit through the H.264 layer; the picture it makes (if any) is left in s->captured. */
+static int decode_unit(struct rdnvd_session *s, const uint8_t *data, size_t size, unsigned nal_length_size)
 {
 	int r, r2;
 
@@ -581,6 +700,71 @@ RDNVD_PUBLIC int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *da
 	r = nal_length_size ? rdnvd_h264_parser_feed_avcc(s->parser, data, size, nal_length_size, 0) :
 			      rdnvd_h264_parser_feed_annexb(s->parser, data, size, 0);
 	r2 = rdnvd_h264_parser_end_au(s->parser);
+	return r ? r : r2;
+}
+
+/*
+ * The firmware stopped answering this session: end it, start the firmware again, make a new decoder and show it the
+ * access units since the last IDR picture again, the one that failed last; its picture is left in s->captured. The
+ * pictures the caller got before were made by the old decoder and stay as they are. 0, or an error (with s->stalled
+ * set if the new decoder was not answered either).
+ */
+static int recover(struct rdnvd_session *s)
+{
+	uint32_t epoch;
+	unsigned i;
+	int r;
+
+	s->stalled = 0;
+	if (!s->replay_valid || !s->replay_n)
+		return RDNVD_FAILED;
+	syslog(LOG_NOTICE, "RadeonNIAVC: the video decoder stopped answering; starting it again and showing it %u pictures again",
+	       s->replay_n);
+	rdnvd_h264_parser_free(s->parser);
+	s->parser = NULL;
+	codec_close(s);
+	if (!rdn_target_uvd_reset(&epoch))
+		return RDNVD_FAILED;
+	s->parser = rdnvd_h264_parser_new(&session_callbacks, s);
+	if (!s->parser)
+		return RDNVD_NO_MEMORY;
+	if (s->avcc) {
+		if (rdnvd_h264_parser_avcc(s->parser, s->avcc, s->avcc_size) < 0)
+			return RDNVD_BAD_STREAM;
+		r = rdnvd_h264_prepare(s);
+		if (r)
+			return r;
+	}
+	for (i = 0; i < s->replay_n; i++) {
+		r = decode_unit(s, s->replay[i].data, s->replay[i].size, s->replay[i].nal_length_size);
+		if (r || s->stalled)
+			return r ? r : RDNVD_FAILED;
+		/* the caller has the pictures of the earlier ones already */
+		if (i + 1 < s->replay_n && s->captured) {
+			frame_unref(s->captured);
+			s->captured = NULL;
+		}
+	}
+	return 0;
+}
+
+RDNVD_PUBLIC int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *data, size_t size,
+				      unsigned nal_length_size, struct rdnvd_frame **frame)
+{
+	int r;
+	unsigned attempt;
+
+	replay_add(s, data, size, nal_length_size);
+	r = decode_unit(s, data, size, nal_length_size);
+	/* a stalled firmware is started again and shown the stream again, a few times at most */
+	for (attempt = 0; s->stalled; attempt++) {
+		if (attempt == 3) {
+			s->stalled = 0;
+			r = RDNVD_FAILED;
+			break;
+		}
+		r = recover(s);
+	}
 	/* The picture of this data (not of display order): the first one decoded. */
 	*frame = s->captured ? &s->captured->frame : NULL;
 	if (s->captured) {
@@ -596,7 +780,7 @@ RDNVD_PUBLIC int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *da
 	}
 	/* a second picture in the data would be a damaged access unit: let it go */
 	s->captured = NULL;
-	return r ? r : r2;
+	return r;
 }
 
 RDNVD_PUBLIC unsigned rdnvd_h264_reorder_delay(struct rdnvd_session *s)
@@ -617,6 +801,9 @@ RDNVD_PUBLIC void rdnvd_h264_close(struct rdnvd_session *s)
 		return;
 	rdnvd_h264_parser_free(s->parser);	/* releases what the parser holds */
 	codec_close(s);
+	replay_clear(s);
+	free(s->replay);
+	free(s->avcc);
 	/* What the caller still holds stays until it is released; the rest is gone. */
 	for (f = s->all; f; f = next) {
 		next = f->next;
