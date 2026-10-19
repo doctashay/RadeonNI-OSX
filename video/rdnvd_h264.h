@@ -143,6 +143,8 @@ void rdnvd_h264_parser_free(struct rdnvd_h264 *h);
 
 /* The configuration record of an MP4/QuickTime avcC box: its SPS and PPS go in; returns the NAL length size (1-4) or an error. */
 int rdnvd_h264_parser_avcc(struct rdnvd_h264 *h, const uint8_t *avcc, size_t size);
+/* The first usable sequence parameter set the parser has seen (from an avcC record, say), or NULL. */
+const struct rdnvd_h264_sps *rdnvd_h264_parser_first_sps(const struct rdnvd_h264 *h);
 /* NAL units after start codes (00 00 01); or, with nal_length_size 1 to 4, length prefixed. `pts` goes with the pictures that complete in it. */
 int rdnvd_h264_parser_feed_annexb(struct rdnvd_h264 *h, const uint8_t *data, size_t size, uint64_t pts);
 int rdnvd_h264_parser_feed_avcc(struct rdnvd_h264 *h, const uint8_t *data, size_t size, unsigned nal_length_size,

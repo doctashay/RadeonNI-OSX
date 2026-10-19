@@ -3,6 +3,8 @@ _rdnvd_close
 _rdnvd_h264_open
 _rdnvd_h264_feed
 _rdnvd_h264_flush
+_rdnvd_h264_decode_au
+_rdnvd_frame_read_2vuy
 _rdnvd_h264_close
 _rdnvd_frame_read
 _rdnvd_frame_release

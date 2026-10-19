@@ -56,6 +56,8 @@ void rdnvd_close(struct rdnvd *d);
 /*
  * `avcc`: the configuration record of an MP4/QuickTime 'avcC' box (its SPS and PPS), or NULL for a stream that
  * carries them. Returns the session; *nal_length_size gets the length-prefix size to pass to feed (0 for Annex B).
+ * Returns NULL if the stream is one the card does not decode (with an avcC record that is known here: other
+ * than 4:2:0 at 8 bits, interlaced coding, more than 8704 macroblocks): decode it in software.
  */
 struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_t *avcc, size_t avcc_size,
 				      rdnvd_output_fn output, void *user, unsigned *nal_length_size);
@@ -66,6 +68,15 @@ struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_t *avcc, size
  */
 int rdnvd_h264_feed(struct rdnvd_session *s, const uint8_t *data, size_t size, uint64_t pts,
 		    unsigned nal_length_size, int end_of_au);
+/*
+ * Decode one access unit (a QuickTime sample) and give back the picture it holds, as soon as it is decoded
+ * and in decoding order, not display order: for a consumer that shows pictures by time stamp itself
+ * (QuickTime draws them in display order, later). *frame is NULL if the data held no picture (parameter
+ * sets only, or not a point to start from); release it with rdnvd_frame_release(). The `output` callback of
+ * rdnvd_h264_open may be NULL when this is used.
+ */
+int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *data, size_t size, unsigned nal_length_size,
+			 struct rdnvd_frame **frame);
 /* The end of the stream or a seek: decode what is pending and output everything (drop: forget it instead). */
 int rdnvd_h264_flush(struct rdnvd_session *s, int drop);
 void rdnvd_h264_close(struct rdnvd_session *s);
@@ -75,6 +86,11 @@ void rdnvd_h264_close(struct rdnvd_session *s);
  * both directions) cropped to width x height, into the caller's planes.
  */
 int rdnvd_frame_read(struct rdnvd_frame *frame, uint8_t *y, size_t y_stride, uint8_t *uv, size_t uv_stride);
+/*
+ * The same picture as packed 4:2:2 ('2vuy': U, Y, V, Y for every two pixels; chroma rows repeated), into a
+ * buffer of rows `stride` bytes apart, cropped to width x height.
+ */
+int rdnvd_frame_read_2vuy(struct rdnvd_frame *frame, uint8_t *dst, size_t stride);
 void rdnvd_frame_release(struct rdnvd_frame *frame);
 
 #ifdef __cplusplus

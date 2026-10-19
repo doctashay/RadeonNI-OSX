@@ -51,12 +51,16 @@ struct frame_buf {
 
 struct rdnvd_session {
 	struct rdnvd *d;
+	/* The picture decoded by the call in progress (rdnvd_h264_decode_au), holding a reference for the caller. */
+	struct frame_buf *captured;
+	int captured_count;
 	struct rdnvd_h264 *parser;
 	struct pipe_video_codec *codec;
 	rdnvd_output_fn output;
 	void *user;
 	unsigned gen;				/* of the codec and its buffers: a new sequence is a new one */
 	unsigned width, height;			/* the codec's, in samples */
+	unsigned crop_left, crop_right, crop_top, crop_bottom;
 	struct frame_buf *all, *free;
 	struct pipe_fence_handle *fence;
 	int error;				/* the first failure of a callback, for the feed that caused it */
@@ -162,16 +166,29 @@ static void codec_close(struct rdnvd_session *s)
 	s->gen++;
 }
 
+/*
+ * What the card decodes: frame pictures of 4:2:0 at 8 bits in Baseline, Main and High (the H.264 layer has
+ * refused the rest already), up to level 4.2's 8704 macroblocks. Interlaced coding (field pictures can
+ * come with it) is left to software for now.
+ */
+static int sequence_supported(const struct rdnvd_h264_sps *sps)
+{
+	if (profile_for(sps) == PIPE_VIDEO_PROFILE_UNKNOWN || sps->chroma_format_idc != 1)
+		return 0;
+	if (!sps->frame_mbs_only_flag)
+		return 0;
+	if (sps->width_mbs * sps->height_mbs > 8704 || sps->width_mbs > 128 || sps->height_mbs > 128)
+		return 0;
+	return 1;
+}
+
 static int on_sequence(void *user, const struct rdnvd_h264_sps *sps)
 {
 	struct rdnvd_session *s = user;
 	struct pipe_video_codec templ;
 	enum pipe_video_profile profile = profile_for(sps);
 
-	if (profile == PIPE_VIDEO_PROFILE_UNKNOWN || sps->chroma_format_idc != 1)
-		return RDNVD_UNSUPPORTED;
-	/* Level 5.1's largest frame (4096x2304) is far more than the card is asked for; a bigger one is a damaged stream. */
-	if (sps->width_mbs * sps->height_mbs > 36864 || sps->width_mbs > 256 || sps->height_mbs > 256)
+	if (!sequence_supported(sps))
 		return RDNVD_UNSUPPORTED;
 	codec_close(s);
 	memset(&templ, 0, sizeof(templ));
@@ -181,6 +198,10 @@ static int on_sequence(void *user, const struct rdnvd_h264_sps *sps)
 	templ.width = s->width = sps->width_mbs * 16;
 	templ.height = s->height = sps->height_mbs * 16;
 	templ.max_references = sps->max_num_ref_frames ? sps->max_num_ref_frames : 1;
+	s->crop_left = sps->crop_left;
+	s->crop_right = sps->crop_right;
+	s->crop_top = sps->crop_top;
+	s->crop_bottom = sps->crop_bottom;
 	s->codec = s->d->ctx->create_video_codec(s->d->ctx, &templ);
 	return s->codec ? 0 : RDNVD_FAILED;
 }
@@ -344,6 +365,11 @@ static int on_decode(void *user, const struct rdnvd_h264_picture *pic, void **su
 	}
 	fence_release(s);
 	*surface = f;
+	/* rdnvd_h264_decode_au() hands the caller the picture of the data it fed. */
+	if (s->captured_count++ == 0) {
+		f->refs++;
+		s->captured = f;
+	}
 	return 0;
 }
 
@@ -352,6 +378,8 @@ static void on_output(void *user, void *surface, uint64_t pts, const struct rdnv
 	struct rdnvd_session *s = user;
 	struct frame_buf *f = surface;
 
+	if (!s->output)
+		return;
 	f->refs++;				/* the caller's */
 	f->frame.pts = pts;
 	f->frame.coded_width = sps->width_mbs * 16;
@@ -417,8 +445,10 @@ RDNVD_PUBLIC struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_
 		*nal_length_size = 0;
 	if (avcc) {
 		int r = rdnvd_h264_parser_avcc(s->parser, avcc, avcc_size);
+		const struct rdnvd_h264_sps *sps = r < 0 ? NULL : rdnvd_h264_parser_first_sps(s->parser);
 
-		if (r < 0) {
+		/* A stream the card cannot decode is refused now, while the caller can still use software. */
+		if (r < 0 || !sps || !sequence_supported(sps)) {
 			rdnvd_h264_parser_free(s->parser);
 			free(s);
 			return NULL;
@@ -438,6 +468,34 @@ RDNVD_PUBLIC int rdnvd_h264_feed(struct rdnvd_session *s, const uint8_t *data, s
 			      rdnvd_h264_parser_feed_annexb(s->parser, data, size, pts);
 	if (end_of_au)
 		r2 = rdnvd_h264_parser_end_au(s->parser);
+	return r ? r : r2;
+}
+
+RDNVD_PUBLIC int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *data, size_t size,
+				      unsigned nal_length_size, struct rdnvd_frame **frame)
+{
+	int r, r2;
+
+	s->captured = NULL;
+	s->captured_count = 0;
+	r = nal_length_size ? rdnvd_h264_parser_feed_avcc(s->parser, data, size, nal_length_size, 0) :
+			      rdnvd_h264_parser_feed_annexb(s->parser, data, size, 0);
+	r2 = rdnvd_h264_parser_end_au(s->parser);
+	/* The picture of this data (not of display order): the first one decoded. */
+	*frame = s->captured ? &s->captured->frame : NULL;
+	if (s->captured) {
+		struct frame_buf *f = s->captured;
+
+		f->frame.coded_width = s->width;
+		f->frame.coded_height = s->height;
+		f->frame.crop_left = s->crop_left;
+		f->frame.crop_top = s->crop_top;
+		f->frame.width = s->width - s->crop_left - s->crop_right;
+		f->frame.height = s->height - s->crop_top - s->crop_bottom;
+		f->frame.pts = 0;
+	}
+	/* a second picture in the data would be a damaged access unit: let it go */
+	s->captured = NULL;
 	return r ? r : r2;
 }
 
@@ -474,9 +532,15 @@ static double now_ms(void)
  * The card's DMA engine copies the two planes' bytes as they are into system memory (3 MB a picture of
  * 1080p in about a millisecond), and the CPU reads that. The 3D engine's copy of an 8-bit texture into
  * system memory is some 20 ms per megabyte, and turns the two bytes of a chroma texel around.
+ * Returns the mapped copy (to be unmapped with *xfer) and where the planes are in it.
  */
-static int frame_read_dma(struct rdnvd_frame *frame, struct pipe_resource *res[3], uint8_t *y, size_t y_stride,
-			  uint8_t *uv, size_t uv_stride)
+struct staged {
+	const uint8_t *src;
+	struct pipe_transfer *xfer;
+	unsigned y_pitch, c_at, c_pitch;
+};
+
+static int frame_stage_dma(struct rdnvd_frame *frame, struct pipe_resource *res[3], struct staged *st)
 {
 	struct frame_buf *f = (struct frame_buf *)frame;
 	struct rdnvd *d = f->d;
@@ -485,10 +549,6 @@ static int frame_read_dma(struct rdnvd_frame *frame, struct pipe_resource *res[3
 	unsigned y_pitch = ly->nblk_x, c_pitch = lc->nblk_x * 2;
 	unsigned y_size = y_pitch * frame->coded_height, c_size = c_pitch * (frame->coded_height / 2);
 	unsigned c_at = (y_size + 255) & ~255u, total = c_at + c_size;
-	struct pipe_transfer *xfer;
-	const uint8_t *src;
-	unsigned row;
-	unsigned cw = (frame->width + 1) / 2, ch = (frame->height + 1) / 2;
 
 	if (!d->staging || d->staging->width0 < total) {
 		pipe_resource_reference(&d->staging, NULL);
@@ -501,16 +561,70 @@ static int frame_read_dma(struct rdnvd_frame *frame, struct pipe_resource *res[3
 	r600_cp_dma_copy_buffer((struct r600_context *)d->ctx, d->staging, c_at, res[1],
 				(uint64_t)lc->offset_256B * 256, c_size);
 	/* Mapping for reading flushes the commands and waits for them. */
-	src = pipe_buffer_map_range(d->ctx, d->staging, 0, total, PIPE_MAP_READ, &xfer);
-	if (!src)
+	st->src = pipe_buffer_map_range(d->ctx, d->staging, 0, total, PIPE_MAP_READ, &st->xfer);
+	if (!st->src)
 		return RDNVD_FAILED;
+	st->y_pitch = y_pitch;
+	st->c_at = c_at;
+	st->c_pitch = c_pitch;
+	return 0;
+}
+
+static int frame_read_dma(struct rdnvd_frame *frame, struct pipe_resource *res[3], uint8_t *y, size_t y_stride,
+			  uint8_t *uv, size_t uv_stride)
+{
+	struct frame_buf *f = (struct frame_buf *)frame;
+	struct staged st;
+	unsigned row, cw = (frame->width + 1) / 2, ch = (frame->height + 1) / 2;
+	int r = frame_stage_dma(frame, res, &st);
+
+	if (r)
+		return r;
 	for (row = 0; row < frame->height; row++)
-		memcpy(y + row * y_stride, src + (size_t)(row + frame->crop_top) * y_pitch + frame->crop_left,
+		memcpy(y + row * y_stride, st.src + (size_t)(row + frame->crop_top) * st.y_pitch + frame->crop_left,
 		       frame->width);
 	for (row = 0; row < ch; row++)
 		memcpy(uv + row * uv_stride,
-		       src + c_at + (size_t)(row + frame->crop_top / 2) * c_pitch + (frame->crop_left / 2) * 2, cw * 2);
-	pipe_buffer_unmap(d->ctx, xfer);
+		       st.src + st.c_at + (size_t)(row + frame->crop_top / 2) * st.c_pitch + (frame->crop_left / 2) * 2,
+		       cw * 2);
+	pipe_buffer_unmap(f->d->ctx, st.xfer);
+	return 0;
+}
+
+/* U, Y0, V, Y1 as one word in the byte order of memory; chroma rows repeated for the two luma rows they serve. */
+static inline uint32_t pack_2vuy(unsigned u, unsigned y0, unsigned v, unsigned y1)
+{
+#if UTIL_ARCH_BIG_ENDIAN
+	return u << 24 | y0 << 16 | v << 8 | y1;
+#else
+	return u | y0 << 8 | v << 16 | y1 << 24;
+#endif
+}
+
+RDNVD_PUBLIC int rdnvd_frame_read_2vuy(struct rdnvd_frame *frame, uint8_t *dst, size_t stride)
+{
+	struct frame_buf *f = (struct frame_buf *)frame;
+	struct pipe_resource *res[3] = { NULL, NULL, NULL };
+	struct staged st;
+	unsigned row, x, pairs = frame->width / 2;
+	int r;
+
+	f->buf->get_resources(f->buf, res);
+	if (!res[0] || !res[1])
+		return RDNVD_FAILED;
+	r = frame_stage_dma(frame, res, &st);
+	if (r)
+		return r;
+	for (row = 0; row < frame->height; row++) {
+		const uint8_t *ly = st.src + (size_t)(row + frame->crop_top) * st.y_pitch + frame->crop_left;
+		const uint8_t *lc = st.src + st.c_at + (size_t)((row + frame->crop_top) / 2) * st.c_pitch +
+				    (frame->crop_left / 2) * 2;
+		uint32_t *out = (uint32_t *)(dst + row * stride);
+
+		for (x = 0; x < pairs; x++)
+			out[x] = pack_2vuy(lc[2 * x], ly[2 * x], lc[2 * x + 1], ly[2 * x + 1]);
+	}
+	pipe_buffer_unmap(f->d->ctx, st.xfer);
 	return 0;
 }
 
