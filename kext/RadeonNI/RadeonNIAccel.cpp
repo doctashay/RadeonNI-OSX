@@ -671,6 +671,15 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 		IOLockUnlock(fLock);
 		return kIOReturnNotReady;
 	}
+	{
+		/* the RLC microcode for the minimal start (personality FW_RLC); optional, and kept for the life of the kext */
+		static void *rlcFw;
+		static UInt32 rlcSize;
+
+		if (!rlcFw)
+			rlcFw = copyFirmware("FW_RLC", &rlcSize);
+		rdn_uvd_set_rlc_ucode(rlcFw, rlcSize);
+	}
 	vcpuBytes = rdn_uvd_vcpu_bytes(fwSize, RDN_UVD_DEFAULT_HANDLES);
 	if (rdn_uvd_ref_clock(fAccel.card, &ref))
 		ref = 0;

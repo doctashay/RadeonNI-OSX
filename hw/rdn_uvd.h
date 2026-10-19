@@ -149,4 +149,7 @@ int rdn_uvd_fence_wait(struct rdn_uvd *uvd, uint32_t seq, uint32_t timeout_ms);
 int rdn_uvd_idle(struct rdn_uvd *uvd);
 int rdn_uvd_wake(struct rdn_uvd *uvd);
 
+/* The RLC microcode (BTC_rlc.bin, 3072 bytes) the minimal start loads before enabling the RLC; NULL for none. */
+void rdn_uvd_set_rlc_ucode(const void *fw, uint32_t size);
+
 #endif /* RDN_UVD_H */

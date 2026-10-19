@@ -361,6 +361,36 @@ static int ring_test(struct rdn_uvd *uvd)
 	return 0;
 }
 
+/*
+ * The RLC's microcode (BTC_rlc.bin, 768 big-endian words), as evergreen_rlc_resume() loads it. The card keeps it across a
+ * warm reboot, so a card that has been through other drivers works with RLC_CNTL alone and a card that lost power does
+ * not: set it (rdn_uvd_set_rlc_ucode) and the start loads it first. Not copied: the caller keeps it alive.
+ */
+static const uint8_t *rlc_ucode;
+static uint32_t rlc_ucode_size;
+
+void rdn_uvd_set_rlc_ucode(const void *fw, uint32_t size)
+{
+	rlc_ucode = size == 768 * 4 ? fw : NULL;
+	rlc_ucode_size = rlc_ucode ? size : 0;
+}
+
+static void rlc_load(struct rdn_card *card)
+{
+	static const uint32_t zero_regs[] = { 0x3f0c, 0x3f10, 0x3f20, 0x3f1c, 0x3f14, 0x3f18, 0x3f44, 0x3f48 };
+	unsigned k;
+
+	wr(card, 0x3f00, 0);				/* RLC_CNTL: stop */
+	for (k = 0; k < sizeof(zero_regs) / sizeof(zero_regs[0]); k++)
+		wr(card, zero_regs[k], 0);
+	for (k = 0; k < rlc_ucode_size / 4; k++) {
+		wr(card, 0x3f2c, k);			/* RLC_UCODE_ADDR */
+		wr(card, 0x3f30, ((uint32_t)rlc_ucode[k * 4] << 24) | ((uint32_t)rlc_ucode[k * 4 + 1] << 16) |
+		   ((uint32_t)rlc_ucode[k * 4 + 2] << 8) | rlc_ucode[k * 4 + 3]);	/* RLC_UCODE_DATA */
+	}
+	wr(card, 0x3f2c, 0);
+}
+
 /* ---- start and stop ---------------------------------------------------- */
 
 /* uvd_v2_2_resume(): tell the UVD memory controller where things are. */
@@ -434,6 +464,8 @@ static int vcpu_start(struct rdn_uvd *uvd)
 
 	if (uvd->flags & RDN_UVD_F_MINIMAL) {
 		/* the RLC (evergreen_rlc_start() writes RLC_ENABLE) after the memory window, and time to come up */
+		if (rlc_ucode)
+			rlc_load(card);
 		wr(card, 0x3f00, 1);
 		mdelay(card, 300);
 		if (uvd->flags & RDN_UVD_F_LMI) {
