@@ -90,13 +90,17 @@ Three layers, each testable without the next:
    recreates the decoder when the sequence changes. `rdnvd_frame_read()` gives a picture's cropped NV12 in the caller's memory: the card's
    CP DMA copies the two planes into system memory (GART) and the CPU reads them there. Scaling lists go to Mesa in raster order
    (as VA-API gives them; found with a custom, non-symmetric matrix: the order of the bitstream and the transposed one both fail).
+   `librdnvd.dylib` (`scripts/build-mesa.sh darwin src/gallium/targets/rdn/librdnvd.dylib`, 12 MB, exports only `rdnvd_*`, no allocator noise on 10.5 unlike the
+   static test) works as a library: `tools/guest/rdnvd_smoke.c` decodes a stream through it on the G5. Its install name is `@rpath/librdnvd.dylib`:
+   decide the install place with the consumers.
 3. Consumers (not written): a PowerVLC decoder module and a QuickTime `avc1` component call `rdnvd_open`, `rdnvd_h264_open` (with the `avcC`
    for QuickTime), `rdnvd_h264_feed`, `rdnvd_frame_read`, `rdnvd_frame_release`.
 
 Test: `rdn_uvdtest stream.h264 reference.yuv` (`scripts/uvd-testvec.sh <dir> <name>` makes x264 streams and ffmpeg's decode: i, p, cabac,
 high, b, bcavlc, mbaff, slices, weightp, cqm, cqmjvt, opengop, noloop; any size). On the G5 (Leopard, PLL on): all 13 at 128x96 and 40 pictures
-identical to ffmpeg's, sample for sample; 1280x720 High CABAC with B pyramid and 4 references: 12.8 ms a picture, 1920x1080: 24 ms (42 a second);
-reading a picture out: 4.9 ms at 720p, 10 ms at 1080p. (The 3D engine's copy of the planes took 55 ms at 1080p: it writes an 8-bit texture into
+identical to ffmpeg's, sample for sample, as are 1280x720 and 1920x1080 High CABAC with B pyramid and 4 references. Decoding takes about 0.8 ms
+for 128x96, 9.3 ms at 720p and 20 ms at 1080p per picture (50 a second), plus about 150 ms once for the clocks and the decoder; reading a
+picture out: 4.9 ms at 720p, 10.8 ms at 1080p (so 1080p is about 30 pictures a second one after the other, before any overlap of the two). (The 3D engine's copy of the planes took 55 ms at 1080p: it writes an 8-bit texture into
 system memory at some 50 MB/s and turns the chroma bytes around; the DMA copy is raw bytes.) Not covered by any vector: long-term references and
 MMCO (implemented from the spec), frame number gaps, a change of resolution inside a stream, the length-prefixed and `avcC` input,
 field pictures (refused).
