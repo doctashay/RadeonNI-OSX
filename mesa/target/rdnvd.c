@@ -138,7 +138,7 @@ static enum pipe_video_profile profile_for(const struct rdnvd_h264_sps *sps)
 		return PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN;
 	if (sps->profile_idc >= 100)
 		return PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH;
-	return PIPE_VIDEO_PROFILE_NONE;		/* Extended: data partitioning, SP/SI */
+	return PIPE_VIDEO_PROFILE_UNKNOWN;		/* Extended: data partitioning, SP/SI */
 }
 
 static void codec_close(struct rdnvd_session *s)
@@ -164,7 +164,7 @@ static int on_sequence(void *user, const struct rdnvd_h264_sps *sps)
 	struct pipe_video_codec templ;
 	enum pipe_video_profile profile = profile_for(sps);
 
-	if (profile == PIPE_VIDEO_PROFILE_NONE || sps->chroma_format_idc != 1)
+	if (profile == PIPE_VIDEO_PROFILE_UNKNOWN || sps->chroma_format_idc != 1)
 		return RDNVD_UNSUPPORTED;
 	codec_close(s);
 	memset(&templ, 0, sizeof(templ));
