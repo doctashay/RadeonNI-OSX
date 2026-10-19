@@ -10,6 +10,10 @@
  *   rdnuvd test          init if needed, then run one indirect buffer that
  *                        writes UVD_CONTEXT_ID, wait for its fence, read it back
  *   rdnuvd regs          UVD_STATUS and the registers rdn_uvd.c programs
+ *   rdnuvd watch <s>     for s seconds read the decoder's whole working memory (the VCPU region: firmware, heap, stack and
+ *                        session area) once a second and say which bytes changed since the last look
+ *   rdnuvd beat <s> [ms] for s seconds, every ms milliseconds (100) run an indirect buffer of nothing at all through the
+ *                        decoder's ring and wait for its fence: work for the firmware while no program is decoding
  *   rdnuvd fwcheck <fw>  compare the firmware in the running decoder's own memory with the file (it changes a few
  *                        bytes of itself; thousands of other differences mean something wrote over it)
  *   rdnuvd bw            how fast the CPU reads and writes video memory through the aperture, by access width
@@ -31,6 +35,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include <mach/mach.h>
 #include <IOKit/IOKitLib.h>
 #include "rdn_user.h"
@@ -273,6 +278,86 @@ static int do_test(void)
 	return reached && v == (unsigned)fence ? 0 : 1;
 }
 
+static int do_watch(int seconds)
+{
+	int up = 0, vcpu = 0, ring = 0, t;
+	uint32_t *a, *b, *tmp;
+	size_t words, i;
+
+	if (IOConnectMethodScalarIScalarO(conn, RDN_UC_UVD_INFO, 0, 3, &up, &vcpu, &ring) || !up || ring <= vcpu) {
+		fprintf(stderr, "UVD is not up\n");
+		return 1;
+	}
+	words = (size_t)(ring - vcpu) / 4;
+	a = malloc(words * 4);
+	b = malloc(words * 4);
+	if (!a || !b)
+		return 1;
+	for (i = 0; i < words; i++)
+		a[i] = aperture[vcpu / 4 + i];
+	printf("watching %lu KB at 0x%x\n", (unsigned long)(words * 4 / 1024), vcpu);
+	for (t = 1; t <= seconds; t++) {
+		unsigned changed = 0, ranges = 0;
+		size_t first = 0, last = 0;
+		int open = 0;
+
+		sleep(1);
+		for (i = 0; i < words; i++)
+			b[i] = aperture[vcpu / 4 + i];
+		printf("t=%d:", t);
+		for (i = 0; i < words; i++) {
+			if (a[i] != b[i]) {
+				changed++;
+				if (!open) {
+					open = 1;
+					first = i;
+				}
+				last = i;
+			} else if (open && i > last + 16) {
+				if (ranges++ < 6)
+					printf(" 0x%lx-0x%lx", (unsigned long)(first * 4), (unsigned long)(last * 4 + 3));
+				open = 0;
+			}
+		}
+		if (open && ranges++ < 6)
+			printf(" 0x%lx-0x%lx", (unsigned long)(first * 4), (unsigned long)(last * 4 + 3));
+		printf("  (%u words changed in %u ranges)\n", changed, ranges);
+		fflush(stdout);
+		tmp = a;
+		a = b;
+		b = tmp;
+	}
+	return 0;
+}
+
+static int do_beat(double seconds, int ms)
+{
+	int off = 0, fence = 0, reached = 0, i, kr;
+	struct timeval t0, t;
+	unsigned n = 0, missed = 0;
+
+	if (IOConnectMethodScalarIScalarO(conn, RDN_UC_ALLOC, 2, 1, 4096, 4096, &off)) {
+		fprintf(stderr, "no video memory for the buffer\n");
+		return 1;
+	}
+	for (i = 0; i < 16; i++)
+		aperture[off / 4 + i] = 0x80000000;	/* type 2 packets: no operation */
+	gettimeofday(&t0, NULL);
+	do {
+		kr = IOConnectMethodScalarIScalarO(conn, RDN_UC_UVD_SUBMIT, 2, 1, off, 16, &fence);
+		if (!kr)
+			kr = IOConnectMethodScalarIScalarO(conn, RDN_UC_UVD_FENCE_WAIT, 2, 1, fence, 1000, &reached);
+		if (kr || !reached)
+			missed++;
+		n++;
+		usleep((useconds_t)ms * 1000);
+		gettimeofday(&t, NULL);
+	} while ((t.tv_sec - t0.tv_sec) + (t.tv_usec - t0.tv_usec) / 1e6 < seconds);
+	printf("%u empty buffers run, %u without a fence\n", n, missed);
+	IOConnectMethodScalarIScalarO(conn, RDN_UC_FREE, 1, 0, off);
+	return missed != 0;
+}
+
 int main(int argc, char **argv)
 {
 	const char *cmd = argc > 1 ? argv[1] : "info";
@@ -295,6 +380,10 @@ int main(int argc, char **argv)
 		return do_bw();
 	else if (!strcmp(cmd, "regs"))
 		show_regs();
+	else if (!strcmp(cmd, "watch") && argc > 2)
+		return do_watch(atoi(argv[2]));
+	else if (!strcmp(cmd, "beat") && argc > 2)
+		return do_beat(atof(argv[2]), argc > 3 ? atoi(argv[3]) : 100);
 	else {
 		fprintf(stderr, "usage: rdnuvd info | init | test | regs | bw | dump <firmware>\n");
 		return 2;
