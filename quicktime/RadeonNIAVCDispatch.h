@@ -69,7 +69,7 @@ ComponentRangeBegin (1)
 	ComponentDelegate (RequestGammaLevel)			/* 0x28 */
 	ComponentDelegate (GetSourceDataGammaLevel)		/* 0x29 */
 	ComponentDelegate (Unused2A)				/* 0x2A */
-	ComponentDelegate (GetDecompressLatency)		/* 0x2B */
+	ComponentCall (GetDecompressLatency)			/* 0x2B */
 	ComponentDelegate (MergeFloatingImageOntoWindow)	/* 0x2C */
 	ComponentDelegate (RemoveFloatingImage)			/* 0x2D */
 	ComponentDelegate (GetDITLForSize)			/* 0x2E */

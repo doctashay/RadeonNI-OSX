@@ -170,6 +170,23 @@ pascal ComponentResult RDNAVC_GetCodecInfo(RDNAVCGlobals *storage, CodecInfo *in
 	return noErr;
 }
 
+/*
+ * How long before a picture is to be shown it may be decoded: the pictures a decoder holds back. QuickTime
+ * takes a frame whose display time is further from its decoding time than this to be undisplayable.
+ * (Nominal 24 pictures a second, in milliseconds.)
+ */
+pascal ComponentResult RDNAVC_GetDecompressLatency(RDNAVCGlobals *storage, TimeRecord *latency)
+{
+	unsigned pictures = storage->session ? rdnvd_h264_reorder_delay(storage->session) : 16;
+
+	if (!latency)
+		return paramErr;
+	memset(latency, 0, sizeof(*latency));
+	latency->value.lo = (pictures + 1) * 1000 / 24;
+	latency->scale = 1000;
+	return noErr;
+}
+
 pascal ComponentResult RDNAVC_Initialize(RDNAVCGlobals *storage, ImageSubCodecDecompressCapabilities *cap)
 {
 	cap->decompressRecordSize = sizeof(RDNAVCDecompressRecord);

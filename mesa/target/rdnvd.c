@@ -61,6 +61,7 @@ struct rdnvd_session {
 	unsigned gen;				/* of the codec and its buffers: a new sequence is a new one */
 	unsigned width, height;			/* the codec's, in samples */
 	unsigned crop_left, crop_right, crop_top, crop_bottom;
+	unsigned reorder_delay;
 	struct frame_buf *all, *free;
 	struct pipe_fence_handle *fence;
 	int error;				/* the first failure of a callback, for the feed that caused it */
@@ -198,6 +199,7 @@ static int on_sequence(void *user, const struct rdnvd_h264_sps *sps)
 	templ.width = s->width = sps->width_mbs * 16;
 	templ.height = s->height = sps->height_mbs * 16;
 	templ.max_references = sps->max_num_ref_frames ? sps->max_num_ref_frames : 1;
+	s->reorder_delay = sps->vui_bitstream_restriction ? sps->max_num_reorder_frames + 1 : sps->dpb_frames;
 	s->crop_left = sps->crop_left;
 	s->crop_right = sps->crop_right;
 	s->crop_top = sps->crop_top;
@@ -500,6 +502,11 @@ RDNVD_PUBLIC int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *da
 	/* a second picture in the data would be a damaged access unit: let it go */
 	s->captured = NULL;
 	return r ? r : r2;
+}
+
+RDNVD_PUBLIC unsigned rdnvd_h264_reorder_delay(struct rdnvd_session *s)
+{
+	return s->reorder_delay;
 }
 
 RDNVD_PUBLIC int rdnvd_h264_flush(struct rdnvd_session *s, int drop)

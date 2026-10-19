@@ -77,6 +77,11 @@ int rdnvd_h264_feed(struct rdnvd_session *s, const uint8_t *data, size_t size, u
  */
 int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *data, size_t size, unsigned nal_length_size,
 			 struct rdnvd_frame **frame);
+/*
+ * How many pictures a picture can be decoded before it is displayed: the decoder's picture buffer, or
+ * what the stream says it reorders. For a consumer that has to say how far ahead it decodes.
+ */
+unsigned rdnvd_h264_reorder_delay(struct rdnvd_session *s);
 /* The end of the stream or a seek: decode what is pending and output everything (drop: forget it instead). */
 int rdnvd_h264_flush(struct rdnvd_session *s, int drop);
 void rdnvd_h264_close(struct rdnvd_session *s);
