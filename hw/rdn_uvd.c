@@ -799,7 +799,7 @@ int rdn_uvd_ib_submit(struct rdn_uvd *uvd, uint64_t gpu_addr, uint32_t words,
 		return -EINVAL;
 	if ((gpu_addr >> 32) != (uvd->ring_gpu >> 32))
 		return -EINVAL;
-	r = ring_begin(uvd, 16);
+	r = ring_begin(uvd, 32);
 	if (r)
 		return r;
 	*seq = ++uvd->fence_emitted;
@@ -807,11 +807,17 @@ int rdn_uvd_ib_submit(struct rdn_uvd *uvd, uint64_t gpu_addr, uint32_t words,
 	ring_put(uvd, (uint32_t)gpu_addr);
 	ring_put(uvd, RDN_UVD_PACKET0(UVD_RBC_IB_SIZE, 0));
 	ring_put(uvd, words);
-	/* the fence: the VCPU writes `seq` to memory, then traps (uvd_v1_0_fence_emit) */
+	/*
+	 * the fence, as uvd_v2_2_fence_emit() (the evergreen and later hardware): UVD_CONTEXT_ID gets the
+	 * sequence number, the VCPU writes that register's value to the address in DATA0/DATA1 (command 0), then
+	 * traps (command 2)
+	 */
+	ring_put(uvd, RDN_UVD_PACKET0(UVD_CONTEXT_ID, 0));
+	ring_put(uvd, *seq);
 	ring_put(uvd, RDN_UVD_PACKET0(UVD_GPCOM_VCPU_DATA0, 0));
 	ring_put(uvd, fence_low);
 	ring_put(uvd, RDN_UVD_PACKET0(UVD_GPCOM_VCPU_DATA1, 0));
-	ring_put(uvd, *seq);
+	ring_put(uvd, (uint32_t)(ring_gpu >> 32) & 0xff);
 	ring_put(uvd, RDN_UVD_PACKET0(UVD_GPCOM_VCPU_CMD, 0));
 	ring_put(uvd, 0);
 	ring_put(uvd, RDN_UVD_PACKET0(UVD_GPCOM_VCPU_DATA0, 0));
