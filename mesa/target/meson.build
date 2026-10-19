@@ -79,7 +79,9 @@ rdnvd_sources = [rdn_sources, files('rdnvd.c', 'video/rdnvd_h264.c')]
 rdnvd_link_with = [libr600, libmesa, libgallium, libgalliumvl, librdnwinsys]
 rdnvd_args = []
 if host_machine.system() == 'darwin'
-  rdnvd_args = ['-Wl,-exported_symbols_list,' + meson.current_source_dir() / 'rdnvd.exports']
+  # @loader_path: a program (a QuickTime component, say) keeps the library beside it; Tiger has no @rpath.
+  rdnvd_args = ['-Wl,-exported_symbols_list,' + meson.current_source_dir() / 'rdnvd.exports',
+                '-Wl,-install_name,@loader_path/librdnvd.dylib']
 endif
 shared_library(
   'rdnvd',

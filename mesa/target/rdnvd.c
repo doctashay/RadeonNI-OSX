@@ -448,11 +448,14 @@ RDNVD_PUBLIC struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_
 		const struct rdnvd_h264_sps *sps = r < 0 ? NULL : rdnvd_h264_parser_first_sps(s->parser);
 
 		/* A stream the card cannot decode is refused now, while the caller can still use software. */
-		if (r < 0 || !sps || !sequence_supported(sps)) {
+		/* The decoder (and its memory) is made now, so that a card that cannot take another one says so now. */
+		if (r < 0 || !sps || !sequence_supported(sps) || on_sequence(s, sps)) {
+			codec_close(s);
 			rdnvd_h264_parser_free(s->parser);
 			free(s);
 			return NULL;
 		}
+		rdnvd_h264_parser_set_sequence(s->parser, sps);
 		if (nal_length_size)
 			*nal_length_size = (unsigned)r;
 	}

@@ -1501,6 +1501,12 @@ int rdnvd_h264_parser_feed_avcc(struct rdnvd_h264 *h, const uint8_t *data, size_
 	return err;
 }
 
+void rdnvd_h264_parser_set_sequence(struct rdnvd_h264 *h, const struct rdnvd_h264_sps *sps)
+{
+	h->seq = *sps;
+	h->have_seq = 1;
+}
+
 const struct rdnvd_h264_sps *rdnvd_h264_parser_first_sps(const struct rdnvd_h264 *h)
 {
 	unsigned i;
