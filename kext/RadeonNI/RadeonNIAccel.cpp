@@ -885,6 +885,7 @@ void RadeonNIAccel::uvdScan(UInt32 offset, UInt32 words, UInt32 *handles, UInt32
 				m = (volatile UInt8 *)fAccel.aperture + at;
 				type_ = m[4] | m[5] << 8 | m[6] << 16 | (UInt32)m[7] << 24;
 				handle = m[8] | m[9] << 8 | m[10] << 16 | (UInt32)m[11] << 24;
+				IOLog("RadeonNI: trace uvd message type %lu handle 0x%lx\n", (unsigned long)type_, (unsigned long)handle);
 				if (type_ == 0) {
 					for (k = 0; k < *count; k++)
 						if (handles[k] == handle)
@@ -1016,6 +1017,7 @@ bool RadeonNIAccel::uvdFenceWait(UInt32 fence, UInt32 timeoutMs)
 void RadeonNIAccel::uvdUser(bool add)
 {
 	IOLockLock(fLock);
+	IOLog("RadeonNI: trace uvd user %s, users were %lu\n", add ? "added" : "removed", (unsigned long)fUvdUsers);
 	if (add) {
 		fUvdUsers++;
 	} else if (fUvdUsers && !--fUvdUsers && fUvdUp && fUvdClocksUp) {
@@ -1661,6 +1663,7 @@ bool RadeonNIUserClient::initWithTask(task_t owningTask, void *securityID,
 	if (!super::initWithTask(owningTask, securityID, type))
 		return false;
 	fTask = owningTask;
+	IOLog("RadeonNI: trace client %p task %p opened\n", this, owningTask);
 	fOffsets = (UInt32 *)IOMalloc(kMaxAllocations * sizeof(UInt32));
 	fCount = 0;
 	fUvdUser = false;
@@ -1701,6 +1704,8 @@ void RadeonNIUserClient::freeAll(void)
 
 IOReturn RadeonNIUserClient::clientClose(void)
 {
+	IOLog("RadeonNI: trace client %p task %p closing (uvd handles %lu, uvd user %d)\n", this, fTask,
+	      (unsigned long)fUvdHandleCount, (int)fUvdUser);
 	freeAll();
 	terminate();
 	return kIOReturnSuccess;
@@ -1775,6 +1780,17 @@ IOExternalMethod *RadeonNIUserClient::getTargetAndMethodForIndex(
 
 	if (index >= RDN_UC_METHOD_COUNT)
 		return 0;
+	/* trace of what the clients do to the card (not the calls that are many and plain: submit, fence waits, register reads, copies, allocation) */
+	{
+		static const char *const names[RDN_UC_METHOD_COUNT] = {
+			"get-info", "", "", "", "", "", "surface-region", "surface-buffer", "surface-list", "surface-locked",
+			"power", "", "alloc-hidden", "hidden-info", "gart-info", "gart-bind", "gart-unbind", "screen-fill",
+			"screen-copy", "uvd-init", "uvd-submit", "", "uvd-info"
+		};
+
+		if (names[index][0])
+			IOLog("RadeonNI: trace client %p task %p %s\n", this, fTask, names[index]);
+	}
 	*target = this;
 	return (IOExternalMethod *)&methods[index];
 }
@@ -1816,6 +1832,9 @@ IOReturn RadeonNIUserClient::methodAlloc(UInt32 size, UInt32 align,
 	r = fAccel->allocVram(size, align, offset);
 	if (r == kIOReturnSuccess)
 		fOffsets[fCount++] = *offset;
+	if (size >= (4u << 20))
+		IOLog("RadeonNI: trace client %p alloc %lu KB -> %s 0x%lx\n", this, (unsigned long)(size >> 10),
+		      r == kIOReturnSuccess ? "at" : "FAILED", (unsigned long)(r == kIOReturnSuccess ? *offset : 0));
 	return r;
 }
 
