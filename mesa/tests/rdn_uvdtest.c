@@ -55,7 +55,7 @@ struct test {
 	FILE *out;
 	unsigned pictures, bad_pictures, size_errors;
 	unsigned long bad_samples;
-	double compare_ms;
+	double compare_ms, read_ms;
 	unsigned width, height;
 };
 
@@ -80,7 +80,12 @@ static void on_frame(void *user, struct rdnvd_frame *frame)
 			fprintf(stderr, "uvdtest: the reference has too few pictures\n");
 		goto done;
 	}
-	r = rdnvd_frame_read(frame, y, w, uv, w);
+	{
+		double tr = now_ms();
+
+		r = rdnvd_frame_read(frame, y, w, uv, w);
+		t->read_ms += now_ms() - tr;
+	}
 	if (r) {
 		fprintf(stderr, "uvdtest: reading picture %u failed (%d)\n", t->pictures, r);
 		t->bad_pictures++;
@@ -187,9 +192,11 @@ int main(int argc, char **argv)
 		}
 	}
 	total_ms = now_ms() - t0;
-	printf("%ux%u, %u pictures in %u pass(es): %.1f ms in all, %.1f ms of it comparing: %.2f ms a picture\n",
-	       t.width, t.height, pictures, pass, total_ms, t.compare_ms,
-	       pictures ? (total_ms - t.compare_ms) / pictures : 0.0);
+	printf("%ux%u, %u pictures in %u pass(es): %.1f ms in all; decoding %.2f ms a picture (%.0f a second), "
+	       "reading a picture out %.2f ms, comparing it %.2f ms\n",
+	       t.width, t.height, pictures, pass, total_ms, pictures ? (total_ms - t.compare_ms) / pictures : 0.0,
+	       pictures ? 1000.0 * pictures / (total_ms - t.compare_ms) : 0.0, pictures ? t.read_ms / pictures : 0.0,
+	       pictures ? (t.compare_ms - t.read_ms) / pictures : 0.0);
 	printf("%s\n", r || t.bad_pictures ? "FAIL" : "PASS: every picture identical to ffmpeg's");
 	rdnvd_close(d);
 	return r || t.bad_pictures;
