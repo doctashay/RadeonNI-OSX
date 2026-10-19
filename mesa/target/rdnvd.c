@@ -476,18 +476,34 @@ RDNVD_PUBLIC struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_
 		const struct rdnvd_h264_sps *sps = r < 0 ? NULL : rdnvd_h264_parser_first_sps(s->parser);
 
 		/* A stream the card cannot decode is refused now, while the caller can still use software. */
-		/* The decoder (and its memory) is made now, so that a card that cannot take another one says so now. */
-		if (r < 0 || !sps || !sequence_supported(sps) || on_sequence(s, sps)) {
-			codec_close(s);
+		if (r < 0 || !sps || !sequence_supported(sps)) {
 			rdnvd_h264_parser_free(s->parser);
 			free(s);
 			return NULL;
 		}
-		rdnvd_h264_parser_set_sequence(s->parser, sps);
+		/* The decoder is made by rdnvd_h264_prepare() or by the first picture: it takes some 100 MB of video memory. */
 		if (nal_length_size)
 			*nal_length_size = (unsigned)r;
 	}
 	return s;
+}
+
+RDNVD_PUBLIC int rdnvd_h264_prepare(struct rdnvd_session *s)
+{
+	const struct rdnvd_h264_sps *sps = rdnvd_h264_parser_first_sps(s->parser);
+	int r;
+
+	if (s->codec)
+		return 0;
+	if (!sps)
+		return RDNVD_BAD_STREAM;
+	r = on_sequence(s, sps);
+	if (r) {
+		codec_close(s);
+		return r;
+	}
+	rdnvd_h264_parser_set_sequence(s->parser, sps);
+	return 0;
 }
 
 RDNVD_PUBLIC int rdnvd_h264_feed(struct rdnvd_session *s, const uint8_t *data, size_t size, uint64_t pts,

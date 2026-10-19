@@ -510,12 +510,16 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
       if (!r)
          bo->region = RDN_VISIBLE;
    }
-   if (r && want != RDN_GART && ws->dev->gart_alloc) {
+   if (r && want != RDN_GART && ws->dev->gart_alloc &&
+       (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING)) {
       /*
        * Video memory is full. Nothing here can move a buffer out of it to
        * make room, but a new one can live in the program's own memory
        * behind the GART: slower for the GPU to read, and the program goes
-       * on instead of stopping.
+       * on instead of stopping. Not what r600 marks as shareable (the video
+       * decoder's buffers, the display's): the engines that use those
+       * cannot reach the GART, so the allocation fails, and whoever asked
+       * can do without (a second decoder: the first one has the memory).
        */
       r = ws->dev->gart_alloc(ws->dev, size, alignment, &bo->offset);
       if (!r) {

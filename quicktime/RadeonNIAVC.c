@@ -43,6 +43,7 @@ typedef struct {
 	ComponentInstance self, delegate, target;
 	struct rdnvd_session *session;
 	unsigned nalLengthSize;
+	Boolean prepared;
 	long width, height;
 	OSType **wantedPixelTypes;
 } RDNAVCGlobals;
@@ -286,6 +287,7 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 	storage->nalLengthSize = nal;
 	storage->width = (**desc).width;
 	storage->height = (**desc).height;
+	/* QuickTime opens several instances to ask about one movie: the decoder (100 MB of video memory) waits for the first picture */
 	say("taking a %ldx%ld stream (NAL length size %u)", storage->width, storage->height, nal);
 
 	if (!storage->wantedPixelTypes) {
@@ -331,6 +333,18 @@ pascal ComponentResult RDNAVC_BeginBand(RDNAVCGlobals *storage, CodecDecompressP
 
 	if (!storage->session)
 		return codecErr;
+	if (!storage->prepared) {
+		int r;
+
+		pthread_mutex_lock(&gLock);
+		r = rdnvd_h264_prepare(storage->session);
+		pthread_mutex_unlock(&gLock);
+		if (r) {
+			say("no room for the decoder (%d)", r);
+			return codecErr;
+		}
+		storage->prepared = true;
+	}
 	rec->width = (**p->imageDescription).width;
 	rec->height = (**p->imageDescription).height;
 	rec->dataSize = p->bufferSize;

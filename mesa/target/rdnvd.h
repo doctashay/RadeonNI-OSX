@@ -69,6 +69,11 @@ void rdnvd_close(struct rdnvd *d);
 struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_t *avcc, size_t avcc_size,
 				      rdnvd_output_fn output, void *user, unsigned *nal_length_size);
 /*
+ * Makes the decoder (and takes its video memory) now, for a session opened with an avcC record; otherwise it is made
+ * when the first picture comes. 0, or an error: another decoder may have the card's memory.
+ */
+int rdnvd_h264_prepare(struct rdnvd_session *s);
+/*
  * Data: Annex B (nal_length_size 0) or length prefixed. `end_of_au`: the data ends an access unit, so the
  * picture in it is decoded now (a QuickTime sample, or what a VLC packetizer hands over). `pts` goes with the
  * pictures that start in this data.
