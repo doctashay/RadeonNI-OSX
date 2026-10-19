@@ -15,14 +15,15 @@ CONTENTS = $(BUNDLE)/Contents
 
 all: $(CONTENTS)/MacOS/RadeonNIAVC $(CONTENTS)/MacOS/librdnvd.dylib $(CONTENTS)/Resources/RadeonNIAVC.rsrc $(CONTENTS)/Info.plist
 
-$(CONTENTS)/MacOS/RadeonNIAVC: RadeonNIAVC.c RadeonNIAVCDispatch.h rdnvd.h
-	mkdir -p $(CONTENTS)/MacOS
-	$(CC) $(ARCH) -O2 -Wall -fno-strict-aliasing -fpascal-strings -I. -bundle -o $@ RadeonNIAVC.c \
-		-framework CoreServices -framework QuickTime -L. -lrdnvd
-
+# the library first: the executable records its install name when it is linked
 $(CONTENTS)/MacOS/librdnvd.dylib: librdnvd.dylib
 	mkdir -p $(CONTENTS)/MacOS
 	cp librdnvd.dylib $@
+	install_name_tool -id @loader_path/librdnvd.dylib $@
+
+$(CONTENTS)/MacOS/RadeonNIAVC: RadeonNIAVC.c RadeonNIAVCDispatch.h rdnvd.h $(CONTENTS)/MacOS/librdnvd.dylib
+	$(CC) $(ARCH) -O2 -Wall -fno-strict-aliasing -fpascal-strings -I. -bundle -o $@ RadeonNIAVC.c \
+		-framework CoreServices -framework QuickTime -L$(CONTENTS)/MacOS -lrdnvd
 
 $(CONTENTS)/Resources/RadeonNIAVC.rsrc: RadeonNIAVC.r
 	mkdir -p $(CONTENTS)/Resources
