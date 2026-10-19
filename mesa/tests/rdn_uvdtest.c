@@ -27,7 +27,7 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_video_codec.h"
 #include "pipe/p_video_state.h"
-#include "util/u_box.h"
+#include "util/box.h"
 #include "util/u_inlines.h"
 
 extern struct pipe_screen *osmesa_create_screen(void);
