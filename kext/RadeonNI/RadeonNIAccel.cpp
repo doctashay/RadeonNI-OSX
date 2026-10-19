@@ -923,7 +923,8 @@ void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count)
 		volatile UInt8 *m = (volatile UInt8 *)fAccel.aperture + fUvdScratch;
 		volatile UInt32 *ib = (volatile UInt32 *)((UInt8 *)fAccel.aperture + fUvdScratch + 1024);
 		uint64_t addr = rdn_vram_addr(&fAccel, fUvdScratch);
-		UInt32 j, seq = 0, handle = handles[i];
+		UInt32 j, handle = handles[i];
+		uint32_t seq = 0;
 
 		for (j = 0; j < 64; j++)
 			m[j] = 0;
