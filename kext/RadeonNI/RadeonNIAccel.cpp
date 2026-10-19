@@ -803,10 +803,42 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 		return kIOReturnIOError;
 	}
 	fUvdUp = true;
+	fUvdFlags = flags;
+	fUvdRef = ref;
 	IOLockUnlock(fLock);
 	IOLog("RadeonNI: UVD is up, UVD_STATUS 0x%08lx\n", (unsigned long)*status);
 	IOFree(fw, fwSize);
 	return kIOReturnSuccess;
+}
+
+/*
+ * The firmware holds ten sessions, made by programs' messages; QuickTime programs end without closing their
+ * decoders, and a session nobody destroys stays: after ten the next decoder silently decodes nothing. When the last
+ * program that decoded is gone nothing is in use, so the block is started again (about half a second).
+ * Called with fLock held and no fences pending.
+ */
+void RadeonNIAccel::uvdRestart(void)
+{
+	UInt32 fwSize = 0;
+	void *fw;
+	int r;
+
+	if (!fUvdUp || !fUvdDirty || (fUvdFlags & RDN_UVD_F_GART))
+		return;
+	fw = copyFirmware("FW_UVD", &fwSize);
+	if (!fw)
+		return;
+	fUvdDirty = false;
+	rdn_uvd_fini(&fUvd);
+	r = rdn_uvd_init(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
+			 fUvd.vcpu_offset, fUvd.ring_offset, 4096, fUvdFlags);
+	IOFree(fw, fwSize);
+	if (r) {
+		fUvdUp = false;
+		IOLog("RadeonNI: UVD did not start again (%d)\n", r);
+		return;
+	}
+	IOLog("RadeonNI: UVD restarted: no program is decoding\n");
 }
 
 IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence)
@@ -830,8 +862,10 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence)
 	}
 	if (!r)
 		r = rdn_uvd_ib_submit(&fUvd, rdn_vram_addr(&fAccel, offset), words, &seq);
-	if (!r)
+	if (!r) {
 		fUvdLastSeq = seq;
+		fUvdDirty = true;
+	}
 	IOLockUnlock(fLock);
 	if (r)
 		return kIOReturnIOError;
@@ -879,6 +913,7 @@ void RadeonNIAccel::uvdUser(bool add)
 			fUvdClocksUp = false;
 			if (fUvd.flags & RDN_UVD_F_PLL)
 				IOLog("RadeonNI: UVD clocks down\n");
+			uvdRestart();
 		}
 	}
 	IOLockUnlock(fLock);

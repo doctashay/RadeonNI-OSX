@@ -6,7 +6,9 @@
  *
  * stream.h264: Annex B; reference.yuv: the same stream decoded by ffmpeg as yuv420p, all the
  * pictures in display order (scripts/uvd-testvec.sh makes both). H.264 decodes bit-exactly, so every
- * sample must be identical. -n repeats the whole stream; -o writes the last pass's pictures.
+ * sample must be identical. -n repeats the whole stream; -o writes the last pass's pictures. -L n opens n more
+ * decoder sessions first and leaves them open when the program ends (what QuickTime programs do: the card's
+ * firmware holds ten sessions, and the kext starts the block again when the last program that used it is gone).
  *
  * Copyright (c) 2026 kouta-kun and Claude
  * SPDX-License-Identifier: MIT
@@ -126,6 +128,7 @@ int main(int argc, char **argv)
 {
 	const char *stream_path = NULL, *ref_path = NULL, *out_path = NULL;
 	unsigned count = 1, pass, nal_length_size = 0, pictures = 0;
+	int leak = 0;
 	size_t stream_size, ref_size;
 	uint8_t *stream, *ref;
 	struct rdnvd *d;
@@ -138,6 +141,8 @@ int main(int argc, char **argv)
 			count = atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-o") && a + 1 < argc)
 			out_path = argv[++a];
+		else if (!strcmp(argv[a], "-L") && a + 1 < argc)
+			leak = atoi(argv[++a]);
 		else if (!stream_path)
 			stream_path = argv[a];
 		else if (!ref_path)
@@ -162,6 +167,18 @@ int main(int argc, char **argv)
 	memset(&t, 0, sizeof(t));
 	t.ref = ref;
 	t.ref_size = ref_size;
+	/* sessions that are made, decode a picture and are never destroyed */
+	for (a = 0; a < leak; a++) {
+		struct rdnvd_session *s = rdnvd_h264_open(d, NULL, 0, NULL, NULL, &nal_length_size);
+		struct rdnvd_frame *frame = NULL;
+
+		if (!s || rdnvd_h264_decode_au(s, stream, stream_size, 0, &frame))
+			fprintf(stderr, "uvdtest: leaked session %d did not decode\n", a);
+		if (frame)
+			rdnvd_frame_release(frame);
+	}
+	if (leak)
+		printf("%d sessions left open\n", leak);
 	t0 = now_ms();
 	for (pass = 0; pass < count && !r; pass++) {
 		struct rdnvd_session *s = rdnvd_h264_open(d, NULL, 0, on_frame, &t, &nal_length_size);

@@ -98,6 +98,8 @@ public:
 	bool uvdFenceWait(UInt32 fence, UInt32 timeoutMs);
 	/* The clients that have decoded: the clocks stay up while there is one. */
 	void uvdUser(bool add);
+	/* Start the block again: the sessions programs left in the firmware (they end without destroying them) go. */
+	void uvdRestart(void);
 	IOReturn uvdInfo(UInt32 *up, UInt32 *vcpuOffset, UInt32 *ringOffset);
 	IOMemoryDescriptor *apertureMemory(void);
 	UInt32 apertureBytes(void);
@@ -147,6 +149,10 @@ private:
 	struct rdn_uvd fUvd;
 	bool fUvdUp, fUvdFailed, fUvdClocksUp;
 	UInt32 fUvdLastSeq, fUvdUsers;
+	/* How the block was started (to start it again), and whether any program has used it since. */
+	UInt32 fUvdFlags;
+	uint32_t fUvdRef;
+	bool fUvdDirty;
 	IOBufferMemoryDescriptor *fUvdGartMem;
 	UInt32 fUvdGartAt;
 	/* The power state the card was last put in (hw/rdn_pm.h). */
