@@ -1,0 +1,40 @@
+--- a/src/gallium/drivers/r600/r600_uvd.c
++++ b/src/gallium/drivers/r600/r600_uvd.c
+@@ -47,6 +47,10 @@
+ 	/* first create the needed resources as "normal" textures */
+ 	vl_get_video_buffer_formats(pipe->screen, tmpl->buffer_format, resource_formats);
+ 
++	/*
++	 * osx-gpu: PIPE_BIND_SHARED below makes these buffers shareable in r600's terms, so that our winsys never
++	 * puts one in system memory (behind the GART) when video memory is full: the decoder cannot reach it.
++	 */
+ 	array_size = tmpl->interlaced ? 2 : 1;
+ 	template = *tmpl;
+ 	template.width = align(tmpl->width, VL_MACROBLOCK_WIDTH);
+@@ -56,7 +60,7 @@
+ 	vl_video_buffer_template(&templ, &template, resource_formats[0], 1, array_size,
+ 									 PIPE_USAGE_DEFAULT, 0, chroma_format);
+ 	if (ctx->b.gfx_level < EVERGREEN || tmpl->interlaced || !R600_UVD_ENABLE_TILING)
+-		templ.bind = PIPE_BIND_LINEAR;
++		templ.bind = PIPE_BIND_LINEAR | PIPE_BIND_SHARED;
+ 	resources[0] = r600_as_texture(pipe->screen->resource_create(pipe->screen, &templ));
+ 	if (!resources[0])
+ 		goto error;
+@@ -65,7 +69,7 @@
+ 		vl_video_buffer_template(&templ, &template, resource_formats[1], 1, array_size,
+ 										 PIPE_USAGE_DEFAULT, 1, chroma_format);
+ 		if (ctx->b.gfx_level < EVERGREEN || tmpl->interlaced || !R600_UVD_ENABLE_TILING)
+-			templ.bind = PIPE_BIND_LINEAR;
++			templ.bind = PIPE_BIND_LINEAR | PIPE_BIND_SHARED;
+ 		resources[1] = r600_as_texture(pipe->screen->resource_create(pipe->screen, &templ));
+ 		if (!resources[1])
+ 			goto error;
+@@ -75,7 +79,7 @@
+ 		vl_video_buffer_template(&templ, &template, resource_formats[2], 1, array_size,
+ 										 PIPE_USAGE_DEFAULT, 2, chroma_format);
+ 		if (ctx->b.gfx_level < EVERGREEN || tmpl->interlaced || !R600_UVD_ENABLE_TILING)
+-			templ.bind = PIPE_BIND_LINEAR;
++			templ.bind = PIPE_BIND_LINEAR | PIPE_BIND_SHARED;
+ 		resources[2] = r600_as_texture(pipe->screen->resource_create(pipe->screen, &templ));
+ 		if (!resources[2])
+ 			goto error;

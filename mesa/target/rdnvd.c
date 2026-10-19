@@ -205,7 +205,33 @@ static int on_sequence(void *user, const struct rdnvd_h264_sps *sps)
 	s->crop_top = sps->crop_top;
 	s->crop_bottom = sps->crop_bottom;
 	s->codec = s->d->ctx->create_video_codec(s->d->ctx, &templ);
-	return s->codec ? 0 : RDNVD_FAILED;
+	if (!s->codec)
+		return RDNVD_FAILED;
+	/*
+	 * The pictures the decoder will hand out are made now: with several programs decoding, video memory runs out
+	 * while the first pictures are decoded, and a stream that stops at its fifth picture is worse than one that is
+	 * refused at the start. More are made when a program holds on to many.
+	 */
+	{
+		struct frame_buf *held[8];
+		unsigned want = sps->max_num_ref_frames + 3, i, n = 0;
+
+		if (want > 8)
+			want = 8;
+		for (i = 0; i < want; i++) {
+			held[n] = frame_get(s);
+			if (!held[n])
+				break;
+			n++;
+		}
+		for (i = 0; i < n; i++)
+			frame_unref(held[i]);
+		if (n < want) {
+			codec_close(s);
+			return RDNVD_NO_MEMORY;
+		}
+	}
+	return 0;
 }
 
 static void fence_release(struct rdnvd_session *s)
