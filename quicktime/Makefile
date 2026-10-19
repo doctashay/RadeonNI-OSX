@@ -16,10 +16,11 @@ CONTENTS = $(BUNDLE)/Contents
 all: $(CONTENTS)/MacOS/RadeonNIAVC $(CONTENTS)/MacOS/librdnvd.dylib $(CONTENTS)/Resources/RadeonNIAVC.rsrc $(CONTENTS)/Info.plist
 
 # the library first: the executable records its install name when it is linked
+# (scripts/qt-component.sh has set it to @loader_path/librdnvd.dylib: Apple's install_name_tool of Xcode 3 does not read
+# the cross linker's output)
 $(CONTENTS)/MacOS/librdnvd.dylib: librdnvd.dylib
 	mkdir -p $(CONTENTS)/MacOS
 	cp librdnvd.dylib $@
-	install_name_tool -id @loader_path/librdnvd.dylib $@
 
 $(CONTENTS)/MacOS/RadeonNIAVC: RadeonNIAVC.c RadeonNIAVCDispatch.h rdnvd.h $(CONTENTS)/MacOS/librdnvd.dylib
 	$(CC) $(ARCH) -O2 -Wall -fno-strict-aliasing -fpascal-strings -I. -bundle -o $@ RadeonNIAVC.c \

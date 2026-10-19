@@ -21,7 +21,12 @@ build)
     mac ssh 'rm -rf ~/qt-build && mkdir -p ~/qt-build'
     tar -C "$root/quicktime" -cf - . | mac ssh 'tar -C ~/qt-build -xf -'
     mac put "$root/mesa/target/rdnvd.h" '~/qt-build/rdnvd.h'
-    mac put "$lib" '~/qt-build/librdnvd.dylib'
+    # the library keeps the bundle's copy next to the executable: @loader_path, since Tiger has no @rpath
+    mkdir -p "$root/build/qt"
+    cp "$lib" "$root/build/qt/librdnvd.dylib"
+    "$root/scripts/darwin.sh" powerpc-apple-darwin8-install_name_tool -id @loader_path/librdnvd.dylib \
+        "$root/build/qt/librdnvd.dylib"
+    mac put "$root/build/qt/librdnvd.dylib" '~/qt-build/librdnvd.dylib'
     mac ssh 'cd ~/qt-build && make 2>&1 | tail -40 && ls -lR RadeonNIAVC.component | head -30'
     ;;
 get)
