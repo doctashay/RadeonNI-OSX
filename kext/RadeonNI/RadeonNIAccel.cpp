@@ -7,6 +7,7 @@
  */
 
 #include <IOKit/IOLib.h>
+#include <kern/clock.h>
 #include <IOKit/graphics/IOGraphicsInterfaceTypes.h>
 
 #include "RadeonNI.h"
@@ -823,7 +824,7 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
  * epoch; sessions of an older one are gone. Called with fLock held; nothing happens if no program has used the block
  * since the last start (fUvdDirty).
  */
-void RadeonNIAccel::uvdRestart(void)
+void RadeonNIAccel::uvdRestart(UInt32 level)
 {
 	UInt32 fwSize = 0, fenceBase;
 	void *fw;
@@ -836,9 +837,11 @@ void RadeonNIAccel::uvdRestart(void)
 		return;
 	fUvdDirty = false;
 	fenceBase = fUvd.fence_emitted;
+	rdn_uvd_set_reset_level(level);
 	rdn_uvd_fini(&fUvd);
 	r = rdn_uvd_init(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
 			 fUvd.vcpu_offset, fUvd.ring_offset, 4096, fUvdFlags);
+	rdn_uvd_set_reset_level(0);
 	IOFree(fw, fwSize);
 	/* the fence numbers go on, for programs that remember the newest one they saw reached */
 	if (!r) {
@@ -854,7 +857,7 @@ void RadeonNIAccel::uvdRestart(void)
 		IOLog("RadeonNI: UVD did not start again (%d)\n", r);
 		return;
 	}
-	IOLog("RadeonNI: UVD restarted (epoch %lu)\n", (unsigned long)fUvdEpoch);
+	IOLog("RadeonNI: UVD restarted (epoch %lu, reset level %lu)\n", (unsigned long)fUvdEpoch, (unsigned long)level);
 }
 
 /*
@@ -987,7 +990,7 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 			creates = true;
 	/* a new generation of decoders: nobody else's session is alive, so the firmware starts clean (and not in the middle of a command) */
 	if (creates && !fUvdLive && fUvdDirty && rdn_uvd_fence_done(&fUvd, fUvdLastSeq))
-		uvdRestart();
+		uvdRestart(1);
 	if (!fUvdUp) {
 		IOLockUnlock(fLock);
 		return kIOReturnNotReady;
@@ -1050,7 +1053,21 @@ IOReturn RadeonNIAccel::uvdReset(UInt32 *epoch)
 		IOLockLock(fLock);
 	}
 	fUvdDirty = true;
-	uvdRestart();
+	{
+		/* a program that asks again soon found the last reset not enough: the whole block this time (level 2) */
+		uint64_t abstime, nanos;
+		UInt64 now;
+		UInt32 level = 1;
+
+		clock_get_uptime(&abstime);
+		absolutetime_to_nanoseconds(abstime, &nanos);
+		now = nanos / 1000000ULL;
+		if (fUvdResetAtMs && now - fUvdResetAtMs < 20000)
+			level = 2;
+		fUvdResetAtMs = now;
+		fUvdResetLevel = level;
+		uvdRestart(level);
+	}
 	*epoch = fUvdEpoch;
 	IOLockUnlock(fLock);
 	return fUvdUp ? kIOReturnSuccess : kIOReturnIOError;
@@ -1096,7 +1113,7 @@ void RadeonNIAccel::uvdUser(bool add)
 			fUvdClocksUp = false;
 			if (fUvd.flags & RDN_UVD_F_PLL)
 				IOLog("RadeonNI: UVD clocks down\n");
-			uvdRestart();
+			uvdRestart(1);
 		}
 	}
 	IOLockUnlock(fLock);

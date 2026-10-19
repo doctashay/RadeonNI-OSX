@@ -369,6 +369,13 @@ static int ring_test(struct rdn_uvd *uvd)
 static const uint8_t *rlc_ucode;
 static uint32_t rlc_ucode_size;
 
+static unsigned reset_level;
+
+void rdn_uvd_set_reset_level(unsigned level)
+{
+	reset_level = level;
+}
+
 void rdn_uvd_set_rlc_ucode(const void *fw, uint32_t size)
 {
 	rlc_ucode = size == 768 * 4 ? fw : NULL;
@@ -479,6 +486,11 @@ static int vcpu_start(struct rdn_uvd *uvd)
 			wr(card, UVD_MPC_SET_MUXB1, 0x0);
 			wr(card, UVD_MPC_SET_ALU, 0);
 			wr(card, UVD_MPC_SET_MUX, 0x88);
+		}
+		/* after a reset of the sub-blocks they come out of it first, the VCPU last (uvd_v1_0_start()) */
+		if (reset_level >= 1) {
+			wr(card, UVD_SOFT_RESET, VCPU_SOFT_RESET);
+			mdelay(card, 5);
 		}
 		/* clock gating off, VCPU clock on, VCPU out of reset */
 		wr(card, UVD_CGC_GATE, 0);
@@ -610,6 +622,19 @@ static void vcpu_stop(struct rdn_uvd *uvd)
 	/* put VCPU into reset */
 	wr(card, UVD_SOFT_RESET, VCPU_SOFT_RESET);
 	mdelay(card, 5);
+	if (reset_level >= 1) {
+		/* every sub-block, with the memory controller and the register bus stalled, as uvd_v1_0_start() does */
+		wr(card, UVD_SOFT_RESET, LMI_SOFT_RESET | VCPU_SOFT_RESET | LBSI_SOFT_RESET | RBC_SOFT_RESET |
+		   CSM_SOFT_RESET | CXW_SOFT_RESET | TAP_SOFT_RESET | LMI_UMC_SOFT_RESET);
+		mdelay(card, 5);
+	}
+	if (reset_level >= 2) {
+		/* the whole block, as evergreen_gpu_soft_reset() does for a UVD that hung */
+		wr_p(card, SRBM_SOFT_RESET_UVD_REG, SOFT_RESET_UVD, ~SOFT_RESET_UVD);
+		mdelay(card, 1);
+		wr_p(card, SRBM_SOFT_RESET_UVD_REG, 0, ~SOFT_RESET_UVD);
+		mdelay(card, 5);
+	}
 	/* disable VCPU clock */
 	wr(card, UVD_VCPU_CNTL, 0x0);
 	/* unstall UMC and register bus */

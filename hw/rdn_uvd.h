@@ -158,4 +158,12 @@ int rdn_uvd_wake(struct rdn_uvd *uvd);
 /* The RLC microcode (BTC_rlc.bin, 3072 bytes) the minimal start loads before enabling the RLC; NULL for none. */
 void rdn_uvd_set_rlc_ucode(const void *fw, uint32_t size);
 
+/*
+ * How much of the block the next stop and start reset (a global, like the RLC microcode: set it before rdn_uvd_fini() and
+ * rdn_uvd_init(), back to 0 after): 0 only the VCPU (the minimal start relies on the rest being in its cold state);
+ * 1 also every sub-block (UVD_SOFT_RESET, as Linux's uvd_v1_0_start does); 2 also the whole block (SOFT_RESET_UVD in SRBM_SOFT_RESET, as
+ * evergreen_gpu_soft_reset() does for a UVD that hung).
+ */
+void rdn_uvd_set_reset_level(unsigned level);
+
 #endif /* RDN_UVD_H */

@@ -108,7 +108,7 @@ public:
 	/* The clients that have decoded: the clocks stay up while there is one. */
 	void uvdUser(bool add);
 	/* Start the block again: the sessions programs left in the firmware (they end without destroying them) go. */
-	void uvdRestart(void);
+	void uvdRestart(UInt32 level);
 	IOReturn uvdInfo(UInt32 *up, UInt32 *vcpuOffset, UInt32 *ringOffset);
 	IOMemoryDescriptor *apertureMemory(void);
 	UInt32 apertureBytes(void);
@@ -164,6 +164,9 @@ private:
 	UInt32 fUvdFlags;
 	uint32_t fUvdRef;
 	bool fUvdDirty;
+	/* When the program last asked for a reset, and with what level: the same ask again soon is answered with a deeper one. */
+	UInt64 fUvdResetAtMs;
+	UInt32 fUvdResetLevel;
 	/* A page of video memory for messages of the kext's own. */
 	UInt32 fUvdScratch;
 	/* The session messages in a stream of commands: type (0 create, 2 destroy) and handle of each. */

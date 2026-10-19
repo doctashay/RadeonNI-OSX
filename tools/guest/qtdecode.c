@@ -160,6 +160,30 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 	}
 }
 
+/* QuickTime Player has an OpenGL context (its window) in the same program as the decoder: make one */
+static void make_gl_context(void)
+{
+	/* QuickTime Player has an OpenGL context (its window) in the same program as the decoder: make one */
+	CGLPixelFormatAttribute attrs[] = { kCGLPFAAccelerated, kCGLPFAColorSize, (CGLPixelFormatAttribute)24, (CGLPixelFormatAttribute)0 };
+	CGLPixelFormatObj pix = NULL;
+	CGLContextObj ctx = NULL;
+	GLint npix = 0;
+	CGLError ge = CGLChoosePixelFormat(attrs, &pix, &npix);
+
+	if (!ge && pix)
+		ge = CGLCreateContext(pix, NULL, &ctx);
+	if (!ge && ctx) {
+		CGLSetCurrentContext(ctx);
+		glClearColor(0.2f, 0.4f, 0.6f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glFinish();
+		printf("OpenGL context made: %s\n", (const char *)glGetString(GL_RENDERER));
+	} else {
+		printf("OpenGL context failed (%d)\n", (int)ge);
+	}
+
+}
+
 int main(int argc, char **argv)
 {
 	const char *movie_path = NULL, *ref_path = NULL, *component_path = NULL;
@@ -349,26 +373,9 @@ int main(int argc, char **argv)
 			SetTimeBaseValue(timebase, 0, scale);
 		}
 	}
-	if (getenv("QTDECODE_GL")) {
-		/* QuickTime Player has an OpenGL context (its window) in the same program as the decoder: make one */
-		CGLPixelFormatAttribute attrs[] = { kCGLPFAAccelerated, kCGLPFAColorSize, (CGLPixelFormatAttribute)24, (CGLPixelFormatAttribute)0 };
-		CGLPixelFormatObj pix = NULL;
-		CGLContextObj ctx = NULL;
-		GLint npix = 0;
-		CGLError ge = CGLChoosePixelFormat(attrs, &pix, &npix);
-
-		if (!ge && pix)
-			ge = CGLCreateContext(pix, NULL, &ctx);
-		if (!ge && ctx) {
-			CGLSetCurrentContext(ctx);
-			glClearColor(0.2f, 0.4f, 0.6f, 1.0f);
-			glClear(GL_COLOR_BUFFER_BIT);
-			glFinish();
-			printf("OpenGL context made: %s\n", (const char *)glGetString(GL_RENDERER));
-		} else {
-			printf("OpenGL context failed (%d)\n", (int)ge);
-		}
-	}
+	/* QTDECODE_GL=1: before the first picture; QTDECODE_GL=2: after the pause (Player makes it when it starts to play) */
+	if (getenv("QTDECODE_GL") && atoi(getenv("QTDECODE_GL")) == 1)
+		make_gl_context();
 	gT0 = now_ms();
 	while (decodeTime < mediaDuration) {
 		ByteCount got = 0;
@@ -436,6 +443,8 @@ int main(int argc, char **argv)
 			printf("pausing %d s after %u samples\n", atoi(getenv("QTDECODE_PAUSE")), samples);
 			fflush(stdout);
 			sleep(atoi(getenv("QTDECODE_PAUSE")));
+			if (getenv("QTDECODE_GL") && atoi(getenv("QTDECODE_GL")) == 2)
+				make_gl_context();
 		}
 	}
 	if (gSched) {
