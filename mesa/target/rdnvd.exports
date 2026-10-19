@@ -1,4 +1,5 @@
 _rdnvd_open
+_rdnvd_h264_supported
 _rdnvd_close
 _rdnvd_h264_open
 _rdnvd_h264_feed

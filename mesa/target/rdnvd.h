@@ -50,6 +50,13 @@ struct rdnvd_frame {
 
 typedef void (*rdnvd_output_fn)(void *user, struct rdnvd_frame *frame);
 
+/*
+ * Whether the card decodes a stream, from its avcC record, without opening the card: the profile, 4:2:0 at 8
+ * bits, no interlaced coding, not larger than level 4.2. 0 if not, 1 if so; *width and *height (may be NULL)
+ * get the picture's size.
+ */
+int rdnvd_h264_supported(const uint8_t *avcc, size_t avcc_size, unsigned *width, unsigned *height);
+
 struct rdnvd *rdnvd_open(void);
 void rdnvd_close(struct rdnvd *d);
 

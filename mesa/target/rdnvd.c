@@ -400,6 +400,32 @@ static void on_release(void *user, void *surface)
 
 /* ---- the interface ------------------------------------------------------------------- */
 
+static int nop_sequence(void *user, const struct rdnvd_h264_sps *sps)
+{
+	return 0;
+}
+
+RDNVD_PUBLIC int rdnvd_h264_supported(const uint8_t *avcc, size_t avcc_size, unsigned *width, unsigned *height)
+{
+	static const struct rdnvd_h264_callbacks cb = { nop_sequence, NULL, NULL, NULL };
+	struct rdnvd_h264 *p = rdnvd_h264_parser_new(&cb, NULL);
+	const struct rdnvd_h264_sps *sps;
+	int ok = 0;
+
+	if (!p)
+		return 0;
+	if (rdnvd_h264_parser_avcc(p, avcc, avcc_size) >= 0 && (sps = rdnvd_h264_parser_first_sps(p)) != NULL &&
+	    sequence_supported(sps)) {
+		ok = 1;
+		if (width)
+			*width = sps->width_mbs * 16 - sps->crop_left - sps->crop_right;
+		if (height)
+			*height = sps->height_mbs * 16 - sps->crop_top - sps->crop_bottom;
+	}
+	rdnvd_h264_parser_free(p);
+	return ok;
+}
+
 RDNVD_PUBLIC struct rdnvd *rdnvd_open(void)
 {
 	struct rdnvd *d = calloc(1, sizeof(*d));

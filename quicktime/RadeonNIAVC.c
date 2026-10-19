@@ -258,6 +258,15 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 		return codecUnimpErr;
 	}
 
+	/* a stream the card does not take is declined without touching the card */
+	HLock(avcc);
+	if (!rdnvd_h264_supported((const uint8_t *)*avcc, (size_t)GetHandleSize(avcc), NULL, NULL)) {
+		HUnlock(avcc);
+		say("declined: a %ldx%ld stream the card does not decode", (long)(**desc).width, (long)(**desc).height);
+		return codecUnimpErr;
+	}
+	HUnlock(avcc);
+
 	pthread_mutex_lock(&gLock);
 	if (storage->session) {
 		rdnvd_h264_close(storage->session);
