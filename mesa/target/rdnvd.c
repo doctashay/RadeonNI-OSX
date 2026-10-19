@@ -82,7 +82,6 @@ struct rdnvd_session {
 	int replay_valid;			/* 0 once too much came without an IDR picture: nothing to start over from */
 	int stalled;				/* the firmware did not answer the decode that was just run */
 	unsigned failed_recoveries;		/* starting over in a row that did not bring the decoder back */
-	unsigned settle_ms;			/* wait before the next decode: the firmware was just started */
 };
 
 /* ---- surfaces ---------------------------------------------------------------- */
@@ -401,10 +400,6 @@ static int on_decode(void *user, const struct rdnvd_h264_picture *pic, void **su
 		sizes[2 * i + 1] = (unsigned)pic->slices[i].size;
 	}
 
-	if (s->settle_ms) {
-		usleep(s->settle_ms * 1000);
-		s->settle_ms = 0;
-	}
 	s->codec->begin_frame(s->codec, f->buf, &desc.base);
 	s->codec->decode_bitstream(s->codec, f->buf, &desc.base, 2 * pic->num_slices, buffers, sizes);
 	if (s->codec->end_frame(s->codec, f->buf, &desc.base) ||
@@ -416,7 +411,8 @@ static int on_decode(void *user, const struct rdnvd_h264_picture *pic, void **su
 	fence_release(s);
 	/*
 	 * The firmware can stop serving a session: the commands and their fences run, nothing is decoded. Its answer to a
-	 * decode is a feedback block that carries the message's counter; without it the picture was never made.
+	 * decode is a feedback block that carries the message's counter; the picture is made when that is there, and the
+	 * fence can come before it.
 	 */
 	{
 		/* RDNVD_FAKE_STALL=n: take the n-th decode of the program for one that was not answered (to try the recovery) */
@@ -432,9 +428,12 @@ static int on_decode(void *user, const struct rdnvd_h264_picture *pic, void **su
 	}
 	if (!getenv("RDNVD_NO_STALL_CHECK")) {
 		struct radeon_winsys *ws = ((struct r600_common_screen *)s->d->screen)->ws;
-		/* RDNVD_LATE_MS=n: wait up to n ms for an answer that is late, and say how long it took */
+		/*
+		 * The answer can come some milliseconds after the fence (8 ms for the first decodes after the firmware
+		 * was started again), so it is waited for: RDNVD_LATE_MS, 250 ms by default; it is said when it was late.
+		 */
 		const char *e = getenv("RDNVD_LATE_MS");
-		unsigned late = e ? (unsigned)atoi(e) : 0, waited = 0;
+		unsigned late = e ? (unsigned)atoi(e) : 250, waited = 0;
 		int answered = rdn_winsys_uvd_answered(ws);
 
 		while (!answered && waited < late) {
@@ -442,7 +441,7 @@ static int on_decode(void *user, const struct rdnvd_h264_picture *pic, void **su
 			waited += 2;
 			answered = rdn_winsys_uvd_answered(ws);
 		}
-		if (late && (waited || !answered))
+		if (waited || !answered)
 			syslog(LOG_NOTICE, "RadeonNIAVC: a decode %s after %u ms", answered ? "was answered" : "was not answered", waited);
 		if (!answered) {
 			s->stalled = 1;
@@ -754,18 +753,6 @@ static int recover(struct rdnvd_session *s)
 		r = rdnvd_h264_prepare(s);
 		if (r)
 			return r;
-	}
-	/*
-	 * The restarted firmware ignores the first decodes (the card on the G5 answered the fifth after a start, none
-	 * before). The decoder's session is made by the first decode when the stream's configuration was not known, so
-	 * the wait is taken there, after the session exists and the clocks are up: more each time it did not help.
-	 * RDNVD_SETTLE_MS is the first wait.
-	 */
-	{
-		const char *e = getenv("RDNVD_SETTLE_MS");
-		unsigned ms = e ? (unsigned)atoi(e) : 250;
-
-		s->settle_ms = ms << (s->failed_recoveries < 3 ? s->failed_recoveries : 3);
 	}
 	for (i = 0; i < s->replay_n; i++) {
 		r = decode_unit(s, s->replay[i].data, s->replay[i].size, s->replay[i].nal_length_size);
