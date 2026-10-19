@@ -153,7 +153,8 @@ int main(int argc, char **argv)
 	ByteCount maxSize = 4 << 20;
 	unsigned samples = 0, i, j;
 	CFStringRef path;
-	TimeValue64 *times = calloc(65536, sizeof(*times));
+	TimeValue64 *times = calloc(65536, sizeof(*times)), *sorted = calloc(65536, sizeof(*sorted));
+	unsigned nTimes = 0, next = 0;
 
 	for (a = 1; a < argc; a++) {
 		if (!strcmp(argv[a], "-c") && a + 1 < argc)
@@ -276,6 +277,29 @@ int main(int argc, char **argv)
 	}
 
 	buffer = malloc(maxSize);
+	/* A first pass over the sample table for the display times, so that pictures can be asked for as soon as they can be shown. */
+	{
+		TimeValue64 t = 0;
+
+		while (t < mediaDuration && nTimes < 65536) {
+			TimeValue64 st = 0, du = 0, of = 0;
+			ByteCount sz = 0;
+			ItemCount k = 0, idx = 0;
+			MediaSampleFlags fl = 0;
+
+			if (GetMediaSample2(media, NULL, 0, &sz, t, &st, &du, &of, NULL, &idx, 1, &k, &fl) || !k)
+				break;
+			sorted[nTimes++] = st + of;
+			t = st + du;
+		}
+		for (i = 1; i < nTimes; i++) {
+			TimeValue64 v = sorted[i];
+
+			for (j = i; j > 0 && sorted[j - 1] > v; j--)
+				sorted[j] = sorted[j - 1];
+			sorted[j] = v;
+		}
+	}
 	gT0 = now_ms();
 	while (decodeTime < mediaDuration) {
 		ByteCount got = 0;
@@ -317,18 +341,22 @@ int main(int argc, char **argv)
 			times[samples] = sampleTime + offset;
 		samples++;
 		decodeTime = sampleTime + duration;
-	}
-	/* The frames are queued for display at their times, not scheduled: ask for them in display order. */
-	for (i = 1; i < samples && i < 65536; i++) {
-		TimeValue64 t = times[i];
+		/* a picture can be shown once every picture that is displayed before it has been queued */
+		while (next < nTimes && !getenv("QTDECODE_NOFLAGS")) {
+			unsigned q;
+			int queued = 0;
 
-		for (j = i; j > 0 && times[j - 1] > t; j--)
-			times[j] = times[j - 1];
-		times[j] = t;
+			for (q = 0; q < samples; q++)
+				if (times[q] == sorted[next])
+					queued = 1;
+			if (!queued)
+				break;
+			ICMDecompressionSessionSetNonScheduledDisplayTime(session, sorted[next], scale, 0);
+			next++;
+		}
 	}
-	if (!getenv("QTDECODE_NOFLAGS"))
-		for (i = 0; i < samples && i < 65536; i++)
-			ICMDecompressionSessionSetNonScheduledDisplayTime(session, times[i], scale, 0);
+	for (; next < nTimes && !getenv("QTDECODE_NOFLAGS"); next++)
+		ICMDecompressionSessionSetNonScheduledDisplayTime(session, sorted[next], scale, 0);
 	ICMDecompressionSessionFlush(session);
 	printf("%u samples fed, %u pictures out, %u wrong, %u errors, %.1f ms (%.2f ms a sample)\n", samples, gFrames,
 	       gBad, gErrors, now_ms() - gT0, samples ? (now_ms() - gT0) / samples : 0.0);
