@@ -12,6 +12,7 @@
 #include "RadeonNI.h"
 #include "RadeonNIAccel.h"
 #include "RadeonNISurface.h"
+#include "rdn_uvd_reg.h"
 
 OSDefineMetaClassAndStructors(RadeonNIAGPShim, IOAGPDevice)
 
