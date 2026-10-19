@@ -66,6 +66,10 @@ if os.environ.get("RDN_ACCEL") == "1":
         blob = open(os.path.join(root, "firmware", name), "rb").read()
         extra += "\t\t\t<key>%s</key>\n\t\t\t<data>%s</data>\n" % (
             key, base64.b64encode(blob).decode())
+    if os.environ.get("RDN_UVD") == "1":
+        # The UVD firmware (docs/UVD.md): the block is only touched when a program asks (rdnuvd init).
+        blob = open(os.path.join(root, "firmware", "SUMO_uvd.bin"), "rb").read()
+        extra += "\t\t\t<key>FW_UVD</key>\n\t\t\t<data>%s</data>\n" % base64.b64encode(blob).decode()
     if os.environ.get("RDN_ACCELCAPS"):
         extra += "\t\t\t<key>AccelCaps</key>\n\t\t\t<integer>%d</integer>\n" % int(
             os.environ["RDN_ACCELCAPS"], 0)
