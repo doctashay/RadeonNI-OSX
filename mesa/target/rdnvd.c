@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
@@ -454,6 +455,14 @@ RDNVD_PUBLIC void rdnvd_h264_close(struct rdnvd_session *s)
 	free(s);
 }
 
+static double now_ms(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
 RDNVD_PUBLIC int rdnvd_frame_read(struct rdnvd_frame *frame, uint8_t *y, size_t y_stride, uint8_t *uv,
 				  size_t uv_stride)
 {
@@ -466,6 +475,13 @@ RDNVD_PUBLIC int rdnvd_frame_read(struct rdnvd_frame *frame, uint8_t *y, size_t 
 	unsigned row, x;
 	unsigned cw = (frame->width + 1) / 2, ch = (frame->height + 1) / 2;
 
+	static int profile = -1;
+	double t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
+
+	if (profile < 0)
+		profile = getenv("RDNVD_PROFILE") != NULL;
+	if (profile)
+		t0 = now_ms();
 	f->buf->get_resources(f->buf, res);
 	if (!res[0] || !res[1])
 		return RDNVD_FAILED;
@@ -474,14 +490,20 @@ RDNVD_PUBLIC int rdnvd_frame_read(struct rdnvd_frame *frame, uint8_t *y, size_t 
 	src = ctx->texture_map(ctx, res[0], 0, PIPE_MAP_READ, &box, &xfer);
 	if (!src)
 		return RDNVD_FAILED;
+	if (profile)
+		t1 = now_ms();
 	for (row = 0; row < frame->height; row++)
 		memcpy(y + row * y_stride, src + (size_t)row * xfer->stride, frame->width);
 	ctx->texture_unmap(ctx, xfer);
+	if (profile)
+		t2 = now_ms();
 
 	u_box_2d(frame->crop_left / 2, frame->crop_top / 2, cw, ch, &box);
 	src = ctx->texture_map(ctx, res[1], 0, PIPE_MAP_READ, &box, &xfer);
 	if (!src)
 		return RDNVD_FAILED;
+	if (profile)
+		t3 = now_ms();
 	for (row = 0; row < ch; row++) {
 		const uint8_t *in = src + (size_t)row * xfer->stride;
 		uint8_t *out = uv + row * uv_stride;
@@ -500,6 +522,11 @@ RDNVD_PUBLIC int rdnvd_frame_read(struct rdnvd_frame *frame, uint8_t *y, size_t 
 #endif
 	}
 	ctx->texture_unmap(ctx, xfer);
+	if (profile) {
+		t4 = now_ms();
+		fprintf(stderr, "rdnvd read: luma map %.2f ms, copy %.2f ms, chroma map %.2f ms, copy %.2f ms\n",
+			t1 - t0, t2 - t1, t3 - t2, t4 - t3);
+	}
 	return 0;
 }
 
