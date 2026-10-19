@@ -52,6 +52,15 @@ static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 static struct rdnvd *gDevice;
 static int gDeviceTried;
 
+static int debug(void)
+{
+	static int on = -1;
+
+	if (on < 0)
+		on = getenv("RDNAVC_DEBUG") != NULL;
+	return on;
+}
+
 static void say(const char *format, ...)
 {
 	char line[256];
@@ -282,6 +291,13 @@ pascal ComponentResult RDNAVC_BeginBand(RDNAVCGlobals *storage, CodecDecompressP
 	/* already decoded: its display was cancelled and it is back */
 	rec->decoded = p->frameTime && (p->frameTime->flags & icmFrameAlreadyDecoded) != 0;
 	drp->frameType = frame_type((const UInt8 *)drp->codecData, rec->dataSize, storage->nalLengthSize);
+	if (debug())
+		say("BeginBand: frame %ld display %lld decode %lld flags 0x%lx type %d size %ld already-decoded %d",
+		    p->frameTime ? (long)p->frameTime->frameNumber : -1L,
+		    p->frameTime ? (long long)p->frameTime->value.lo : -1LL,
+		    p->frameTime ? (long long)p->frameTime->decodeTime : -1LL,
+		    p->frameTime ? (unsigned long)p->frameTime->flags : 0UL, (int)drp->frameType, rec->dataSize,
+		    (int)rec->decoded);
 	return noErr;
 }
 
@@ -296,6 +312,8 @@ pascal ComponentResult RDNAVC_DecodeBand(RDNAVCGlobals *storage, ImageSubCodecDe
 				 storage->nalLengthSize, &rec->frame);
 	pthread_mutex_unlock(&gLock);
 	rec->decoded = true;
+	if (debug())
+		say("DecodeBand: result %d, picture %p", r, (void *)rec->frame);
 	if (r) {
 		rec->failed = true;
 		say("decoding a sample failed (%d)", r);
@@ -309,6 +327,8 @@ pascal ComponentResult RDNAVC_DrawBand(RDNAVCGlobals *storage, ImageSubCodecDeco
 	RDNAVCDecompressRecord *rec = (RDNAVCDecompressRecord *)drp->userDecompressRecord;
 	ComponentResult err = noErr;
 
+	if (debug())
+		say("DrawBand: decoded %d picture %p", (int)rec->decoded, (void *)rec->frame);
 	if (!rec->decoded)
 		err = RDNAVC_DecodeBand(storage, drp, 0);
 	if (err)
@@ -342,6 +362,8 @@ pascal ComponentResult RDNAVC_EndBand(RDNAVCGlobals *storage, ImageSubCodecDecom
 {
 	RDNAVCDecompressRecord *rec = (RDNAVCDecompressRecord *)drp->userDecompressRecord;
 
+	if (debug())
+		say("EndBand: result %d picture %p", (int)result, (void *)rec->frame);
 	if (rec->frame) {
 		pthread_mutex_lock(&gLock);
 		rdnvd_frame_release(rec->frame);
