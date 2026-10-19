@@ -94,7 +94,10 @@ public:
 	IOReturn regRead(UInt32 offset, UInt32 *value);
 	/* UVD, only with the personality's FW_UVD (hw/rdn_user.h). */
 	IOReturn uvdInit(UInt32 flags, UInt32 *status);
-	IOReturn uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence);
+	/* `handles` and `count`: the client's sessions (stream handles of the messages it has sent, not yet destroyed). */
+	IOReturn uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UInt32 *handles, UInt32 *count);
+	/* End sessions a program made and left (it died, or ended without destroying them). */
+	void uvdDestroy(const UInt32 *handles, UInt32 count);
 	bool uvdFenceWait(UInt32 fence, UInt32 timeoutMs);
 	/* The clients that have decoded: the clocks stay up while there is one. */
 	void uvdUser(bool add);
@@ -153,6 +156,9 @@ private:
 	UInt32 fUvdFlags;
 	uint32_t fUvdRef;
 	bool fUvdDirty;
+	/* A page of video memory for messages of the kext's own. */
+	UInt32 fUvdScratch;
+	void uvdScan(UInt32 offset, UInt32 words, UInt32 *handles, UInt32 *count);
 	IOBufferMemoryDescriptor *fUvdGartMem;
 	UInt32 fUvdGartAt;
 	/* The power state the card was last put in (hw/rdn_pm.h). */
@@ -272,6 +278,10 @@ private:
 	UInt32 fCount;
 	/* Has submitted UVD work: counted in RadeonNIAccel::uvdUser(). */
 	bool fUvdUser;
+	/* The decoder's sessions this client has made and not destroyed (RadeonNIAccel::uvdScan). */
+	enum { kMaxUvdSessions = 32 };
+	UInt32 fUvdHandles[kMaxUvdSessions];
+	UInt32 fUvdHandleCount;
 
 	void freeAll(void);
 };

@@ -806,6 +806,8 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	fUvdFlags = flags;
 	fUvdRef = ref;
 	IOLockUnlock(fLock);
+	if (!fUvdScratch)
+		(void)allocVram(4096, 4096, &fUvdScratch, false);
 	IOLog("RadeonNI: UVD is up, UVD_STATUS 0x%08lx\n", (unsigned long)*status);
 	IOFree(fw, fwSize);
 	return kIOReturnSuccess;
@@ -841,7 +843,120 @@ void RadeonNIAccel::uvdRestart(void)
 	IOLog("RadeonNI: UVD restarted: no program is decoding\n");
 }
 
-IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence)
+/*
+ * What the messages in a program's command stream do to its sessions. The stream is register writes: the message's
+ * address goes to GPCOM_VCPU_DATA0 and DATA1, and a write of 0 to GPCOM_VCPU_CMD says "the message is there". Its
+ * first words, little-endian, are its size, its type (0 create, 2 destroy) and the stream handle. Called with fLock held.
+ */
+void RadeonNIAccel::uvdScan(UInt32 offset, UInt32 words, UInt32 *handles, UInt32 *count)
+{
+	volatile UInt32 *w = (volatile UInt32 *)((UInt8 *)fAccel.aperture + offset);
+	UInt32 i = 0, data0 = 0, data1 = 0;
+
+	while (i < words) {
+		UInt32 pkt = w[i], type = pkt >> 30, n, reg, j;
+
+		if (type == 2) {
+			i++;
+			continue;
+		}
+		if (type != 0)
+			return;
+		n = ((pkt >> 16) & 0x3fff) + 1;
+		reg = (pkt & 0xffff) << 2;
+		if (i + 1 + n > words)
+			return;
+		for (j = 0; j < n; j++, reg += 4) {
+			UInt32 value = w[i + 1 + j];
+
+			if (reg == UVD_GPCOM_VCPU_DATA0) {
+				data0 = value;
+			} else if (reg == UVD_GPCOM_VCPU_DATA1) {
+				data1 = value;
+			} else if (reg == UVD_GPCOM_VCPU_CMD && (value >> 1) == 0) {
+				uint64_t addr = ((uint64_t)data1 << 32) | data0;
+				uint64_t at = addr - fAccel.vram_base;
+				volatile UInt8 *m;
+				UInt32 type_, handle, k;
+
+				if (addr < fAccel.vram_base || at + 12 > fAccel.aperture_size)
+					continue;
+				m = (volatile UInt8 *)fAccel.aperture + at;
+				type_ = m[4] | m[5] << 8 | m[6] << 16 | (UInt32)m[7] << 24;
+				handle = m[8] | m[9] << 8 | m[10] << 16 | (UInt32)m[11] << 24;
+				if (type_ == 0) {
+					for (k = 0; k < *count; k++)
+						if (handles[k] == handle)
+							break;
+					if (k == *count && *count < 32)
+						handles[(*count)++] = handle;
+				} else if (type_ == 2) {
+					for (k = 0; k < *count; k++)
+						if (handles[k] == handle) {
+							handles[k] = handles[--(*count)];
+							break;
+						}
+				}
+			}
+		}
+		i += 1 + n;
+	}
+}
+
+/*
+ * Linux's radeon_uvd_get_destroy_msg(): a message of 0xde4 bytes whose type is 2 and whose third word is the handle,
+ * in a stream that only names it.
+ */
+void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count)
+{
+	UInt32 i;
+
+	IOLockLock(fLock);
+	if (!fUvdUp || !fUvdScratch || (fUvdFlags & RDN_UVD_F_GART)) {
+		IOLockUnlock(fLock);
+		return;
+	}
+	if (!fUvdClocksUp && count) {
+		fUvdClocksUp = rdn_uvd_wake(&fUvd) == 0;
+	}
+	for (i = 0; i < count; i++) {
+		volatile UInt8 *m = (volatile UInt8 *)fAccel.aperture + fUvdScratch;
+		volatile UInt32 *ib = (volatile UInt32 *)((UInt8 *)fAccel.aperture + fUvdScratch + 1024);
+		uint64_t addr = rdn_vram_addr(&fAccel, fUvdScratch);
+		UInt32 j, seq = 0, handle = handles[i];
+
+		for (j = 0; j < 64; j++)
+			m[j] = 0;
+		m[0] = 0xe4;
+		m[1] = 0x0d;
+		m[4] = 2;
+		m[8] = handle;
+		m[9] = handle >> 8;
+		m[10] = handle >> 16;
+		m[11] = handle >> 24;
+		ib[0] = RDN_UVD_PACKET0(UVD_GPCOM_VCPU_DATA0, 0);
+		ib[1] = (UInt32)addr;
+		ib[2] = RDN_UVD_PACKET0(UVD_GPCOM_VCPU_DATA1, 0);
+		ib[3] = (UInt32)(addr >> 32);
+		ib[4] = RDN_UVD_PACKET0(UVD_GPCOM_VCPU_CMD, 0);
+		ib[5] = 0;
+		for (j = 6; j < 16; j++)
+			ib[j] = RDN_UVD_PACKET0(UVD_NO_OP, 0);
+		if (rdn_uvd_ib_submit(&fUvd, rdn_vram_addr(&fAccel, fUvdScratch + 1024), 16, &seq)) {
+			IOLog("RadeonNI: UVD: could not end a program's session\n");
+			break;
+		}
+		fUvdLastSeq = seq;
+		fUvdDirty = true;
+		(void)rdn_uvd_fence_wait(&fUvd, seq, 100);
+	}
+	if (count)
+		IOLog("RadeonNI: UVD: ended %lu session(s) a program left\n", (unsigned long)count);
+	IOLockUnlock(fLock);
+}
+
+IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UInt32 *handles,
+				  UInt32 *count)
 {
 	uint32_t seq = 0;
 	int r = 0;
@@ -865,6 +980,7 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence)
 	if (!r) {
 		fUvdLastSeq = seq;
 		fUvdDirty = true;
+		uvdScan(offset, words, handles, count);
 	}
 	IOLockUnlock(fLock);
 	if (r)
@@ -1546,6 +1662,7 @@ bool RadeonNIUserClient::initWithTask(task_t owningTask, void *securityID,
 	fOffsets = (UInt32 *)IOMalloc(kMaxAllocations * sizeof(UInt32));
 	fCount = 0;
 	fUvdUser = false;
+	fUvdHandleCount = 0;
 	return fOffsets != 0;
 }
 
@@ -1565,6 +1682,11 @@ void RadeonNIUserClient::freeAll(void)
 		return;
 	/* Whatever the client still has queued must be done with the memory. */
 	fAccel->syncForCPU();
+	/* sessions this client made and never ended: the firmware has ten, and they would stay until the block is restarted */
+	if (fUvdHandleCount) {
+		fAccel->uvdDestroy(fUvdHandles, fUvdHandleCount);
+		fUvdHandleCount = 0;
+	}
 	for (i = 0; i < fCount; i++)
 		fAccel->freeVram(fOffsets[i]);
 	fCount = 0;
@@ -1798,7 +1920,7 @@ IOReturn RadeonNIUserClient::methodUvdInit(UInt32 flags, UInt32 *status)
 IOReturn RadeonNIUserClient::methodUvdSubmit(UInt32 offset, UInt32 words,
 					     UInt32 *fence)
 {
-	IOReturn ret = fAccel->uvdSubmit(offset, words, fence);
+	IOReturn ret = fAccel->uvdSubmit(offset, words, fence, fUvdHandles, &fUvdHandleCount);
 
 	if (ret == kIOReturnSuccess && !fUvdUser) {
 		fUvdUser = true;
