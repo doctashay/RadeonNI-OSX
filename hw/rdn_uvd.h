@@ -46,6 +46,7 @@
 #define RDN_UVD_F_PM_GLOBAL	(1 << 7)	/* GENERAL_PWRMGT |= GLOBAL_PWRMGT_EN | STATIC_PM_EN, as in Linux's trace; restored on failure */
 #define RDN_UVD_F_PM_SCLK	(1 << 8)	/* SCLK_PWRMGT_CNTL |= DYN_GFX_CLK_OFF_EN | DYN_LIGHT_SLEEP_EN, as in Linux's trace; restored on failure */
 #define RDN_UVD_F_MINIMAL	(1 << 10)	/* only the register writes a bisection of radeon showed necessary; the caller moves VRAM to MC address 0 and starts the RLC first */
+#define RDN_UVD_F_LMI		(1 << 11)	/* with MINIMAL: also the LMI control, swap and MPC mux registers */
 #define RDN_UVD_F_GART		(1 << 9)	/* (kext) the VCPU region and ring in GART memory: addresses with bits 32-39 zero */
 
 struct rdn_uvd {

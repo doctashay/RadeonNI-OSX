@@ -429,6 +429,18 @@ static int vcpu_start(struct rdn_uvd *uvd)
 		/* the RLC (evergreen_rlc_start() writes RLC_ENABLE) after the memory window, and time to come up */
 		wr(card, 0x3f00, 1);
 		mdelay(card, 300);
+		if (uvd->flags & RDN_UVD_F_LMI) {
+			/* uvd_v1_0_start(): initialize the UVD memory controller and the MPC muxes */
+			wr(card, UVD_LMI_CTRL, 0x40 | (1 << 8) | (1 << 13) | (1 << 21) | (1 << 9) | (1 << 20));
+			wr(card, UVD_LMI_SWAP_CNTL, uvd->swapped ? 0xa : 0);
+			wr(card, UVD_MP_SWAP_CNTL, 0);
+			wr(card, UVD_MPC_SET_MUXA0, 0x40c2040);
+			wr(card, UVD_MPC_SET_MUXA1, 0x0);
+			wr(card, UVD_MPC_SET_MUXB0, 0x40c2040);
+			wr(card, UVD_MPC_SET_MUXB1, 0x0);
+			wr(card, UVD_MPC_SET_ALU, 0);
+			wr(card, UVD_MPC_SET_MUX, 0x88);
+		}
 		/* clock gating off, VCPU clock on, VCPU out of reset */
 		wr(card, UVD_CGC_GATE, 0);
 		wr(card, UVD_VCPU_CNTL, 1 << 9);
