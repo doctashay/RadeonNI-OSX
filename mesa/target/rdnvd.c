@@ -82,6 +82,8 @@ struct rdnvd_session {
 	int replay_valid;			/* 0 once too much came without an IDR picture: nothing to start over from */
 	int stalled;				/* the firmware did not answer the decode that was just run */
 	unsigned failed_recoveries;		/* starting over in a row that did not bring the decoder back */
+	uint64_t dead_until;			/* ms: the decoder is given up until then (data fails at once) */
+	unsigned backoff_ms;
 };
 
 /* ---- surfaces ---------------------------------------------------------------- */
@@ -709,6 +711,14 @@ static void replay_add(struct rdnvd_session *s, const uint8_t *data, size_t size
 	s->replay_bytes += size;
 }
 
+static uint64_t wall_ms(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
 /* One access unit through the H.264 layer; the picture it makes (if any) is left in s->captured. */
 static int decode_unit(struct rdnvd_session *s, const uint8_t *data, size_t size, unsigned nal_length_size)
 {
@@ -778,24 +788,48 @@ RDNVD_PUBLIC int rdnvd_h264_decode_au(struct rdnvd_session *s, const uint8_t *da
 	unsigned attempt;
 
 	replay_add(s, data, size, nal_length_size);
-	r = decode_unit(s, data, size, nal_length_size);
-	/*
-	 * A stalled firmware is started again and shown the stream again, a few times at most. When that has not helped
-	 * three times in a row it is not tried again (each start takes a second): the data is decoded once, and anything
-	 * that works brings the tries back.
-	 */
-	for (attempt = 0; s->stalled; attempt++) {
-		if (attempt == 3 || s->failed_recoveries >= 3) {
-			s->stalled = 0;
-			r = RDNVD_FAILED;
-			break;
+	if (s->dead_until) {
+		/*
+		 * The tries failed: data fails at once (a program must not wait a quarter of a second on every picture), and from
+		 * time to time the firmware is started again and shown the stream since the last IDR picture, to see whether it
+		 * answers now. The waits between the tries double, 2 s to 30 s.
+		 */
+		if (wall_ms() < s->dead_until) {
+			s->captured = NULL;
+			*frame = NULL;
+			return RDNVD_FAILED;
 		}
 		r = recover(s);
-		if (s->stalled || r)
-			s->failed_recoveries++;
+		if (s->stalled || r) {
+			s->stalled = 0;
+			r = r ? r : RDNVD_FAILED;
+			s->backoff_ms = s->backoff_ms < 15000 ? s->backoff_ms * 2 : 30000;
+			s->dead_until = wall_ms() + s->backoff_ms;
+		} else {
+			s->dead_until = 0;
+			s->failed_recoveries = 0;
+		}
+	} else {
+		r = decode_unit(s, data, size, nal_length_size);
+		/* A stalled firmware is started again and shown the stream again, a few times at most. */
+		for (attempt = 0; s->stalled; attempt++) {
+			if (attempt == 3 || s->failed_recoveries >= 3) {
+				s->stalled = 0;
+				r = RDNVD_FAILED;
+				break;
+			}
+			r = recover(s);
+			if (s->stalled || r)
+				s->failed_recoveries++;
+		}
+		if (!r) {
+			s->failed_recoveries = 0;
+		} else if (s->failed_recoveries >= 3) {
+			/* three tries in a row did not bring it back: give it up for a while */
+			s->backoff_ms = 2000;
+			s->dead_until = wall_ms() + s->backoff_ms;
+		}
 	}
-	if (!r)
-		s->failed_recoveries = 0;
 	/* The picture of this data (not of display order): the first one decoded. */
 	*frame = s->captured ? &s->captured->frame : NULL;
 	if (s->captured) {
