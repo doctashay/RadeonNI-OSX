@@ -323,6 +323,16 @@ pascal ComponentResult RDNAVC_BeginBand(RDNAVCGlobals *storage, CodecDecompressP
 	/* already decoded: its display was cancelled and it is back */
 	rec->decoded = p->frameTime && (p->frameTime->flags & icmFrameAlreadyDecoded) != 0;
 	drp->frameType = frame_type((const UInt8 *)drp->codecData, rec->dataSize, storage->nalLengthSize);
+	if (getenv("RDNAVC_FRAMETYPE")) {
+		int v = atoi(getenv("RDNAVC_FRAMETYPE"));
+
+		if (v == 1 && drp->frameType == kCodecFrameTypeDroppableDifference)
+			drp->frameType = kCodecFrameTypeDifference;
+		else if (v == 2)
+			drp->frameType = kCodecFrameTypeKey;
+		else if (v == 3)
+			drp->frameType = kCodecFrameTypeUnknown;
+	}
 	if (debug())
 		say("BeginBand: frame %ld display %lld decode %lld flags 0x%lx type %d size %ld already-decoded %d",
 		    p->frameTime ? (long)p->frameTime->frameNumber : -1L,
