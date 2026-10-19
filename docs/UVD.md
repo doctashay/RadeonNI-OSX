@@ -1,9 +1,32 @@
-# UVD (hardware video decode): feasibility, paper check
+# UVD (hardware video decode): status, architecture, how it was brought up
 
-Read this before starting any work on video decode acceleration on the 7570. Status: **nothing
-implemented and nothing run on the card**; every statement below is read from the sources named,
-marked `[V]` verified in the file given, `[I]` inference. See also `docs/LEOPARD-VIDEO-DECODE.md`
-(what Leopard itself offers, if that file exists).
+Read this before any work on video decode on the 7570. Status (2026-10-18 night): **the UVD block boots from our
+code and runs rings, indirect buffers and fences** on the x86 server (`rdn_tool uvdonly`) and through the kext in
+the Tiger guest under QEMU with the real card (big-endian PowerPC host). Not yet run on the G5. No decoding yet:
+the message/decoder layer, the PowerVLC module and the QuickTime component are still to do. Older sections
+below are the paper check and the failed first attempts, kept for the record; the journal
+(`docs/JOURNAL.md`, 2026-10-18) has the whole story. See also `docs/LEOPARD-VIDEO-DECODE.md`.
+
+## What it takes (found by bisecting radeon's own register stream on a card we POSTed)
+
+1. **Video memory below 4 GB**: `rdn_mc_relocate(card, 0)` (`hw/rdn_mc.c`; radeon's `evergreen_mc_stop`,
+   `evergreen_mc_program`, `evergreen_mc_resume`) moves it from the BIOS's 0xF00000000 to 0. With it left where
+   POST puts it the VCPU does not answer, with or without the address-extension registers. The kext does it
+   when its personality has `RelocateVRAM` (`RDN_RELOC=1` in `scripts/kext.sh`); everything that needs the
+   base reads `MC_VM_FB_LOCATION`. Before the mode set; the display controllers stay off afterwards.
+2. The firmware in video memory (any 4 KB-aligned place below 256 MB), the first memory window only
+   (`UVD_VCPU_CACHE_OFFSET0`/`SIZE0`) and `UVD_VCPU_CHIP_ID`.
+3. `RLC_CNTL` = 1 (RLC enable) AFTER the window, and a few hundred ms before the VCPU is released. The RLC
+   microcode upload is not needed.
+4. `UVD_CGC_GATE` = 0, `UVD_VCPU_CNTL` = 0x200, `UVD_SOFT_RESET` = 0. No PLL, no LMI control (optional,
+   `RDN_UVD_F_LMI`), no interrupt handler, no GART, no MC microcode, no GFX init.
+5. Ring: submissions padded to 16 dwords with `UVD_NO_OP` (the controller fetches in 16-dword blocks); the
+   fence of the evergreen hardware is `uvd_v2_2_fence_emit` (`UVD_CONTEXT_ID` = sequence number, the VCPU stores
+   it at the DATA0/DATA1 address on command 0, command 2 traps).
+In code: `RDN_UVD_F_MINIMAL` (and `RDN_UVD_F_LMI`) in `hw/rdn_uvd.c`; `rdnuvd init 3072` in the guest.
+`UVD_STATUS` bit 1 alone is not proof (it also appears when the firmware does not run); the firmware modifies its own
+window (40 bytes at image offset 320 become 7e706b85 611a2c7d 3062109e 30260b85 00031e40, as under radeon) and the ring test
+is the real check.
 
 ## Why
 

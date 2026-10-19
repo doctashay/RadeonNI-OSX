@@ -7150,3 +7150,16 @@ relocate VRAM like radeon's evergreen_mc_program (touches the framebuffer driver
 the accelerator's), or put the UVD window and ring in GART memory (addresses below 4 GB, no relocation; needs
 DMA memory and the GART; untestable with `rdn_tool` on this server because the host IOMMU translates the card's DMA,
 so it is for the Tiger guest under QEMU/VFIO).
+
+2026-10-18 late night: UVD through the KEXT in the Tiger guest (QEMU, real 7570 passed through, big-endian host).
+QEMU had to be rebuilt first (the host's libnfs/libibverbs were upgraded; `ninja` reconfigure, same 11.1.1 + patches).
+No monitor on the server's card, so the kext got a test aid, personality key `FakeEDID` (`RDN_FAKE_EDID=1`): used only
+when no display answers. New: `rdn_mc_relocate` (above), key `RelocateVRAM` (`RDN_RELOC=1`), `RDN_UVD=1` puts
+`SUMO_uvd.bin` in the personality. Result with `RDN_ACCEL=1 RDN_UVD=1 RDN_FAKE_EDID=1 RDN_RELOC=1 scripts/kext.sh up`:
+"video memory moved from 0xf00000000 to 0x0", framebuffer at 1024x768, `rdnuvd init 3072`: UVD_STATUS 2, "uvd ring test
+succeeded", "uvd initialized", `rdnuvd test`: IB submitted through the user client, fence reached, UVD_CONTEXT_ID = the
+fence number. Option 2 (firmware window in GART memory, VRAM left at 0xF00000000, `rdnuvd init 3584`): VCPU does not
+answer; a Linux test with the window in GTT could not be made (radeon's allocation of the buffer in GTT fails at init).
+Left: the G5 (VRAM relocation under a scan-out that Open Firmware left running needs care: the kext's start-up on a
+posted card), the UVD message layer (create/decode/destroy session; `radeon_uvd.c` and Mesa's `radeon_uvd.c`), the
+winsys in Mesa, the PowerVLC `vlc_va` module and the QuickTime component.
