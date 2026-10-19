@@ -127,8 +127,9 @@ int main(int argc, char **argv)
 	ItemCount sdIndex, count;
 	unsigned char *buffer;
 	ByteCount maxSize = 4 << 20;
-	unsigned samples = 0;
+	unsigned samples = 0, i, j;
 	CFStringRef path;
+	TimeValue64 *times = calloc(65536, sizeof(*times));
 
 	for (a = 1; a < argc; a++) {
 		if (!strcmp(argv[a], "-c") && a + 1 < argc)
@@ -269,9 +270,22 @@ int main(int argc, char **argv)
 			fprintf(stderr, "decode frame %u: %ld\n", samples, (long)err);
 			gErrors++;
 		}
+		if (samples < 65536)
+			times[samples] = sampleTime + offset;
 		samples++;
 		decodeTime = sampleTime + duration;
 	}
+	/* The frames are queued for display at their times, not scheduled: ask for them in display order. */
+	for (i = 1; i < samples && i < 65536; i++) {
+		TimeValue64 t = times[i];
+
+		for (j = i; j > 0 && times[j - 1] > t; j--)
+			times[j] = times[j - 1];
+		times[j] = t;
+	}
+	if (!getenv("QTDECODE_NOFLAGS"))
+		for (i = 0; i < samples && i < 65536; i++)
+			ICMDecompressionSessionSetNonScheduledDisplayTime(session, times[i], scale, 0);
 	ICMDecompressionSessionFlush(session);
 	printf("%u samples fed, %u pictures out, %u wrong, %u errors, %.1f ms (%.2f ms a sample)\n", samples, gFrames,
 	       gBad, gErrors, now_ms() - gT0, samples ? (now_ms() - gT0) / samples : 0.0);
