@@ -340,6 +340,17 @@ bool RadeonNI::bringUp()
 	      (unsigned long)readReg(0x5428));
 
 	/*
+	 * Video memory to address 0 like radeon does (personality key RelocateVRAM, scripts/kext.sh RDN_RELOC=1): the
+	 * UVD block's firmware window only works below 4 GB. Before the mode set; the display stays off until then. Before the memory
+	 * controller's microcode, as in radeon's evergreen_startup() (mc_program, then ni_mc_load_microcode).
+	 */
+	if (getProperty("RelocateVRAM") == kOSBooleanTrue) {
+		int mr = rdn_mc_relocate(&fCard, 0);
+
+		IOLog("RadeonNI: video memory moved to 0: %d (0 moved, 1 there already)\n", mr);
+	}
+
+	/*
 	 * Load the memory controller's microcode, as Linux does on this
 	 * card, before anything is kept in video memory: the memory clock
 	 * can only be raised with it. It is in the personality when the
@@ -360,16 +371,6 @@ bool RadeonNI::bringUp()
 			      (unsigned long)readReg(0x28c8),
 			      (unsigned long)readReg(0x5428));
 		}
-	}
-
-	/*
-	 * Video memory to address 0 like radeon does (personality key RelocateVRAM, scripts/kext.sh RDN_RELOC=1): the
-	 * UVD block's firmware window only works below 4 GB. Before the mode set; the display stays off until then.
-	 */
-	if (getProperty("RelocateVRAM") == kOSBooleanTrue) {
-		int mr = rdn_mc_relocate(&fCard, 0);
-
-		IOLog("RadeonNI: video memory moved to 0: %d (0 moved, 1 there already)\n", mr);
 	}
 
 	/* The first connector with a display on it: DVI-I, then DisplayPort. */
