@@ -726,6 +726,18 @@ static int recover(struct rdnvd_session *s)
 	codec_close(s);
 	if (!rdn_target_uvd_reset(&epoch))
 		return RDNVD_FAILED;
+	/*
+	 * The restarted firmware ignores the messages that come right away (the card on the G5 answered the fifth decode
+	 * after a start, none before): give it time, more each time it did not help. RDNVD_SETTLE_MS is the first wait.
+	 */
+	{
+		const char *e = getenv("RDNVD_SETTLE_MS");
+		unsigned ms = e ? (unsigned)atoi(e) : 250;
+
+		ms <<= s->failed_recoveries < 3 ? s->failed_recoveries : 3;
+		if (ms)
+			usleep(ms * 1000);
+	}
 	s->parser = rdnvd_h264_parser_new(&session_callbacks, s);
 	if (!s->parser)
 		return RDNVD_NO_MEMORY;
