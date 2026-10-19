@@ -262,6 +262,8 @@ int main(int argc, char **argv)
 		ft.flags = icmFrameTimeIsNonScheduledDisplayTime | icmFrameTimeHasDecodeTime;
 		if (getenv("QTDECODE_NOFLAGS"))
 			ft.flags = 0;
+		if (getenv("QTDECODE_NSONLY"))
+			ft.flags = icmFrameTimeIsNonScheduledDisplayTime;
 		err = ICMDecompressionSessionDecodeFrame(session, buffer, got, NULL, &ft, NULL);
 		if (err) {
 			fprintf(stderr, "decode frame %u: %ld\n", samples, (long)err);
