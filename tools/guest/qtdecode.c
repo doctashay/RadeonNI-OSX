@@ -4,7 +4,9 @@
  * buffers and compare every picture, in display order, with ffmpeg's decode of the same stream (yuv420p).
  * Nothing is shown on the screen.
  *
- *   qtdecode movie.mp4 reference.yuv|- [-c RadeonNIAVC.component] [-a]      (- : no reference, only count and time)
+ *   qtdecode movie.mp4 reference.yuv|- [-c RadeonNIAVC.component] [-a] [-t]  (- : no reference, only count and time;
+ *   -t: the frames are scheduled against a time base that runs in real time, as when a movie plays: pictures come late
+ *   or not at all, each is checked by its own display time)
  *
  * -c  registers that component for this program only (nothing is installed) and makes the session use it;
  * -a  makes it use Apple's own H.264 decoder (a control: the program's own checks must pass with it too);
@@ -31,7 +33,9 @@ static const unsigned char *gRef;
 static size_t gRefSize;
 static unsigned gFrames, gBad, gWidth, gHeight;
 static unsigned gErrors;
-static int gNoRef;
+static int gNoRef, gSched;
+static TimeValue64 *gSorted;
+static unsigned gNSorted;
 static double gT0;
 
 static double now_ms(void)
@@ -59,21 +63,41 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 	}
 	if ((flags & kICMDecompressionTracking_EmittingFrame) && pb) {
 		unsigned w = gWidth, h = gHeight, x, row;
+		unsigned index = gFrames;
 		size_t frame_bytes = (size_t)w * h * 3 / 2;
 		const unsigned char *ry, *ru, *rv;
 		unsigned long bad = 0, bad_y = 0, bad_c = 0, bad_r = 0;
 		OSType fmt = CVPixelBufferGetPixelFormatType(pb);
 
+		if (gSched) {
+			/* scheduled playback: pictures may be late or dropped, so the picture's own time says which one it is */
+			unsigned lo = 0, hi = gNSorted;
+
+			while (lo < hi) {
+				unsigned mid = (lo + hi) / 2;
+
+				if (gSorted[mid] < displayTime)
+					lo = mid + 1;
+				else
+					hi = mid;
+			}
+			if (lo >= gNSorted || gSorted[lo] != displayTime) {
+				gBad++;
+				gFrames++;
+				return;
+			}
+			index = lo;
+		}
 		if (gNoRef) {
 			gFrames++;
 			return;
 		}
-		if ((size_t)(gFrames + 1) * frame_bytes > gRefSize) {
+		if ((size_t)(index + 1) * frame_bytes > gRefSize) {
 			gFrames++;
 			gBad++;
 			return;
 		}
-		ry = gRef + (size_t)gFrames * frame_bytes;
+		ry = gRef + (size_t)index * frame_bytes;
 		ru = ry + (size_t)w * h;
 		rv = ru + (size_t)w * h / 4;
 		if (getenv("QTDECODE_NOATTRS") && gFrames == 0)
@@ -126,7 +150,7 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 		if (bad) {
 			if (gBad < 8)
 				printf("picture %u (display time %lld): luma pairs %lu, chroma pairs %lu, chroma rows unlike %lu "
-				       "(of %u pairs)\n", gFrames, (long long)displayTime, bad_y, bad_c, bad_r, w / 2 * h);
+				       "(of %u pairs)\n", index, (long long)displayTime, bad_y, bad_c, bad_r, w / 2 * h);
 			gBad++;
 		}
 		gFrames++;
@@ -160,12 +184,15 @@ int main(int argc, char **argv)
 	CFStringRef path;
 	TimeValue64 *times = calloc(65536, sizeof(*times)), *sorted = calloc(65536, sizeof(*sorted));
 	unsigned nTimes = 0, next = 0;
+	TimeBase timebase = NULL;
 
 	for (a = 1; a < argc; a++) {
 		if (!strcmp(argv[a], "-c") && a + 1 < argc)
 			component_path = argv[++a];
 		else if (!strcmp(argv[a], "-a"))
 			force_apple = 1;
+		else if (!strcmp(argv[a], "-t"))
+			gSched = 1;
 		else if (!movie_path)
 			movie_path = argv[a];
 		else if (!ref_path)
@@ -308,6 +335,16 @@ int main(int argc, char **argv)
 				sorted[j] = sorted[j - 1];
 			sorted[j] = v;
 		}
+		gSorted = sorted;
+		gNSorted = nTimes;
+		if (gSched) {
+			/* the display times the callback reports are those given, 0.3 s later */
+			for (i = 0; i < nTimes; i++)
+				sorted[i] += scale * 3 / 10;
+			timebase = NewTimeBase();
+			SetTimeBaseRate(timebase, 0);
+			SetTimeBaseValue(timebase, 0, scale);
+		}
 	}
 	gT0 = now_ms();
 	while (decodeTime < mediaDuration) {
@@ -331,6 +368,13 @@ int main(int argc, char **argv)
 		ft.value.lo = (UInt32)(sampleTime + offset);
 		ft.decodeTime = sampleTime;
 		ft.flags = icmFrameTimeIsNonScheduledDisplayTime | icmFrameTimeHasDecodeTime;
+		if (gSched) {
+			ft.flags = icmFrameTimeHasDecodeTime;
+			ft.base = timebase;
+			/* shown 0.3 s after the time base starts, so that the first pictures are not late */
+			ft.value.lo = (UInt32)(sampleTime + offset + scale * 3 / 10);
+			ft.value.hi = 0;
+		}
 		if (getenv("QTDECODE_NOFLAGS"))
 			ft.flags = 0;
 		if (getenv("QTDECODE_NSONLY"))
@@ -364,12 +408,29 @@ int main(int argc, char **argv)
 			next++;
 		}
 	}
-	for (; next < nTimes && !getenv("QTDECODE_NOFLAGS"); next++)
-		ICMDecompressionSessionSetNonScheduledDisplayTime(session, sorted[next], scale, 0);
+	if (gSched) {
+		/* play: the time base runs for as long as the movie, and a second more */
+		TimeValue end = (TimeValue)(sorted[nTimes - 1] + scale), tbnow = 0;
+		double start;
+
+		SetTimeBaseRate(timebase, 0x00010000);
+		start = now_ms();
+		while (tbnow < end && now_ms() - start < 120000.0) {
+			tbnow = GetTimeBaseTime(timebase, scale, NULL);
+			usleep(2000);
+		}
+	} else {
+		for (; next < nTimes && !getenv("QTDECODE_NOFLAGS"); next++)
+			ICMDecompressionSessionSetNonScheduledDisplayTime(session, sorted[next], scale, 0);
+	}
 	ICMDecompressionSessionFlush(session);
+	if (gSched)
+		gErrors = 0;	/* the flush reports the pictures that were never shown as errors */
 	printf("%u samples fed, %u pictures out, %u wrong, %u errors, %.1f ms (%.2f ms a sample)\n", samples, gFrames,
 	       gBad, gErrors, now_ms() - gT0, samples ? (now_ms() - gT0) / samples : 0.0);
-	printf("%s\n", gBad || gErrors || gFrames != samples ? "FAIL" : "PASS: every picture identical to ffmpeg's");
+	if (gSched)
+		printf("%u of %u pictures were shown in time\n", gFrames, samples);
+	printf("%s\n", gBad || gErrors || (!gSched && gFrames != samples) ? "FAIL" : "PASS: every picture identical to ffmpeg's");
 	ICMDecompressionSessionRelease(session);
-	return gBad || gErrors || gFrames != samples;
+	return gBad || gErrors || (!gSched && gFrames != samples);
 }
