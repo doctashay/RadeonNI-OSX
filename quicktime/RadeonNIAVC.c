@@ -174,6 +174,9 @@ pascal ComponentResult RDNAVC_Initialize(RDNAVCGlobals *storage, ImageSubCodecDe
 {
 	cap->decompressRecordSize = sizeof(RDNAVCDecompressRecord);
 	cap->canAsync = true;
+	if (debug())
+		say("Initialize: record size %ld (needs more than %ld for the QuickTime 7 fields)", (long)cap->recordSize,
+		    (long)offsetof(ImageSubCodecDecompressCapabilities, baseCodecShouldCallDecodeBandForAllFrames));
 	if (cap->recordSize > (long)offsetof(ImageSubCodecDecompressCapabilities, baseCodecShouldCallDecodeBandForAllFrames)) {
 		/* always draws into the baseAddr and rowBytes DrawBand is given, every pixel of it */
 		cap->subCodecIsMultiBufferAware = true;
@@ -210,6 +213,8 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 	cap->wantedPixelSize = 0;		/* the pixel types below say it */
 	cap->extendWidth = 0;
 	cap->extendHeight = 0;
+	/* pictures are drawn in another order than they are decoded (B pictures) */
+	cap->flags2 |= codecSupportsOutOfOrderDisplayTimes;
 
 	if ((**desc).cType != 'avc1')
 		return codecUnimpErr;
