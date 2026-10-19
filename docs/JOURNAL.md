@@ -7226,3 +7226,17 @@ Not yet: the kext does not check the addresses the commands name (the 3D path do
 has been built but not tried on the G5; the x86 backend has no UVD ops; stage B (a VA-API driver or library to give ffmpeg's
 parsed headers to `pipe_h264_picture_desc`), the PowerVLC module and the QuickTime component.
 
+## 2026-10-19 (G5, evening): option B built: the rdnvd library decodes real H.264 streams bit-exactly
+
+The user chose a small library over Mesa's VA frontend (the VA path would need libva ported to Darwin and a display type for Mesa's frontend,
+and PowerVLC 2.1.0 has no VA-API hook that would use it). Built in `video/` and `mesa/target/` (see `docs/UVD.md`, "The rdnvd library"):
+the H.264 layer (`video/rdnvd_h264.c`, written from the spec: parameter sets, slice headers, POC 0/1/2, reference marking, DPB, output order) with
+a host dump tool; `rdnvd.c` (Mesa glue); `rdn_uvdtest` rewritten on top of the library. Host check: the output order of 13 x264 vectors (I/P/B pyramid,
+MBAFF, slices, weighted prediction, custom matrices, open GOP...) equals ffprobe's. G5: all 13 identical to ffmpeg's decode on the first run except the two
+with scaling matrices; those pass with the lists in raster order (bitstream order and transposed fail the asymmetric one). So the decoder, Mesa's
+message code, our winsys and the new DPB logic agree with ffmpeg on B pictures, MBAFF, multiple slices and weighted prediction without further changes.
+Speed (PLL on): 720p 12.8 ms a picture, 1080p 24 ms. Reading a 1080p picture out into the caller's memory took 55 ms through r600's texture transfer (the luma
+plane is a 8-bit render target in system memory: about 20 ms a megabyte) and now 10 ms with CP DMA copies (`r600_cp_dma_copy_buffer` into a GART staging
+buffer), which also keeps the chroma bytes in order. Left: the consumers (PowerVLC is not installed on the G5 now; the zips are in `media/`), pipelining
+decode and read-out (the card does both at once), PAFF, long-term references, kext checks of the command addresses.
+

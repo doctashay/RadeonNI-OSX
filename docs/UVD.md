@@ -1,13 +1,12 @@
 # UVD (hardware video decode): status, architecture, how it was brought up
 
-Read this before any work on video decode on the 7570. Status (2026-10-19): **the UVD block boots from our code
-and Mesa's own UVD code decodes H.264 on it, bit-exactly, on the real G5** (x86 server, Tiger guest and G5 all start it).
-Done: the kernel side (hw/rdn_uvd.c, the kext's user-client methods), the message layer (Mesa r600's `radeon_uvd.c` over our
-winsys, see "The message layer" below) and a test that decodes I/P pictures, Baseline to High, against ffmpeg. Still to do:
-the UVD clocks (the block runs on the bypass clock: 720p at 34 ms a picture), a VA-API-style entry to give parsed headers to
-`pipe_h264_picture_desc`, the PowerVLC module and the QuickTime component, address checks in the kext. Older sections below are
-the paper check and the failed first attempts, kept for the record; the journal (`docs/JOURNAL.md`, 2026-10-18 and 2026-10-19)
-has the whole story. See also `docs/LEOPARD-VIDEO-DECODE.md`.
+Read this before any work on video decode on the 7570. Status (2026-10-19): **the UVD block boots from our code,
+Mesa's own UVD code decodes H.264 on it, and the `rdnvd` library (parser, DPB, output order, decoder, picture
+read-out) decodes real streams bit-exactly on the real G5**: Baseline, Main and High, CAVLC and CABAC, I/P/B pictures
+(pyramid), MBAFF, several slices, weighted prediction, scaling matrices, open GOP, up to 1080p. Still to do: the
+PowerVLC module and the QuickTime component (the consumers of `rdnvd.h`), field pictures (PAFF), address checks in the
+kext. Older sections below are the paper check and the failed first attempts, kept for the record; the journal
+(`docs/JOURNAL.md`, 2026-10-18 and 2026-10-19) has the whole story. See also `docs/LEOPARD-VIDEO-DECODE.md`.
 
 ## What it takes (found by bisecting radeon's own register stream on a card we POSTed)
 
@@ -71,6 +70,36 @@ decoded closes) 720p High CABAC takes 9.2 ms a picture on the G5 (34 ms before).
 (`rdnuvd bw`; writes run at 600-750 MB/s), so a 720p picture would take 150 ms and 1080p 340 ms to read. A consumer must either keep the
 picture on the GPU (convert and show it with the 3D engine; zero copies) or have the GPU copy it into system memory (GART, `gart_alloc`) and read that.
 Mind the byte order of such a copy: the 3D engine's copy of an R8G8 plane swaps U and V on this big-endian host (see 4 above).
+
+## The rdnvd library (2026-10-19)
+
+Three layers, each testable without the next:
+
+1. `video/rdnvd_h264.[ch]`: H.264 without a card or Mesa (C99, C library only). SPS (VUI bitstream restriction, scaling lists with the
+   fall-back rules), PPS (including slice groups, to parse past them), slice headers (as far as dec_ref_pic_marking), picture order
+   count types 0, 1 and 2, reference marking (sliding window and MMCO 1-6), frame number gaps, the decoded picture buffer and the
+   order pictures leave it in (the VUI's num_reorder_frames; without it the spec's bumping, with Baseline and POC type 2 counted
+   as not reordering). Callbacks: `sequence`, `decode` (everything for one picture: parameters, resolved scaling lists, the
+   reference list with frame numbers or long-term indices and order counts, the slice NAL units), `output` (display order),
+   `release`. NAL units come as Annex B or length prefixed; `avcC` gives the parameter sets. Refused as UNSUPPORTED (so the caller
+   decodes in software): field pictures, data partitioning (Extended), anything but 4:2:0 at 8 bits. Host test:
+   `video/tests/h264dump.c` and `scripts/uvd-parse-check.py` (the order of picture types out of the DPB against `ffprobe`'s, for 13 vectors).
+2. `mesa/target/rdnvd.c` (+ `rdnvd.h`, plain C, only `rdnvd_*` exported): fills a `pipe_h264_picture_desc` from the layer's picture,
+   runs it through Mesa's r600 UVD code (`create_video_codec`, `begin_frame`, `decode_bitstream`, `end_frame`, fence), keeps a pool of
+   NV12 video buffers (a frame is held by the DPB while it is a reference or waits for output, and by the caller after `output`),
+   recreates the decoder when the sequence changes. `rdnvd_frame_read()` gives a picture's cropped NV12 in the caller's memory: the card's
+   CP DMA copies the two planes into system memory (GART) and the CPU reads them there. Scaling lists go to Mesa in raster order
+   (as VA-API gives them; found with a custom, non-symmetric matrix: the order of the bitstream and the transposed one both fail).
+3. Consumers (not written): a PowerVLC decoder module and a QuickTime `avc1` component call `rdnvd_open`, `rdnvd_h264_open` (with the `avcC`
+   for QuickTime), `rdnvd_h264_feed`, `rdnvd_frame_read`, `rdnvd_frame_release`.
+
+Test: `rdn_uvdtest stream.h264 reference.yuv` (`scripts/uvd-testvec.sh <dir> <name>` makes x264 streams and ffmpeg's decode: i, p, cabac,
+high, b, bcavlc, mbaff, slices, weightp, cqm, cqmjvt, opengop, noloop; any size). On the G5 (Leopard, PLL on): all 13 at 128x96 and 40 pictures
+identical to ffmpeg's, sample for sample; 1280x720 High CABAC with B pyramid and 4 references: 12.8 ms a picture, 1920x1080: 24 ms (42 a second);
+reading a picture out: 4.9 ms at 720p, 10 ms at 1080p. (The 3D engine's copy of the planes took 55 ms at 1080p: it writes an 8-bit texture into
+system memory at some 50 MB/s and turns the chroma bytes around; the DMA copy is raw bytes.) Not covered by any vector: long-term references and
+MMCO (implemented from the spec), frame number gaps, a change of resolution inside a stream, the length-prefixed and `avcC` input,
+field pictures (refused).
 
 ## Why
 

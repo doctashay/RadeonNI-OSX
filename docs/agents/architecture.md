@@ -48,6 +48,11 @@ Moved out of CLAUDE.md. Read before changing code in `hw/`, `kext/`, `gld/`,
   `rdn_device.h`, no DRM), `frontend/` (off-screen GL contexts, from Mesa's
   former OSMesa), `target/` (the device for Linux and the library that ties
   it together), `patches/` (the only changes to Mesa itself).
+- Video decode (UVD; `docs/UVD.md`): `hw/rdn_uvd.c` starts the block, the kext's user client has the `RDN_UC_UVD_*`
+  methods, Mesa's r600 UVD code runs over our winsys (UVD command streams in `mesa/winsys/rdn_winsys.c`,
+  patch 0014 for the message byte order), `video/rdnvd_h264.c` is the H.264 layer without any card or Mesa in it
+  (parameter sets, slice headers, POC, reference marking, DPB, output order) and `mesa/target/rdnvd.c` is the library
+  (`rdnvd.h`) that ties them together; `mesa/tests/rdn_uvdtest.c` is its test.
 - `kext/RadeonNI/RadeonNIAccel.cpp` is the accelerator service and its user
   client; `hw/rdn_user.h` is the interface user space sees.
   `mesa/target/rdn_device_darwin.c` is Mesa's side of it. `mesa/darwin8/`

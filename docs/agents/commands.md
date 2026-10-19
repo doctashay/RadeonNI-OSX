@@ -121,6 +121,12 @@ skill (`scripts/mac.sh`).
   (`RDN_MESA_OPT=s`: for size, into `build-darwin-Os`);
   `.../build-darwin/src/gallium/targets/rdn/rdn_gltest` is the test program
   to copy into the guest (`-s` draws on the screen).
+- Video decode (read `docs/UVD.md`): `scripts/build-mesa.sh darwin
+  src/gallium/targets/rdn/rdn_uvdtest src/gallium/targets/rdn/librdnvd.dylib` builds the test and the library;
+  `scripts/uvd-testvec.sh <dir> <name>` makes a vector (x264 stream and ffmpeg's decode); `rdn_uvdtest
+  stream.h264 reference.yuv` on the G5 compares every picture; `scripts/uvd-parse-check.py <h264dump> <dir>` checks
+  the H.264 layer's output order against ffmpeg on the host (`gcc -o h264dump video/tests/h264dump.c
+  video/rdnvd_h264.c`); `g5/install-kext-binary.sh` replaces only the kext binary on the G5, keeping the old one.
 - `scripts/guest-cycle.sh down`, then `sudo scripts/tiger.sh passthru
   0000:10:00.0` in the background, then `scripts/guest-cycle.sh ready`: a
   clean guest restart (a loaded framebuffer kext cannot be unloaded) with
