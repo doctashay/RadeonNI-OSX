@@ -64,6 +64,13 @@ for Baseline I (500 repeats), Baseline IPPP with 3 references, Main CABAC with 2
 720p takes 34 ms a picture: the UPLL is in reset and bypass after the minimal start (`CG_UPLL_FUNC_CNTL` = 0x305), so
 `RDN_UVD_F_PLL` brings the clocks up (Linux's 533/400 MHz) at the first command stream and keeps them while a decoding client is open.
 Kext hardening still open: the commands are not checked (addresses, 256 MB segment), as the 3D path's are not.
+With the PLL option (`RDN_UVD_F_PLL`, kext default; clocks up at the first command stream, down when the last client that
+decoded closes) 720p High CABAC takes 9.2 ms a picture on the G5 (34 ms before).
+
+**Getting pictures out**: the CPU reads video memory through the aperture at 1.2 MB/s (8-bit loads), 4.6 (32-bit) or 9.1 MB/s (64-bit)
+(`rdnuvd bw`; writes run at 600-750 MB/s), so a 720p picture would take 150 ms and 1080p 340 ms to read. A consumer must either keep the
+picture on the GPU (convert and show it with the 3D engine; zero copies) or have the GPU copy it into system memory (GART, `gart_alloc`) and read that.
+Mind the byte order of such a copy: the 3D engine's copy of an R8G8 plane swaps U and V on this big-endian host (see 4 above).
 
 ## Why
 

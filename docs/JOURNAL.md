@@ -7214,7 +7214,14 @@ Speed: 720p takes 34 ms a picture from `begin_frame` to the fence with the kext'
 block still runs on the bypass clock, because the minimal start never raises the UPLL (`CG_UPLL_FUNC_CNTL` = 0x305: reset +
 bypass; `CG_UPLL_FUNC_CNTL_2` selects source 1 for VCLK and DCLK). Next: `RDN_UVD_F_PLL` (kext default from this commit): the
 clocks (53300/40000, 10 kHz units, as Linux) go up at the first command stream and stay up while a client that has submitted
-one is open (`RadeonNIAccel::uvdUser`); not yet run.
+one is open (`RadeonNIAccel::uvdUser`). Run the same evening (new Leopard kext binary installed with `g5/install-kext-binary.sh`, the old one is
+`Contents/RadeonNI.before-pll-202610182127`, G5 restarted with the user's yes): clocks "up" at the decoder's creation (150 ms), "down" when the
+program exits; 720p High CABAC, 4 references: **9.2 ms a picture (109 a second), still identical to ffmpeg's** (was 34 ms); the tiny pictures
+1.3 ms. 1080p would be about 21 ms.
+**The CPU cannot read the pictures out of video memory** (`rdnuvd bw`, G5): reads through the aperture run at 1.2 MB/s with 8-bit loads, 4.6
+with 32-bit, 9.1 with 64-bit ones (writes 600-750 MB/s). A 720p NV12 picture (1.4 MB) would take 150 ms at best, 1080p 340 ms: the test's
+comparison of 30 pictures took 36 s. So decoded pictures have to stay on the GPU (colour conversion and display by the 3D engine) or be copied by
+the GPU into system memory (the GART: `gart_alloc`) and read from there.
 Not yet: the kext does not check the addresses the commands name (the 3D path does not either); the GL bundle with the changed winsys
 has been built but not tried on the G5; the x86 backend has no UVD ops; stage B (a VA-API driver or library to give ffmpeg's
 parsed headers to `pipe_h264_picture_desc`), the PowerVLC module and the QuickTime component.
