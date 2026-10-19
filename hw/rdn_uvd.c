@@ -324,6 +324,9 @@ static void ring_commit(struct rdn_uvd *uvd)
 {
 	struct rdn_card *card = uvd->accel->card;
 
+	/* radeon pads a submission to 16 dwords with no-ops (ring->align_mask); the controller fetches in such blocks */
+	while (uvd->wptr & 15)
+		ring_put(uvd, RDN_UVD_PACKET0(UVD_NO_OP, 0));
 	rdn_hdp_flush(uvd->accel);
 	wr(card, UVD_RBC_RB_WPTR, uvd->wptr);
 	(void)rd(card, UVD_RBC_RB_WPTR);
