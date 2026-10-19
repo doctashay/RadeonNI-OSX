@@ -922,8 +922,10 @@ static int do_uvdonly(struct linux_card *lc, struct rdn_card *card, uint32_t fla
 		printf("uvdonly: applied %u writes of %s\n", apply_file(card, getenv("RDN_APPLY")), getenv("RDN_APPLY"));
 	if (getenv("RDN_MIN")) {
 		/* the 9 writes a cold-start bisection of radeon's stream left (journal 2026-10-18): VRAM at MC 0, RLC on */
-		rdn_wreg(card, 0x2024, 0x003f0000);	/* MC_VM_FB_LOCATION */
-		rdn_wreg(card, 0x2c04, 0);		/* HDP_NONSURFACE_BASE */
+		if (!getenv("RDN_MIN_NORELOC")) {
+			rdn_wreg(card, 0x2024, 0x003f0000);	/* MC_VM_FB_LOCATION */
+			rdn_wreg(card, 0x2c04, 0);		/* HDP_NONSURFACE_BASE */
+		}
 		os_delay_us(NULL, 200000);
 		flags |= RDN_UVD_F_MINIMAL | (getenv("RDN_MIN_LMI") ? RDN_UVD_F_LMI : 0);
 	}
