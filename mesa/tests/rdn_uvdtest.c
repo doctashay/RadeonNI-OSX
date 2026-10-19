@@ -421,8 +421,14 @@ int main(int argc, char **argv)
 
 		u_box_2d(0, 0, width, height, &box_y);
 		u_box_2d(0, 0, width / 2, height / 2, &box_uv);
-		y = ctx->texture_map(ctx, res[0], 0, PIPE_MAP_READ, &box_y, &xfer_y);
-		uv = res[1] ? ctx->texture_map(ctx, res[1], 0, PIPE_MAP_READ, &box_uv, &xfer_uv) : NULL;
+		/*
+		 * The decoder's bytes as they are in memory. A copy by the 3D engine would
+		 * swap the two bytes of every chroma sample on a big-endian host, as it
+		 * does for any 16-bit format whose memory the GPU did not write.
+		 */
+		y = ctx->texture_map(ctx, res[0], 0, PIPE_MAP_READ | PIPE_MAP_DIRECTLY, &box_y, &xfer_y);
+		uv = res[1] ? ctx->texture_map(ctx, res[1], 0, PIPE_MAP_READ | PIPE_MAP_DIRECTLY, &box_uv,
+					       &xfer_uv) : NULL;
 		if (!y || !uv) {
 			fprintf(stderr, "uvdtest: cannot map the decoded picture\n");
 			return 1;
