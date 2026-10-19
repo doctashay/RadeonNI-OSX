@@ -25,6 +25,7 @@
  */
 
 #include "rdn_mc.h"
+#include "rdn_reg.h"
 #include "atom/atom_port.h"
 
 #ifndef ETIMEDOUT
@@ -120,4 +121,144 @@ int rdn_mc_load_microcode(struct rdn_card *card, const void *fw, size_t size)
 		card->os->delay_us(card->os->cookie, 1);
 	}
 	return -ETIMEDOUT;
+}
+
+/* ---- moving video memory ------------------------------------------------ */
+
+#define MC_RELOC_VGA_RENDER_CONTROL		0x0300
+#define MC_RELOC_VGA_HDP_CONTROL		0x0328
+#define		MC_RELOC_VGA_MEMORY_DISABLE	(1 << 4)
+#define MC_RELOC_VGA_MEMORY_BASE_ADDRESS	0x0310
+#define MC_RELOC_VGA_MEMORY_BASE_ADDRESS_HIGH	0x0324
+#define MC_RELOC_SRBM_STATUS			0x0e50
+#define MC_RELOC_MC_SHARED_BLACKOUT_CNTL	0x20ac
+#define		MC_RELOC_BLACKOUT_MODE_MASK	0x7
+#define MC_RELOC_BIF_FB_EN			0x5490
+#define		MC_RELOC_FB_READ_EN		(1 << 0)
+#define		MC_RELOC_FB_WRITE_EN		(1 << 1)
+#define MC_RELOC_CONFIG_MEMSIZE			0x5428
+#define MC_RELOC_FB_LOCATION			0x2024
+#define MC_RELOC_AGP_TOP			0x2028
+#define MC_RELOC_AGP_BOT			0x202c
+#define MC_RELOC_AGP_BASE			0x2030
+#define MC_RELOC_APERTURE_LOW			0x2034
+#define MC_RELOC_APERTURE_HIGH			0x2038
+#define MC_RELOC_APERTURE_DEFAULT		0x203c
+#define MC_RELOC_HDP_NONSURFACE_BASE		0x2c04
+#define MC_RELOC_HDP_NONSURFACE_INFO		0x2c08
+#define MC_RELOC_HDP_NONSURFACE_SIZE		0x2c0c
+/* the display controllers, per CRTC (rdn_reg.h has the offsets) */
+#define MC_RELOC_CRTC_CONTROL			0x6e70
+#define		MC_RELOC_CRTC_MASTER_EN		(1 << 0)
+#define		MC_RELOC_CRTC_READ_REQ_DISABLE	(1 << 24)
+#define MC_RELOC_CRTC_UPDATE_LOCK		0x6ed4
+#define MC_RELOC_CRTC_FRAME_COUNT		0x6e98
+#define MC_RELOC_GRPH_PRIMARY			0x6810
+#define MC_RELOC_GRPH_SECONDARY			0x6814
+#define MC_RELOC_GRPH_PRIMARY_HIGH		0x681c
+#define MC_RELOC_GRPH_SECONDARY_HIGH		0x6820
+
+static const uint32_t reloc_crtc[RDN_NUM_CRTC] = {
+	EVERGREEN_CRTC0_REGISTER_OFFSET, EVERGREEN_CRTC1_REGISTER_OFFSET,
+	EVERGREEN_CRTC2_REGISTER_OFFSET, EVERGREEN_CRTC3_REGISTER_OFFSET,
+	EVERGREEN_CRTC4_REGISTER_OFFSET, EVERGREEN_CRTC5_REGISTER_OFFSET
+};
+
+static void reloc_wait_idle(struct rdn_card *card)
+{
+	unsigned i;
+
+	for (i = 0; i < 100000; i++) {
+		if (!(rdn_rreg(card, MC_RELOC_SRBM_STATUS) & 0x1f00))
+			return;
+		card->os->delay_us(card->os->cookie, 1);
+	}
+	rdn_log(card->os, RDN_LOG_ERROR, "mc: wait for the memory controller to idle timed out");
+}
+
+int rdn_mc_relocate(struct rdn_card *card, uint64_t new_base)
+{
+	uint32_t old_loc = rdn_rreg(card, MC_RELOC_FB_LOCATION);
+	uint64_t old_base = (uint64_t)(old_loc & 0xffff) << 24;
+	uint64_t size = (uint64_t)rdn_rreg(card, MC_RELOC_CONFIG_MEMSIZE) << 20;
+	uint32_t default_off, vga_render, vga_hdp, blackout, tmp, frames;
+	uint64_t new_end;
+	unsigned i, j;
+
+	if (!size || (new_base & 0xffffff))
+		return -EINVAL;
+	if (new_base == old_base)
+		return 1;
+	new_end = new_base + size - 1;
+	default_off = (uint32_t)(((uint64_t)rdn_rreg(card, MC_RELOC_APERTURE_DEFAULT) << 12) - old_base);
+
+	/* evergreen_mc_stop(): VGA render off, blank the display controllers */
+	vga_render = rdn_rreg(card, MC_RELOC_VGA_RENDER_CONTROL);
+	vga_hdp = rdn_rreg(card, MC_RELOC_VGA_HDP_CONTROL);
+	rdn_wreg(card, MC_RELOC_VGA_RENDER_CONTROL, 0);
+	for (i = 0; i < RDN_NUM_CRTC; i++) {
+		uint32_t off = reloc_crtc[i];
+
+		if (!(rdn_rreg(card, MC_RELOC_CRTC_CONTROL + off) & MC_RELOC_CRTC_MASTER_EN))
+			continue;
+		tmp = rdn_rreg(card, MC_RELOC_CRTC_CONTROL + off);
+		if (!(tmp & MC_RELOC_CRTC_READ_REQ_DISABLE)) {
+			rdn_wreg(card, MC_RELOC_CRTC_UPDATE_LOCK + off, 1);
+			rdn_wreg(card, MC_RELOC_CRTC_CONTROL + off, tmp | MC_RELOC_CRTC_READ_REQ_DISABLE);
+			rdn_wreg(card, MC_RELOC_CRTC_UPDATE_LOCK + off, 0);
+		}
+		/* wait for the next frame, then switch the controller off */
+		frames = rdn_rreg(card, MC_RELOC_CRTC_FRAME_COUNT + off);
+		for (j = 0; j < 100000; j++) {
+			if (rdn_rreg(card, MC_RELOC_CRTC_FRAME_COUNT + off) != frames)
+				break;
+			card->os->delay_us(card->os->cookie, 1);
+		}
+		rdn_wreg(card, MC_RELOC_CRTC_UPDATE_LOCK + off, 1);
+		tmp = rdn_rreg(card, MC_RELOC_CRTC_CONTROL + off);
+		rdn_wreg(card, MC_RELOC_CRTC_CONTROL + off, tmp & ~MC_RELOC_CRTC_MASTER_EN);
+		rdn_wreg(card, MC_RELOC_CRTC_UPDATE_LOCK + off, 0);
+	}
+	reloc_wait_idle(card);
+	blackout = rdn_rreg(card, MC_RELOC_MC_SHARED_BLACKOUT_CNTL);
+	if ((blackout & MC_RELOC_BLACKOUT_MODE_MASK) != 1) {
+		rdn_wreg(card, MC_RELOC_BIF_FB_EN, 0);			/* block CPU access */
+		rdn_wreg(card, MC_RELOC_MC_SHARED_BLACKOUT_CNTL,
+			 (blackout & ~MC_RELOC_BLACKOUT_MODE_MASK) | 1);	/* black out the MC */
+	}
+	card->os->delay_us(card->os->cookie, 100);
+
+	/* evergreen_mc_program(): the new place */
+	rdn_wreg(card, MC_RELOC_VGA_HDP_CONTROL, MC_RELOC_VGA_MEMORY_DISABLE);
+	rdn_wreg(card, MC_RELOC_APERTURE_LOW, (uint32_t)(new_base >> 12));
+	rdn_wreg(card, MC_RELOC_APERTURE_HIGH, (uint32_t)(new_end >> 12));
+	rdn_wreg(card, MC_RELOC_APERTURE_DEFAULT, (uint32_t)((new_base + default_off) >> 12));
+	rdn_wreg(card, MC_RELOC_FB_LOCATION, (uint32_t)(((new_end >> 24) & 0xffff) << 16) |
+		 (uint32_t)((new_base >> 24) & 0xffff));
+	rdn_wreg(card, MC_RELOC_HDP_NONSURFACE_BASE, (uint32_t)(new_base >> 8));
+	rdn_wreg(card, MC_RELOC_HDP_NONSURFACE_INFO, (2 << 7) | (1u << 30));
+	rdn_wreg(card, MC_RELOC_HDP_NONSURFACE_SIZE, 0x3fffffff);
+	rdn_wreg(card, MC_RELOC_AGP_BASE, 0);
+	rdn_wreg(card, MC_RELOC_AGP_TOP, 0x0fffffff);
+	rdn_wreg(card, MC_RELOC_AGP_BOT, 0x0fffffff);
+	reloc_wait_idle(card);
+
+	/* evergreen_mc_resume(): the display controllers' surfaces at the new base, then let the MC and the CPU back */
+	for (i = 0; i < RDN_NUM_CRTC; i++) {
+		rdn_wreg(card, MC_RELOC_GRPH_PRIMARY_HIGH + reloc_crtc[i], (uint32_t)(new_base >> 32));
+		rdn_wreg(card, MC_RELOC_GRPH_SECONDARY_HIGH + reloc_crtc[i], (uint32_t)(new_base >> 32));
+		rdn_wreg(card, MC_RELOC_GRPH_PRIMARY + reloc_crtc[i], (uint32_t)new_base);
+		rdn_wreg(card, MC_RELOC_GRPH_SECONDARY + reloc_crtc[i], (uint32_t)new_base);
+	}
+	rdn_wreg(card, MC_RELOC_VGA_MEMORY_BASE_ADDRESS_HIGH, (uint32_t)(new_base >> 32));
+	rdn_wreg(card, MC_RELOC_VGA_MEMORY_BASE_ADDRESS, (uint32_t)new_base);
+	tmp = rdn_rreg(card, MC_RELOC_MC_SHARED_BLACKOUT_CNTL);
+	rdn_wreg(card, MC_RELOC_MC_SHARED_BLACKOUT_CNTL, tmp & ~MC_RELOC_BLACKOUT_MODE_MASK);
+	rdn_wreg(card, MC_RELOC_BIF_FB_EN, MC_RELOC_FB_READ_EN | MC_RELOC_FB_WRITE_EN);
+	rdn_wreg(card, MC_RELOC_VGA_HDP_CONTROL, vga_hdp);
+	card->os->delay_us(card->os->cookie, 1000);
+	rdn_wreg(card, MC_RELOC_VGA_RENDER_CONTROL, vga_render & 0xfffcffff);	/* rv515_vga_render_disable(): VGA_VSTATUS_CNTL cleared */
+	rdn_log(card->os, RDN_LOG_INFO, "mc: video memory moved from 0x%llx to 0x%llx",
+		(unsigned long long)old_base, (unsigned long long)new_base);
+	return 0;
 }

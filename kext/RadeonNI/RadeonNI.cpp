@@ -362,6 +362,16 @@ bool RadeonNI::bringUp()
 		}
 	}
 
+	/*
+	 * Video memory to address 0 like radeon does (personality key RelocateVRAM, scripts/kext.sh RDN_RELOC=1): the
+	 * UVD block's firmware window only works below 4 GB. Before the mode set; the display stays off until then.
+	 */
+	if (getProperty("RelocateVRAM") == kOSBooleanTrue) {
+		int mr = rdn_mc_relocate(&fCard, 0);
+
+		IOLog("RadeonNI: video memory moved to 0: %d (0 moved, 1 there already)\n", mr);
+	}
+
 	/* The first connector with a display on it: DVI-I, then DisplayPort. */
 	fEdidLen = rdn_output_detect(&fCard, fEdid);
 	if (fEdidLen < 0) {

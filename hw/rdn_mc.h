@@ -1,5 +1,5 @@
 /*
- * The memory controller's microcode.
+ * The memory controller: its microcode, and where video memory sits in its address space.
  *
  * Copyright (c) 2026 kouta-kun and Claude
  * SPDX-License-Identifier: MIT
@@ -24,5 +24,19 @@
  * or a negative errno value.
  */
 int rdn_mc_load_microcode(struct rdn_card *card, const void *fw, size_t size);
+
+/*
+ * Move video memory to `new_base` in the GPU's address space, as radeon's evergreen_mc_stop(), evergreen_mc_program()
+ * and evergreen_mc_resume() do: blank the display controllers, black out the memory controller, set
+ * MC_VM_FB_LOCATION, the system aperture, the CPU aperture's base (HDP_NONSURFACE_*) and the AGP registers, point
+ * every display controller's surface at the new base, unblack. The BIOS puts video memory at 0xF00000000 on this
+ * card; the UVD block's firmware window only works below 4 GB (docs/UVD.md), where radeon puts it (address 0).
+ * Everything in this library reads MC_VM_FB_LOCATION when it needs the base, so the move is invisible to the
+ * rest, but call it before the mode set and before anything is kept in video memory: the display controllers
+ * stay off afterwards. `new_base` is a multiple of 16 MB. The card must be posted.
+ *
+ * Returns 0, 1 when video memory is there already, or a negative errno value.
+ */
+int rdn_mc_relocate(struct rdn_card *card, uint64_t new_base);
 
 #endif /* RDN_MC_H */

@@ -56,6 +56,8 @@ data = base64.b64encode(open(sys.argv[2], "rb").read()).decode()
 marker = "\t\t\t<key>IOProviderClass</key>"
 assert marker in plist
 extra = "\t\t\t<key>VBIOS</key>\n\t\t\t<data>" + data + "</data>\n"
+if os.environ.get("RDN_RELOC") == "1":
+    extra += "\t\t\t<key>RelocateVRAM</key>\n\t\t\t<true/>\n"
 if os.environ.get("RDN_FAKE_EDID") == "1":
     # 1024x768 at 60 Hz, digital, for a card with no monitor (a test aid; see RadeonNI.cpp)
     e = bytearray(128)
