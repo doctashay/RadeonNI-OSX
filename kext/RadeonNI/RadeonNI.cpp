@@ -336,6 +336,14 @@ bool RadeonNI::bringUp()
 		IOLog("RadeonNI: POST failed (%d)\n", r);
 		return false;
 	}
+	/*
+	 * Test aid (boot argument rdn_repost=1): run ASIC_Init even though firmware POSTed the card, to see whether
+	 * what Open Firmware leaves differs from a POST by this driver (UVD works after ours, not after its).
+	 */
+	if (PE_parse_boot_arg("rdn_repost", &i) && i) {
+		r = rdn_card_repost(&fCard);
+		IOLog("RadeonNI: ASIC_Init again on the posted card (rdn_repost): %d\n", r);
+	}
 	IOLog("RadeonNI: CONFIG_MEMSIZE %lu MB\n",
 	      (unsigned long)readReg(0x5428));
 

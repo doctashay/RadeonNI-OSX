@@ -240,6 +240,12 @@ static void rdn_asic_reset_check(struct rdn_card *card)
 			(unsigned)reset_mask);
 }
 
+/* Run the VBIOS's ASIC_Init whatever the card's state (a test aid: see the kext's rdn_repost boot argument). */
+int rdn_card_repost(struct rdn_card *card)
+{
+	return atom_asic_init(card->atom.ctx);
+}
+
 int rdn_card_post(struct rdn_card *card)
 {
 	int r;

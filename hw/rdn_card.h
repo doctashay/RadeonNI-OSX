@@ -117,6 +117,7 @@ bool rdn_card_posted(struct rdn_card *card);
  * card is not posted. Returns 0 or a negative errno value.
  */
 int rdn_card_post(struct rdn_card *card);
+int rdn_card_repost(struct rdn_card *card);
 
 /*
  * Hand-over from firmware. A client run from Open Firmware (of/) that POSTed
