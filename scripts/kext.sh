@@ -56,6 +56,24 @@ data = base64.b64encode(open(sys.argv[2], "rb").read()).decode()
 marker = "\t\t\t<key>IOProviderClass</key>"
 assert marker in plist
 extra = "\t\t\t<key>VBIOS</key>\n\t\t\t<data>" + data + "</data>\n"
+if os.environ.get("RDN_FAKE_EDID") == "1":
+    # 1024x768 at 60 Hz, digital, for a card with no monitor (a test aid; see RadeonNI.cpp)
+    e = bytearray(128)
+    e[0:8] = bytes([0, 255, 255, 255, 255, 255, 255, 0])
+    e[8:10] = bytes([0x4a, 0x59])            # manufacturer "RDN"-like id
+    e[16], e[17], e[18], e[19] = 1, 30, 1, 3  # week 1 of 2020, EDID 1.3
+    e[20] = 0x80                              # digital input
+    e[21], e[22], e[23] = 34, 27, 0x0a
+    e[35], e[36], e[37] = 0x08, 0, 0          # 1024x768 established timing
+    for i in range(38, 54, 2):
+        e[i], e[i + 1] = 1, 1
+    d = bytes([0x64, 0x19, 0x00, 0x40, 0x41, 0x00, 0x26, 0x30, 0x18, 0x88, 0x36, 0x00,
+               0x54, 0x0E, 0x11, 0x00, 0x00, 0x18])
+    e[54:72] = d
+    e[72:75] = bytes([0, 0, 0]); e[75] = 0xfc; e[77:90] = b"RDN virtual\n "
+    e[90:93] = bytes([0, 0, 0]); e[93] = 0xfd; e[95:105] = bytes([50, 70, 30, 80, 8, 0, 10, 32, 32, 32])
+    e[127] = (-sum(e[:127])) & 255
+    extra += "\t\t\t<key>FakeEDID</key>\n\t\t\t<data>" + base64.b64encode(bytes(e)).decode() + "</data>\n"
 if os.environ.get("RDN_ACCEL") == "1":
     extra += "\t\t\t<key>Accelerator</key>\n\t\t\t<true/>\n"
     # The command processor's microcode, like the VBIOS: from the host's

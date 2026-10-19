@@ -87,6 +87,12 @@ void rdn_output_select(struct rdn_card *card, const struct rdn_output *out);
 int rdn_output_detect(struct rdn_card *card, uint8_t *edid);
 
 /*
+ * Test aid, for a card with no display on it: select the DVI-I output as if a monitor had answered. The caller
+ * supplies the EDID. Never used when rdn_output_detect() finds a display.
+ */
+void rdn_output_assume(struct rdn_card *card);
+
+/*
  * One-time display setup after the card is posted and before the first
  * rdn_modeset(): transmitter initialisation and the display engine clock.
  * Returns 0 or a negative errno value.

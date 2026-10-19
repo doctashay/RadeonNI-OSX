@@ -365,6 +365,17 @@ bool RadeonNI::bringUp()
 	/* The first connector with a display on it: DVI-I, then DisplayPort. */
 	fEdidLen = rdn_output_detect(&fCard, fEdid);
 	if (fEdidLen < 0) {
+		/* Test aid (scripts/kext.sh RDN_FAKE_EDID=1): a card with no monitor, to test the accelerator. */
+		OSData *fake = OSDynamicCast(OSData, getProperty("FakeEDID"));
+
+		if (fake && fake->getLength() == 128) {
+			bcopy(fake->getBytesNoCopy(), fEdid, 128);
+			fEdidLen = 128;
+			rdn_output_assume(&fCard);
+			IOLog("RadeonNI: no display; using the FakeEDID of the personality\n");
+		}
+	}
+	if (fEdidLen < 0) {
 		IOLog("RadeonNI: no EDID on any connector (%d)\n", fEdidLen);
 		return false;
 	}

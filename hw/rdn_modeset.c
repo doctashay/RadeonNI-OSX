@@ -1244,6 +1244,12 @@ static int output_edid(struct rdn_card *card, const struct rdn_output *out,
  *  - only with no usable table: the DisplayPort lines as TMDS (a DVI-D
  *    port there; the BIOS answers a DVI sink type and AUX does not).
  */
+void rdn_output_assume(struct rdn_card *card)
+{
+	board_outputs_read(card);
+	rdn_output_select(card, &outputs[RDN_OUTPUT_DVI]);
+}
+
 int rdn_output_detect(struct rdn_card *card, uint8_t *edid)
 {
 	const struct rdn_output *cand[2 + 1 + RDN_MAX_BOARD_OUTPUTS];
