@@ -7290,3 +7290,15 @@ checksum of each drawn picture when `/tmp/rdnavc.debug` exists (`scripts/uvd-pic
 Then, to compare the decoder's registers healthy and hung, a dump of 0xef00-0xf8fc through `rdnreg` hung the whole G5 (fans at full speed, no
 answer): some register of that range does not answer while the block's clocks are down. Do not read ranges there.
 
+## 2026-10-19 (afternoon): disk reads during an idle gap break a session; recovery built; the card is missing after the second hang
+
+Found: the decoder stalls (commands and fences run, no decode, no feedback) when a session sits idle while something loads the machine,
+reproduced with `rdn_uvdtest -A -g 9000` and, in another program during the gap, an application launch (TextEdit, QuickTime Player) or reading
+files that are not cached; not CPU load, memory copies, OpenGL clears, mouse movement, opening or closing connections to the card, a Finder
+window. Heartbeat buffers during the gap did not prevent it. A restart of the block clears it; it persisted in some runs because the kext
+counted a user that never left and so never restarted. Built (not run on the card): kext restarts the firmware when a new session starts with no
+other session alive, keeps fence numbers across restarts, counts sessions, new calls RDN_UC_UVD_RESET and RDN_UC_UVD_EPOCH; winsys
+`rdn_winsys_uvd_answered()` (the feedback counter equals the message's, all 150 healthy decodes of a clip do); rdnvd starts over on a stall (reset,
+new decoder, replay of the access units since the last IDR, three tries). `RDNVD_FAKE_STALL=n` makes the n-th decode count as a stall.
+After two hangs of the G5 (see memory) and the user's power cycle, the G5 came up without the card in its PCI tree. Nothing was installed.
+
