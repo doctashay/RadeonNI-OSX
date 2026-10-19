@@ -1290,6 +1290,28 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
             unsigned k;
 
             ws->dev->sync_for_cpu(ws->dev);
+            {
+               /* every buffer the stream names: which command, where in video memory, how big, and the raw message */
+               char line[400];
+               int len = 0;
+
+               for (k = 0; k < dbg.n && len < (int)sizeof(line) - 60; k++)
+                  len += snprintf(line + len, sizeof(line) - len, " %x:%s@%llx+%x/%llx", dbg.cmd[k],
+                                  dbg.bo[k]->region == RDN_GART ? "gart" : dbg.bo[k]->region == RDN_USER ? "user" : "vram",
+                                  (unsigned long long)dbg.bo[k]->offset, dbg.offset[k],
+                                  (unsigned long long)dbg.bo[k]->base.size);
+               syslog(LOG_NOTICE, "RadeonNIAVC: uvd stream%s", line);
+               for (k = 0; k < dbg.n; k++) {
+                  if (dbg.cmd[k] == 0 && dbg.bo[k]->region != RDN_GART && dbg.bo[k]->region != RDN_USER) {
+                     FILE *f = fopen("/tmp/rdn-uvd-msgs.bin", "ab");
+
+                     if (f) {
+                        fwrite((const uint8_t *)ws->dev->aperture + dbg.bo[k]->offset + dbg.offset[k], 1, 0xde4, f);
+                        fclose(f);
+                     }
+                  }
+               }
+            }
             for (k = 0; k < dbg.n; k++) {
                struct rdn_bo *bo = dbg.bo[k];
                const uint8_t *p;
