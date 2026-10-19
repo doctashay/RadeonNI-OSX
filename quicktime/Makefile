@@ -17,7 +17,7 @@ all: $(CONTENTS)/MacOS/RadeonNIAVC $(CONTENTS)/MacOS/librdnvd.dylib $(CONTENTS)/
 
 $(CONTENTS)/MacOS/RadeonNIAVC: RadeonNIAVC.c RadeonNIAVCDispatch.h rdnvd.h
 	mkdir -p $(CONTENTS)/MacOS
-	$(CC) $(ARCH) -O2 -Wall -fno-strict-aliasing -I. -bundle -o $@ RadeonNIAVC.c \
+	$(CC) $(ARCH) -O2 -Wall -fno-strict-aliasing -fpascal-strings -I. -bundle -o $@ RadeonNIAVC.c \
 		-framework CoreServices -framework QuickTime -L. -lrdnvd
 
 $(CONTENTS)/MacOS/librdnvd.dylib: librdnvd.dylib

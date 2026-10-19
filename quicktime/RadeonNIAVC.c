@@ -17,7 +17,7 @@
 #include <CoreServices/CoreServices.h>
 #include <QuickTime/QuickTime.h>
 #include <QuickTime/ImageCodec.h>
-#include <CarbonCore/Components.k.h>
+#include <CoreServices/Components.k.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -71,6 +71,7 @@ static void say(const char *format, ...)
 #include <QuickTime/ImageCodec.k.h>
 
 pascal ComponentResult RDNAVC_Open(RDNAVCGlobals *storage, ComponentInstance self);
+pascal ComponentResult RDNAVC_CanDo(RDNAVCGlobals *storage, short ftnNumber);
 pascal ComponentResult RDNAVC_Close(RDNAVCGlobals *storage, ComponentInstance self);
 pascal ComponentResult RDNAVC_Version(RDNAVCGlobals *storage);
 pascal ComponentResult RDNAVC_Register(RDNAVCGlobals *storage);
