@@ -8,7 +8,11 @@
  * pictures in display order (scripts/uvd-testvec.sh makes both). H.264 decodes bit-exactly, so every
  * sample must be identical. -n repeats the whole stream; -o writes the last pass's pictures. -L n opens n more
  * decoder sessions first and leaves them open when the program ends; -R n asks n times whether the card has room for a
- * 1280x720 decoder (what the QuickTime component does when a program opens a movie: each asks takes the memory and gives it back) (what QuickTime programs do: the card's
+ * 1280x720 decoder (what the QuickTime component does when a program opens a movie: each asks takes the memory and gives it back).
+ * -A decodes one access unit at a time with rdnvd_h264_decode_au and reads each picture out as it is decoded, as the QuickTime
+ * component does (pictures come in decoding order and are compared with the reference by their order of appearance in the stream's
+ * display order, so only streams without B pictures can be checked: the result then says how many came out right); -g ms waits that
+ * long after the first access unit (QuickTime Player decodes a movie's first picture when it opens it, and the rest when play is pressed) (what QuickTime programs do: the card's
  * firmware holds ten sessions, and the kext starts the block again when the last program that used it is gone).
  *
  * Copyright (c) 2026 kouta-kun and Claude
@@ -20,6 +24,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include "rdnvd.h"
 
@@ -129,7 +134,7 @@ int main(int argc, char **argv)
 {
 	const char *stream_path = NULL, *ref_path = NULL, *out_path = NULL;
 	unsigned count = 1, pass, nal_length_size = 0, pictures = 0;
-	int leak = 0, room = 0;
+	int leak = 0, room = 0, per_au = 0, gap_ms = 0;
 	size_t stream_size, ref_size;
 	uint8_t *stream, *ref;
 	struct rdnvd *d;
@@ -146,6 +151,10 @@ int main(int argc, char **argv)
 			leak = atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-R") && a + 1 < argc)
 			room = atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-A"))
+			per_au = 1;
+		else if (!strcmp(argv[a], "-g") && a + 1 < argc)
+			gap_ms = atoi(argv[++a]);
 		else if (!stream_path)
 			stream_path = argv[a];
 		else if (!ref_path)
@@ -185,6 +194,87 @@ int main(int argc, char **argv)
 	for (a = 0; a < room; a++)
 		if (!rdnvd_h264_room(d, 1280, 720))
 			fprintf(stderr, "uvdtest: no room for a 1280x720 decoder (ask %d)\n", a);
+	if (per_au) {
+		/* Annex B split into access units: one slice NAL that starts a picture (first_mb_in_slice 0) ends the one before */
+		struct rdnvd_session *s = rdnvd_h264_open(d, NULL, 0, NULL, NULL, &nal_length_size);
+		size_t pos = 0, au_start = 0;
+		unsigned au = 0, right = 0, wrong = 0, nonzero = 0;
+		size_t frame_bytes = 0;
+
+		if (!s) {
+			fprintf(stderr, "uvdtest: cannot open a decoder session\n");
+			return 1;
+		}
+		/* NAL starts */
+		while (pos + 4 < stream_size) {
+			size_t next = pos + 3;
+			size_t nal_at;
+			int starts_picture = 0;
+			struct rdnvd_frame *frame = NULL;
+
+			/* find the start code at pos (00 00 01 or 00 00 00 01) */
+			if (!(stream[pos] == 0 && stream[pos + 1] == 0 && (stream[pos + 2] == 1 || (stream[pos + 2] == 0 && stream[pos + 3] == 1)))) {
+				pos++;
+				continue;
+			}
+			nal_at = pos + (stream[pos + 2] == 1 ? 3 : 4);
+			{
+				unsigned type = stream[nal_at] & 0x1f;
+
+				starts_picture = (type == 1 || type == 5) && (stream[nal_at + 1] & 0x80);
+			}
+			/* where this NAL ends: the next start code */
+			next = nal_at + 1;
+			while (next + 3 < stream_size && !(stream[next] == 0 && stream[next + 1] == 0 && (stream[next + 2] == 1 || (stream[next + 2] == 0 && stream[next + 3] == 1))))
+				next++;
+			if (next + 3 >= stream_size)
+				next = stream_size;
+			/* a slice that starts a picture is its own access unit with whatever parameter sets came before it */
+			if (starts_picture) {
+				size_t len = next - au_start;
+				double tdec = now_ms();
+
+				r = rdnvd_h264_decode_au(s, stream + au_start, len, 0, &frame);
+				if (r)
+					fprintf(stderr, "uvdtest: decoding access unit %u failed (%d)\n", au, r);
+				if (frame) {
+					unsigned w = frame->width, h = frame->height;
+					uint8_t *y, *uv;
+					unsigned i, zeros = 0;
+
+					frame_bytes = (size_t)w * h * 3 / 2;
+					y = malloc(frame_bytes);
+					uv = y + (size_t)w * h;
+					if (y && !rdnvd_frame_read(frame, y, w, uv, w)) {
+						for (i = 0; i < w * h; i += 97)
+							zeros += y[i] == 0;
+						nonzero += zeros < (w * h / 97) / 2;
+						/* decoding order equals display order in a stream without B pictures */
+						if ((size_t)(au + 1) * frame_bytes <= ref_size &&
+						    !memcmp(y, ref + (size_t)au * frame_bytes, (size_t)w * h))
+							right++;
+						else
+							wrong++;
+					}
+					free(y);
+					rdnvd_frame_release(frame);
+				}
+				if (au == 0 && gap_ms) {
+					printf("first access unit decoded in %.1f ms; waiting %d ms\n", now_ms() - tdec, gap_ms);
+					fflush(stdout);
+					usleep((useconds_t)gap_ms * 1000);
+				}
+				au++;
+				au_start = next;
+			}
+			pos = next;
+		}
+		printf("%u access units: %u luma planes right, %u wrong (%u with picture content)\n", au, right, wrong, nonzero);
+		printf("%s\n", wrong || !right ? "FAIL" : "PASS: every picture identical to ffmpeg's");
+		rdnvd_h264_close(s);
+		rdnvd_close(d);
+		return wrong != 0 || !right;
+	}
 	t0 = now_ms();
 	for (pass = 0; pass < count && !r; pass++) {
 		struct rdnvd_session *s = rdnvd_h264_open(d, NULL, 0, on_frame, &t, &nal_length_size);

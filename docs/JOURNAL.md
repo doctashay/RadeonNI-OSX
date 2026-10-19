@@ -7272,3 +7272,21 @@ Checked: leaks of 8, 11, 12 sessions and a fresh program decodes right afterward
 QuickTime: Apple's decoder); `qtdecode -t` (scheduled real-time playback) exact for 128x96 to 1080p. Also: the PC lost the server's name (a VPN replaced resolv.conf): `~/.ssh/config` has `HostName arch-server.local`
 for it now (copy of the old file next to it).
 
+## 2026-10-19 (G5, morning): colorbars flicker green: the decoder's firmware answers the first decode and then nothing; a register dump hung the G5
+
+The user's report: the colorbars demo flickers between green and the colorbars in QuickTime Player. Reproduced on the G5 with Player itself
+(open, press play): the card decodes the first picture, then the firmware writes no feedback for any later decode (`uvd feedback` stays at
+the first one's counter) and no picture is written: the buffers show whatever video memory held before (the user's: zeros, green; mine: the
+pictures of the vector my last test decoded). After that the decoder stays dead for every program (new processes decode all zeros, 1.1 ms a
+picture against 4.3 ms healthy) through the kext's block restarts, until the G5 is restarted. Not the cause (all tried on a freshly restarted
+card, each passing): the clip (the same stream passes 150 of 150 through rdn_uvdtest, QuickTime ICM `qtdecode`, scheduled `qtdecode -t`, `qtplay`),
+an 8 s gap after the first picture (`rdn_uvdtest -A -g 8000`, and `qtdecode` with QTDECODE_PAUSE), ten asks for room (`rdn_uvdtest -R 10`),
+an OpenGL context in the same program (`QTDECODE_GL=1`), opening the movie in Player without playing, the readout path (the DMA copy equals
+video memory, byte for byte, in `rdnvd`'s debug check). The streams the decoder gets in Player and in `qtdecode` are identical (same buffers,
+same addresses, `/tmp/rdnavc.debug` makes the winsys log them). What is left: something Player does while it plays (display of the pictures
+through OpenGL by the window server, other processes, threads) that makes the firmware stop. New debug aids: the component logs every band and a
+checksum of each drawn picture when `/tmp/rdnavc.debug` exists (`scripts/uvd-picsums.py` checks them against ffmpeg's), dumps pictures with
+`/tmp/rdnavc.dump`; `qtplay -v`, `qtdecode` options QTDECODE_PAUSE and QTDECODE_GL, `rdn_uvdtest` options -R, -A, -g.
+Then, to compare the decoder's registers healthy and hung, a dump of 0xef00-0xf8fc through `rdnreg` hung the whole G5 (fans at full speed, no
+answer): some register of that range does not answer while the block's clocks are down. Do not read ranges there.
+
