@@ -1,11 +1,13 @@
 # UVD (hardware video decode): status, architecture, how it was brought up
 
-Read this before any work on video decode on the 7570. Status (2026-10-18 night): **the UVD block boots from our
-code and runs rings, indirect buffers and fences** on the x86 server (`rdn_tool uvdonly`) and through the kext in
-the Tiger guest under QEMU with the real card (big-endian PowerPC host). Not yet run on the G5. No decoding yet:
-the message/decoder layer, the PowerVLC module and the QuickTime component are still to do. Older sections
-below are the paper check and the failed first attempts, kept for the record; the journal
-(`docs/JOURNAL.md`, 2026-10-18) has the whole story. See also `docs/LEOPARD-VIDEO-DECODE.md`.
+Read this before any work on video decode on the 7570. Status (2026-10-19): **the UVD block boots from our code
+and Mesa's own UVD code decodes H.264 on it, bit-exactly, on the real G5** (x86 server, Tiger guest and G5 all start it).
+Done: the kernel side (hw/rdn_uvd.c, the kext's user-client methods), the message layer (Mesa r600's `radeon_uvd.c` over our
+winsys, see "The message layer" below) and a test that decodes I/P pictures, Baseline to High, against ffmpeg. Still to do:
+the UVD clocks (the block runs on the bypass clock: 720p at 34 ms a picture), a VA-API-style entry to give parsed headers to
+`pipe_h264_picture_desc`, the PowerVLC module and the QuickTime component, address checks in the kext. Older sections below are
+the paper check and the failed first attempts, kept for the record; the journal (`docs/JOURNAL.md`, 2026-10-18 and 2026-10-19)
+has the whole story. See also `docs/LEOPARD-VIDEO-DECODE.md`.
 
 ## What it takes (found by bisecting radeon's own register stream on a card we POSTed)
 
@@ -34,6 +36,34 @@ In code: `RDN_UVD_F_MINIMAL` (and `RDN_UVD_F_LMI`) in `hw/rdn_uvd.c`; `rdnuvd in
 `UVD_STATUS` bit 1 alone is not proof (it also appears when the firmware does not run); the firmware modifies its own
 window (40 bytes at image offset 320 become 7e706b85 611a2c7d 3062109e 30260b85 00031e40, as under radeon) and the ring test
 is the real check.
+
+## The message layer: Mesa's r600 UVD code over our winsys (2026-10-19)
+
+Nothing was copied from Mesa and no module was written: r600 already compiles `radeon_uvd.c`, `r600_uvd.c`, `radeon_video.c`, and
+the screen offers `create_video_codec`/`create_video_buffer` when the winsys says `info.ip[AMD_IP_UVD].num_queues` is not 0.
+What the winsys (`mesa/winsys/rdn_winsys.c`) does for it:
+
+1. A UVD command stream (`rdn_cs_create(AMD_IP_UVD)`; the decoder is started by the first one: `rdn_device::uvd_init`). Its
+   words are `radeon_uvd.c`'s legacy ones: `GPCOM_VCPU_DATA0` = offset in the buffer, `DATA1` = 4 x the buffer's index in the
+   stream's list. `rdn_uvd_relocate()` turns each pair into the 40-bit address, as the radeon kernel's `radeon_uvd_cs_reloc`
+   does. The IB goes to visible video memory, padded to 16 words with type-2 nops (`radeon_drm_cs.c`), then `uvd_submit`.
+2. Fences of their own (`rdn_fence.uvd`, `rdn_busy.uvd`). Rings are not synchronised by the hardware here: a UVD stream waits on
+   the CPU for the 3D engine's work on its buffers; the 3D engine, CPU maps and destroys wait for the buffer's `last_uvd`.
+3. Placement: the decoder reads its messages from the 256 MB its firmware is in, so r600's message/bitstream buffers (GTT domain,
+   but shareable: no `RADEON_FLAG_NO_INTERPROCESS_SHARING`) go to visible video memory, not to the GART. Decoded pictures are
+   linear (`R600_UVD_ENABLE_TILING` is 0) NV12 in visible video memory.
+4. Byte order (Mesa patch `0014-uvd-message-little-endian.patch`): the message and the feedback buffer's first word are
+   little-endian words (swap of the 32-bit members and the one 16-bit pair, 8-bit members stay); the bitstream and pictures are
+   byte streams. Only H.264 decoders are created on a big-endian host. Reading a picture with a GPU copy (r600's transfer
+   map does) swaps the bytes of every 16-bit texel the GPU did not write, so U and V of NV12 come out turned around: read the
+   buffer itself, or fix the swizzle where the planes are sampled.
+
+Test: `mesa/tests/rdn_uvdtest.c` (build target `rdn_uvdtest` of `scripts/build-mesa.sh darwin`), with vectors from
+`scripts/uvd-testvec.sh` (ffmpeg/x264 on the host; the reference is ffmpeg's decode). On the G5 (Leopard): bit-exact luma and chroma
+for Baseline I (500 repeats), Baseline IPPP with 3 references, Main CABAC with 2 references, High CABAC 720p with 4 references.
+720p takes 34 ms a picture: the UPLL is in reset and bypass after the minimal start (`CG_UPLL_FUNC_CNTL` = 0x305), so
+`RDN_UVD_F_PLL` brings the clocks up (Linux's 533/400 MHz) at the first command stream and keeps them while a decoding client is open.
+Kext hardening still open: the commands are not checked (addresses, 256 MB segment), as the 3D path's are not.
 
 ## Why
 

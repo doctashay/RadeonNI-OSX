@@ -7174,3 +7174,48 @@ clocks, MC microcode on/off and order, the firmware blob (md5), firmware byte or
 screen goes pink then black meanwhile), Quartz Extreme/GL personality keys, hot-plug/DPMS threads, the UVD PLL state at POST (same as Linux's trace).
 Lesson: a test that only passes on a card that has been through other drivers is not a cold test; the card keeps RLC (and
 probably other SRAM) state until it loses power.
+
+## 2026-10-19 (G5): the message layer, through Mesa's own UVD code: H.264 decodes bit-exactly on the card
+
+Asked to reuse the compiled Mesa and write no new modules. Mesa 26.2.4's r600 already builds `radeon_uvd.c`,
+`r600_uvd.c` and `radeon_video.c` (nothing to enable: `-Dvideo-codecs=` only concerns the VA/VDPAU frontends); r600
+offers `create_video_codec`/`create_video_buffer` when `info.ip[AMD_IP_UVD].num_queues` is not 0. What was missing was
+the winsys side, and it is small:
+
+- `mesa/winsys/rdn_winsys.c`: `rdn_cs_create(AMD_IP_UVD)` (starts the decoder on first use through the new device op
+  `uvd_init`), `rdn_uvd_cs_flush`. The commands r600 writes are `radeon_uvd.c`'s legacy ones: `GPCOM_VCPU_DATA0` = offset in the
+  buffer, `DATA1` = 4 x the buffer's index in the stream's list, the radeon kernel replaces both with the 40-bit address
+  (`radeon_uvd_cs_reloc`); `rdn_uvd_relocate` does that on the stream before it goes to the device (and refuses buffers in
+  GART memory). The IB is padded to 16 words with type-2 nops as `radeon_drm_cs.c` does. The two rings do not know of each
+  other: every buffer has `last_uvd` besides `last_use`/`last_write`; a UVD stream waits (on the CPU) for the 3D engine's use of
+  its buffers, a 3D stream, a CPU map or a destroy waits for `last_uvd`. UVD fences have their own number space (`rdn_busy.uvd`,
+  `rdn_fence.uvd`, `uvd_last_done`). r600 asks for the decoder's message/bitstream buffers in the GTT domain without
+  `RADEON_FLAG_NO_INTERPROCESS_SHARING` (they are shareable): those now go to visible video memory instead of the GART, where
+  the decoder cannot read its messages (they must be in its 256 MB).
+- `mesa/winsys/rdn_device.h`: optional ops `uvd_init`, `uvd_submit`, `uvd_fence_wait`; `mesa/target/rdn_device_darwin.c`
+  implements them with `RDN_UC_UVD_*` (offered only when the kext answers `RDN_UC_UVD_INFO`, i.e. has the firmware;
+  `RDN_NO_UVD=1` turns it off). The x86 backend has none yet.
+- `mesa/patches/0014-uvd-message-little-endian.patch`: on a big-endian host the message (`struct ruvd_msg`: 32-bit members,
+  the 16-bit pair in the H.264 part, 8-bit members untouched) and the feedback buffer's first word are converted to
+  little-endian in place before the message is sent; only H.264 decoders are created on big-endian hosts. The memory
+  interface swaps the ring and its indirect buffers (`UVD_LMI_SWAP_CNTL` = 0xa), nothing else; the bitstream and the
+  decoded pictures are byte streams and need nothing.
+- `mesa/tests/rdn_uvdtest.c` (target `rdn_uvdtest`): reads an Annex B file, parses SPS/PPS/slice headers only as far as
+  `pipe_h264_picture_desc` needs, decodes every picture through `pipe_video_codec` and compares each with ffmpeg's decode
+  (`scripts/uvd-testvec.sh` makes the pair). A GPU copy is not used to read the picture: r600 reads a texture in video memory
+  through the 3D engine, which on a big-endian host swaps the two bytes of every 16-bit texel the GPU did not write, and
+  turned every chroma sample's U and V around (found first; the decoded bytes were right).
+
+Results on the G5 (Leopard, kext with `RelocateVRAM`/`FW_UVD`/`FW_RLC`, default flags): **identical to ffmpeg's decode, every
+sample, luma and chroma**, for 128x96 Baseline I (500 times in a row), 128x96 Baseline IPPP with 3 references (20 pictures),
+176x144 Main CABAC with 2 references (30 pictures) and 1280x720 High CABAC (8x8 transform, 4 references, 30 pictures). That is:
+create/decode/destroy messages, the DPB, inter prediction and the byte order are right on the first try with Mesa's code.
+Speed: 720p takes 34 ms a picture from `begin_frame` to the fence with the kext's wait (and the same with a spinning wait): the
+block still runs on the bypass clock, because the minimal start never raises the UPLL (`CG_UPLL_FUNC_CNTL` = 0x305: reset +
+bypass; `CG_UPLL_FUNC_CNTL_2` selects source 1 for VCLK and DCLK). Next: `RDN_UVD_F_PLL` (kext default from this commit): the
+clocks (53300/40000, 10 kHz units, as Linux) go up at the first command stream and stay up while a client that has submitted
+one is open (`RadeonNIAccel::uvdUser`); not yet run.
+Not yet: the kext does not check the addresses the commands name (the 3D path does not either); the GL bundle with the changed winsys
+has been built but not tried on the G5; the x86 backend has no UVD ops; stage B (a VA-API driver or library to give ffmpeg's
+parsed headers to `pipe_h264_picture_desc`), the PowerVLC module and the QuickTime component.
+
