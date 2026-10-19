@@ -239,6 +239,8 @@ int main(int argc, char **argv)
 				size_t len = next - au_start;
 				double tdec = now_ms();
 
+				int au_ok = 0;
+
 				r = rdnvd_h264_decode_au(s, stream + au_start, len, 0, &frame);
 				if (r)
 					fprintf(stderr, "uvdtest: decoding access unit %u failed (%d)\n", au, r);
@@ -256,10 +258,12 @@ int main(int argc, char **argv)
 						nonzero += zeros < (w * h / 97) / 2;
 						/* decoding order equals display order in a stream without B pictures */
 						if ((size_t)(au + 1) * frame_bytes <= ref_size &&
-						    !memcmp(y, ref + (size_t)au * frame_bytes, (size_t)w * h))
+						    !memcmp(y, ref + (size_t)au * frame_bytes, (size_t)w * h)) {
 							right++;
-						else
+							au_ok = 1;
+						} else {
 							wrong++;
+						}
 					}
 					free(y);
 					rdnvd_frame_release(frame);
@@ -277,7 +281,7 @@ int main(int argc, char **argv)
 					gettimeofday(&tv, NULL);
 					t = localtime(&tv.tv_sec);
 					printf("%02d:%02d:%02d.%03d au %u %s\n", t->tm_hour, t->tm_min, t->tm_sec, (int)(tv.tv_usec / 1000), au,
-					       r || !frame ? "NOT DECODED" : "ok");
+					       r || !frame ? "NOT DECODED" : au_ok ? "ok" : "WRONG");
 					fflush(stdout);
 					usleep((useconds_t)pace_ms * 1000);
 				}
