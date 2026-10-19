@@ -187,6 +187,47 @@ static void fence_release(struct rdnvd_session *s)
 	}
 }
 
+/* The raster position of each place of the zig-zag scan (8.5.6, 8.5.7). */
+static const uint8_t zigzag4[16] = { 0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15 };
+static const uint8_t zigzag8[64] = {
+	0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14,
+	21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53,
+	60, 61, 54, 47, 55, 62, 63
+};
+
+/*
+ * The scaling lists the way the decoder takes them from Mesa: how VA-API gives them (RDNVD_SCALING picks
+ * another order for experiments: 0 as sent (zig-zag), 1 raster, 2 raster transposed).
+ */
+static void scaling_to_decoder(uint8_t dst4[6][16], uint8_t dst8[6][64], const uint8_t src4[6][16],
+			       const uint8_t src8[6][64])
+{
+	static int mode = -1;
+	unsigned i, j;
+
+	if (mode < 0) {
+		const char *e = getenv("RDNVD_SCALING");
+
+		mode = e ? atoi(e) : 1;
+	}
+	for (i = 0; i < 6; i++) {
+		for (j = 0; j < 16; j++) {
+			unsigned pos = mode == 0 ? j : zigzag4[j];
+
+			if (mode == 2)
+				pos = (pos % 4) * 4 + pos / 4;
+			dst4[i][pos] = src4[i][j];
+		}
+		for (j = 0; j < 64; j++) {
+			unsigned pos = mode == 0 ? j : zigzag8[j];
+
+			if (mode == 2)
+				pos = (pos % 8) * 8 + pos / 8;
+			dst8[i][pos] = src8[i][j];
+		}
+	}
+}
+
 static int on_decode(void *user, const struct rdnvd_h264_picture *pic, void **surface)
 {
 	struct rdnvd_session *s = user;
@@ -252,8 +293,7 @@ static int on_decode(void *user, const struct rdnvd_h264_picture *pic, void **su
 	pps.transform_8x8_mode_flag = src_pps->transform_8x8_mode_flag;
 	pps.second_chroma_qp_index_offset = src_pps->second_chroma_qp_index_offset;
 	/* The lists in force for the picture (PPS over SPS). */
-	memcpy(pps.ScalingList4x4, pic->scaling_list_4x4, sizeof(pps.ScalingList4x4));
-	memcpy(pps.ScalingList8x8, pic->scaling_list_8x8, sizeof(pps.ScalingList8x8));
+	scaling_to_decoder(pps.ScalingList4x4, pps.ScalingList8x8, pic->scaling_list_4x4, pic->scaling_list_8x8);
 
 	memset(&desc, 0, sizeof(desc));
 	desc.base.profile = s->codec->profile;
