@@ -7,7 +7,8 @@
  * stream.h264: Annex B; reference.yuv: the same stream decoded by ffmpeg as yuv420p, all the
  * pictures in display order (scripts/uvd-testvec.sh makes both). H.264 decodes bit-exactly, so every
  * sample must be identical. -n repeats the whole stream; -o writes the last pass's pictures. -L n opens n more
- * decoder sessions first and leaves them open when the program ends (what QuickTime programs do: the card's
+ * decoder sessions first and leaves them open when the program ends; -R n asks n times whether the card has room for a
+ * 1280x720 decoder (what the QuickTime component does when a program opens a movie: each asks takes the memory and gives it back) (what QuickTime programs do: the card's
  * firmware holds ten sessions, and the kext starts the block again when the last program that used it is gone).
  *
  * Copyright (c) 2026 kouta-kun and Claude
@@ -128,7 +129,7 @@ int main(int argc, char **argv)
 {
 	const char *stream_path = NULL, *ref_path = NULL, *out_path = NULL;
 	unsigned count = 1, pass, nal_length_size = 0, pictures = 0;
-	int leak = 0;
+	int leak = 0, room = 0;
 	size_t stream_size, ref_size;
 	uint8_t *stream, *ref;
 	struct rdnvd *d;
@@ -143,6 +144,8 @@ int main(int argc, char **argv)
 			out_path = argv[++a];
 		else if (!strcmp(argv[a], "-L") && a + 1 < argc)
 			leak = atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-R") && a + 1 < argc)
+			room = atoi(argv[++a]);
 		else if (!stream_path)
 			stream_path = argv[a];
 		else if (!ref_path)
@@ -179,6 +182,9 @@ int main(int argc, char **argv)
 	}
 	if (leak)
 		printf("%d sessions left open\n", leak);
+	for (a = 0; a < room; a++)
+		if (!rdnvd_h264_room(d, 1280, 720))
+			fprintf(stderr, "uvdtest: no room for a 1280x720 decoder (ask %d)\n", a);
 	t0 = now_ms();
 	for (pass = 0; pass < count && !r; pass++) {
 		struct rdnvd_session *s = rdnvd_h264_open(d, NULL, 0, on_frame, &t, &nal_length_size);
