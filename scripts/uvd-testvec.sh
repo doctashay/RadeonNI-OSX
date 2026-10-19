@@ -2,14 +2,15 @@
 # Small H.264 test vectors for rdn_uvdtest: a synthetic test pattern as
 # Baseline (CAVLC, one slice per picture, I and P pictures, no B) and its
 # decode by ffmpeg.
-#   scripts/uvd-testvec.sh <outdir> [width height frames [refs [cabac]]]
+#   scripts/uvd-testvec.sh <outdir> [width height frames [refs [cabac [profile]]]]
 # Writes <outdir>/t.h264 and <outdir>/t.yuv (yuv420p, all the pictures).
-# With "cabac" 1 the stream is Main profile (CABAC) instead.
+# With "cabac" 1 the stream is Main profile (CABAC) instead, with a profile
+# name (high) that profile, the 8x8 transform included.
 #
 # Copyright (c) 2026 kouta-kun and Claude
 # SPDX-License-Identifier: MIT
 set -e
-out=${1:?usage: uvd-testvec.sh <outdir> [width height frames [refs [cabac]]]}
+out=${1:?usage: uvd-testvec.sh <outdir> [width height frames [refs [cabac [profile]]]]}
 w=${2:-128}
 h=${3:-96}
 frames=${4:-1}
@@ -17,6 +18,7 @@ refs=${5:-1}
 cabac=${6:-0}
 profile=baseline
 [ "$cabac" = 1 ] && profile=main
+profile=${7:-$profile}
 mkdir -p "$out"
 ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=${w}x${h}:rate=25" -frames:v "$frames" \
     -pix_fmt yuv420p -c:v libx264 -profile:v $profile \

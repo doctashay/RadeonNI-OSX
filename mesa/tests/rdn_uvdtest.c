@@ -391,7 +391,7 @@ int main(int argc, char **argv)
 	const void *buffers[2];
 	unsigned sizes[2];
 	unsigned long total_bad = 0;
-	double t0;
+	double t0, t_pic, decode_ms = 0;
 	FILE *out = NULL;
 	int a;
 
@@ -595,6 +595,7 @@ int main(int argc, char **argv)
 			sizes[0] = sizeof(start_code);
 			buffers[1] = sl->nal;
 			sizes[1] = sl->size;
+			t_pic = now_ms();
 			codec->begin_frame(codec, target, &desc.base);
 			codec->decode_bitstream(codec, target, &desc.base, 2, buffers, sizes);
 			if (codec->end_frame(codec, target, &desc.base)) {
@@ -605,6 +606,7 @@ int main(int argc, char **argv)
 				fprintf(stderr, "uvdtest: the decoder did not finish in 5 s (picture %u)\n", pic);
 				return 1;
 			}
+			decode_ms += now_ms() - t_pic;
 			bad = compare(screen, target, ref + (size_t)pic * frame_bytes, width, height, crop, out_w, out_h,
 				      pass == count - 1 ? out : NULL, &first);
 			if (bad == (unsigned long)-1)
@@ -630,8 +632,9 @@ int main(int argc, char **argv)
 			}
 		}
 	}
-	printf("decoded %u pictures in %.1f ms (%.2f ms each)\n", count * num_slices, now_ms() - t0,
-	       (now_ms() - t0) / (count * num_slices));
+	printf("decoded %u pictures: %.2f ms each from begin_frame to the fence (%.0f pictures a second), "
+	       "%.1f s in all with the comparison\n", count * num_slices, decode_ms / (count * num_slices),
+	       1000.0 * count * num_slices / decode_ms, (now_ms() - t0) / 1000.0);
 	printf("%s\n", total_bad ? "FAIL: the card's pictures differ from ffmpeg's" : "PASS: every picture identical to ffmpeg's");
 	if (out)
 		fclose(out);
