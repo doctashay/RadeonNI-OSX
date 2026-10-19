@@ -93,6 +93,23 @@ static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags fl
 				}
 			}
 		}
+		if (getenv("QTDECODE_DUMP") && gFrames == 0) {
+			const unsigned char *base = CVPixelBufferGetBaseAddress(pb);
+
+			fprintf(stderr, "bytes per row %lu; first 16 bytes of row 0:", (unsigned long)CVPixelBufferGetBytesPerRow(pb));
+			for (x = 0; x < 16; x++)
+				fprintf(stderr, " %02x", base[x]);
+			fprintf(stderr, "\n row 0 of the reference (luma):");
+			for (x = 0; x < 8; x++)
+				fprintf(stderr, " %02x", ry[x]);
+			fprintf(stderr, "; u:");
+			for (x = 0; x < 4; x++)
+				fprintf(stderr, " %02x", ru[x]);
+			fprintf(stderr, "; v:");
+			for (x = 0; x < 4; x++)
+				fprintf(stderr, " %02x", rv[x]);
+			fprintf(stderr, "\n");
+		}
 		CVPixelBufferUnlockBaseAddress(pb, 0);
 		bad = bad_y + bad_c + bad_r;
 		if (bad) {
