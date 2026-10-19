@@ -7344,3 +7344,20 @@ Built, installed on the G5, not yet loaded (needs a restart): `rdn_uvd_set_reset
 and a reset asked for by a program within 20 s of its previous one is level 2: also `SOFT_RESET_UVD` in `SRBM_SOFT_RESET` (what
 evergreen_gpu_soft_reset() does for a UVD that hung). The log says "UVD restarted (epoch N, reset level L)". Old binary:
 `RadeonNI.before-resetlevels-202610191433`. The test: a Player run (open, 5 s, play); if the decoder stalls, do the tries revive it, and at which level?
+
+## 2026-10-19 (evening, after the first restart with reset levels): level 2 kills the decoder, Player crashed in my library, a store barrier is missing
+
+The user said to restart the G5 myself and it was done (`shutdown -r now` went through this time). Healthy baseline after boot: `rdn_uvdtest` 60 of 60, with
+the kext's first restart "UVD restarted (epoch 1, reset level 1)" before it. Then Player (open, 5 s, play; debug log off):
+- the first decode of the movie was not answered, 250 ms, with the block restarted at the session's start (level 1) before it; the library's first
+  reset (level 1) did not help either (replayed picture 1 unanswered); the second reset, 8 s later by the 20 s rule, was level 2
+  (SOFT_RESET_UVD in SRBM_SOFT_RESET after the sub-block reset): the VCPU did not boot afterwards ("uvd not responding (status 0x00000000)", the
+  kext logs a register dump and "UVD did not start again (-5)"), and the decoder was down until the next restart. Level 2 is removed.
+- QuickTime Player crashed (SIGBUS in `finish_picture`, from `rdnvd_h264_decode_au`): my `recover()` freed the parser before the reset call and a failed
+  reset returned with `s->parser == NULL`; the next access unit used it. Fixed: the reset comes first and the new parser replaces the old only
+  when it exists.
+- Idea behind the next build: the card's video memory window is mapped write-combining (`rdn_device_darwin.c`, "uncached without the guard bit"),
+  and the doorbell goes through the kext's `eieio`-ordered register writes; on PowerPC `eieio` does not order stores to non-guarded
+  cache-inhibited memory, `sync` does. The 3D path has lived with that, but the decoder reads its command stream, the decode message and the
+  bitstream the moment the doorbell rings, and a stale read of any of them could wedge it (load makes the window wider). Built: `__sync_synchronize()` in the winsys
+  just before the kext call, `sync` in the kext before each UVD doorbell (`rdnStoreBarrier()`), both for decode streams and the kext's own destroy messages.
