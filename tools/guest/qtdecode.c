@@ -1,0 +1,274 @@
+/*
+ * qtdecode: decode the first video track of an H.264 movie through QuickTime's Image Compression Manager
+ * (ICMDecompressionSession, as QuickTime Player's own decoding goes) into packed 4:2:2 ('2vuy') pixel
+ * buffers and compare every picture, in display order, with ffmpeg's decode of the same stream (yuv420p).
+ * Nothing is shown on the screen.
+ *
+ *   qtdecode movie.mp4 reference.yuv [-c RadeonNIAVC.component] [-a]
+ *
+ * -c  registers that component for this program only (nothing is installed) and makes the session use it;
+ * -a  makes it use Apple's own H.264 decoder (a control: the program's own checks must pass with it too);
+ * neither: QuickTime's choice, so what an installed component does to a program that knows nothing of it.
+ * Chroma of 4:2:2 is compared with the 4:2:0 reference at its own rows (the two luma rows a chroma row
+ * serves must carry the same chroma: that is how the component draws).
+ * Builds on the G5 (its Xcode):
+ *   gcc-4.0 -arch ppc -isysroot /Developer/SDKs/MacOSX10.4u.sdk -mmacosx-version-min=10.4 -o qtdecode qtdecode.c \
+ *       -framework QuickTime -framework CoreServices -framework CoreVideo -framework CoreFoundation
+ *
+ * Copyright (c) 2026 kouta-kun and Claude
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <QuickTime/QuickTime.h>
+#include <CoreServices/CoreServices.h>
+#include <CoreVideo/CoreVideo.h>
+
+static const unsigned char *gRef;
+static size_t gRefSize;
+static unsigned gFrames, gBad, gWidth, gHeight;
+static unsigned gErrors;
+static double gT0;
+
+static double now_ms(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+static void emit(void *refcon, OSStatus result, ICMDecompressionTrackingFlags flags, CVPixelBufferRef pb,
+		 TimeValue64 displayTime, TimeValue64 displayDuration, ICMValidTimeFlags validTime, void *reserved,
+		 void *sourceFrameRefCon)
+{
+	if (result) {
+		gErrors++;
+		fprintf(stderr, "tracking callback: error %ld\n", (long)result);
+		return;
+	}
+	if ((flags & kICMDecompressionTracking_EmittingFrame) && pb) {
+		unsigned w = gWidth, h = gHeight, x, row;
+		size_t frame_bytes = (size_t)w * h * 3 / 2;
+		const unsigned char *ry, *ru, *rv;
+		unsigned long bad = 0;
+		OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+
+		if ((size_t)(gFrames + 1) * frame_bytes > gRefSize) {
+			gFrames++;
+			gBad++;
+			return;
+		}
+		ry = gRef + (size_t)gFrames * frame_bytes;
+		ru = ry + (size_t)w * h;
+		rv = ru + (size_t)w * h / 4;
+		if (fmt != k422YpCbCr8PixelFormat || CVPixelBufferGetWidth(pb) != w || CVPixelBufferGetHeight(pb) != h) {
+			fprintf(stderr, "picture %u: pixel format %.4s %lux%lu\n", gFrames, (char *)&fmt,
+				(unsigned long)CVPixelBufferGetWidth(pb), (unsigned long)CVPixelBufferGetHeight(pb));
+			gBad++;
+			gFrames++;
+			return;
+		}
+		CVPixelBufferLockBaseAddress(pb, 0);
+		{
+			const unsigned char *base = CVPixelBufferGetBaseAddress(pb);
+			size_t rb = CVPixelBufferGetBytesPerRow(pb);
+
+			for (row = 0; row < h; row++) {
+				const unsigned char *p = base + row * rb;
+				const unsigned char *pe = base + (row & ~1u) * rb;	/* the even row of its pair */
+
+				for (x = 0; x < w / 2; x++) {
+					unsigned u = p[4 * x], y0 = p[4 * x + 1], v = p[4 * x + 2], y1 = p[4 * x + 3];
+
+					bad += y0 != ry[row * w + 2 * x] || y1 != ry[row * w + 2 * x + 1];
+					bad += u != ru[(row / 2) * (w / 2) + x] || v != rv[(row / 2) * (w / 2) + x];
+					bad += pe[4 * x] != u || pe[4 * x + 2] != v;	/* the pair of rows alike */
+				}
+			}
+		}
+		CVPixelBufferUnlockBaseAddress(pb, 0);
+		if (bad) {
+			if (gBad < 8)
+				printf("picture %u (display time %lld): %lu samples differ\n", gFrames,
+				       (long long)displayTime, bad);
+			gBad++;
+		}
+		gFrames++;
+	}
+}
+
+int main(int argc, char **argv)
+{
+	const char *movie_path = NULL, *ref_path = NULL, *component_path = NULL;
+	int force_apple = 0, a;
+	FILE *f;
+	long size;
+	unsigned char *ref;
+	Movie movie = NULL;
+	Track track;
+	Media media;
+	Handle dataRef = NULL, sd;
+	OSType dataRefType;
+	short resId = 0;
+	OSStatus err;
+	ICMDecompressionSessionRef session = NULL;
+	ICMDecompressionSessionOptionsRef options = NULL;
+	ICMDecompressionTrackingCallbackRecord cb = { emit, NULL };
+	CFMutableDictionaryRef attrs;
+	TimeValue64 decodeTime = 0, mediaDuration;
+	TimeScale scale;
+	ItemCount sdIndex, count;
+	unsigned char *buffer;
+	ByteCount maxSize = 4 << 20;
+	unsigned samples = 0;
+	CFStringRef path;
+
+	for (a = 1; a < argc; a++) {
+		if (!strcmp(argv[a], "-c") && a + 1 < argc)
+			component_path = argv[++a];
+		else if (!strcmp(argv[a], "-a"))
+			force_apple = 1;
+		else if (!movie_path)
+			movie_path = argv[a];
+		else if (!ref_path)
+			ref_path = argv[a];
+	}
+	if (!movie_path || !ref_path) {
+		fprintf(stderr, "usage: qtdecode movie.mp4 reference.yuv [-c component] [-a]\n");
+		return 2;
+	}
+	f = fopen(ref_path, "rb");
+	if (!f)
+		return 1;
+	fseek(f, 0, SEEK_END);
+	size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	ref = malloc(size);
+	if (!ref || fread(ref, 1, size, f) != (size_t)size)
+		return 1;
+	fclose(f);
+	gRef = ref;
+	gRefSize = size;
+
+	err = EnterMovies();
+	if (err) {
+		fprintf(stderr, "EnterMovies: %ld\n", (long)err);
+		return 1;
+	}
+
+	if (component_path) {
+		FSRef fsref;
+
+		if (FSPathMakeRef((const UInt8 *)component_path, &fsref, NULL) ||
+		    (err = RegisterComponentFileRef(&fsref, 0)) <= 0) {
+			fprintf(stderr, "cannot register %s (%ld)\n", component_path, (long)err);
+			return 1;
+		}
+	}
+
+	path = CFStringCreateWithCString(NULL, movie_path, kCFStringEncodingUTF8);
+	err = QTNewDataReferenceFromFullPathCFString(path, kQTNativeDefaultPathStyle, 0, &dataRef, &dataRefType);
+	if (!err)
+		err = NewMovieFromDataRef(&movie, newMovieActive, &resId, dataRef, dataRefType);
+	if (err || !movie) {
+		fprintf(stderr, "cannot open %s (%ld)\n", movie_path, (long)err);
+		return 1;
+	}
+	track = GetMovieIndTrackType(movie, 1, VideoMediaType, movieTrackMediaType);
+	if (!track) {
+		fprintf(stderr, "no video track\n");
+		return 1;
+	}
+	media = GetTrackMedia(track);
+	scale = GetMediaTimeScale(media);
+	mediaDuration = GetMediaDuration(media);
+	sd = NewHandle(0);
+	GetMediaSampleDescription(media, 1, (SampleDescriptionHandle)sd);
+	{
+		ImageDescriptionHandle desc = (ImageDescriptionHandle)sd;
+
+		gWidth = (**desc).width;
+		gHeight = (**desc).height;
+		printf("video track: '%.4s' %ux%u, %lu samples\n", (char *)&(**desc).cType, gWidth, gHeight,
+		       (unsigned long)GetMediaSampleCount(media));
+	}
+
+	ICMDecompressionSessionOptionsCreate(NULL, &options);
+	{
+		Boolean order = true;
+
+		ICMDecompressionSessionOptionsSetProperty(options, kQTPropertyClass_ICMDecompressionSessionOptions,
+							  kICMDecompressionSessionOptionsPropertyID_DisplayOrderRequired,
+							  sizeof(order), &order);
+	}
+	if (component_path || force_apple) {
+		ComponentDescription cd = { decompressorComponentType, 'avc1', component_path ? 'RdNI' : 'appl', 0, 0 };
+		Component c = FindNextComponent(NULL, &cd);
+
+		if (!c) {
+			fprintf(stderr, "no such decompressor\n");
+			return 1;
+		}
+		ICMDecompressionSessionOptionsSetProperty(options, kQTPropertyClass_ICMDecompressionSessionOptions,
+							  kICMDecompressionSessionOptionsPropertyID_DecompressorComponent,
+							  sizeof(c), &c);
+	}
+	attrs = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	{
+		SInt32 fmt = k422YpCbCr8PixelFormat, w = gWidth, h = gHeight;
+		CFNumberRef nf = CFNumberCreate(NULL, kCFNumberSInt32Type, &fmt);
+		CFNumberRef nw = CFNumberCreate(NULL, kCFNumberSInt32Type, &w);
+		CFNumberRef nh = CFNumberCreate(NULL, kCFNumberSInt32Type, &h);
+
+		CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, nf);
+		CFDictionarySetValue(attrs, kCVPixelBufferWidthKey, nw);
+		CFDictionarySetValue(attrs, kCVPixelBufferHeightKey, nh);
+	}
+	err = ICMDecompressionSessionCreate(NULL, (ImageDescriptionHandle)sd, options, attrs, &cb, &session);
+	if (err) {
+		fprintf(stderr, "ICMDecompressionSessionCreate: %ld\n", (long)err);
+		return 1;
+	}
+
+	buffer = malloc(maxSize);
+	gT0 = now_ms();
+	while (decodeTime < mediaDuration) {
+		ByteCount got = 0;
+		TimeValue64 sampleTime = 0, duration = 0, offset = 0;
+		MediaSampleFlags sflags = 0;
+		ICMFrameTimeRecord ft;
+		ItemCount n = 0;
+
+		err = GetMediaSample2(media, buffer, maxSize, &got, decodeTime, &sampleTime, &duration, &offset,
+				      (SampleDescriptionHandle)sd, &sdIndex, 1, &n, &sflags);
+		if (err || !n || !got)
+			break;
+		memset(&ft, 0, sizeof(ft));
+		ft.recordSize = sizeof(ft);
+		ft.scale = scale;
+		ft.rate = 0x00010000;
+		ft.duration = (long)duration;
+		ft.frameNumber = (long)samples + 1;
+		ft.value.hi = (SInt32)((sampleTime + offset) >> 32);
+		ft.value.lo = (UInt32)(sampleTime + offset);
+		ft.decodeTime = sampleTime;
+		ft.flags = icmFrameTimeIsNonScheduledDisplayTime | icmFrameTimeHasDecodeTime;
+		err = ICMDecompressionSessionDecodeFrame(session, buffer, got, NULL, &ft, NULL);
+		if (err) {
+			fprintf(stderr, "decode frame %u: %ld\n", samples, (long)err);
+			gErrors++;
+		}
+		samples++;
+		decodeTime = sampleTime + duration;
+	}
+	ICMDecompressionSessionFlush(session);
+	printf("%u samples fed, %u pictures out, %u wrong, %u errors, %.1f ms (%.2f ms a sample)\n", samples, gFrames,
+	       gBad, gErrors, now_ms() - gT0, samples ? (now_ms() - gT0) / samples : 0.0);
+	printf("%s\n", gBad || gErrors || gFrames != samples ? "FAIL" : "PASS: every picture identical to ffmpeg's");
+	ICMDecompressionSessionRelease(session);
+	return gBad || gErrors || gFrames != samples;
+}
