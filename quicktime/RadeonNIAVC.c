@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <unistd.h>
 
 #include "rdnvd.h"
 
@@ -33,6 +34,7 @@
 typedef struct {
 	struct rdnvd_frame *frame;	/* the sample's decoded picture, from DecodeBand until EndBand */
 	long dataSize;
+	long long display;		/* the display time QuickTime gave the sample, for the log */
 	long width, height;
 	Boolean decoded;
 	Boolean failed;
@@ -53,12 +55,14 @@ static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 static struct rdnvd *gDevice;
 static int gDeviceTried;
 
+/* Log every band: RDNAVC_DEBUG in the environment, or (for a program started from the Finder) the file /tmp/rdnavc.debug
+ * when the program starts using the component. */
 static int debug(void)
 {
 	static int on = -1;
 
 	if (on < 0)
-		on = getenv("RDNAVC_DEBUG") != NULL;
+		on = getenv("RDNAVC_DEBUG") != NULL || access("/tmp/rdnavc.debug", F_OK) == 0;
 	return on;
 }
 
@@ -366,6 +370,7 @@ pascal ComponentResult RDNAVC_BeginBand(RDNAVCGlobals *storage, CodecDecompressP
 	rec->failed = false;
 	/* already decoded: its display was cancelled and it is back */
 	rec->decoded = p->frameTime && (p->frameTime->flags & icmFrameAlreadyDecoded) != 0;
+	rec->display = p->frameTime ? (long long)p->frameTime->value.lo : -1LL;
 	drp->frameType = frame_type((const UInt8 *)drp->codecData, rec->dataSize, storage->nalLengthSize);
 	if (debug())
 		say("BeginBand: frame %ld display %lld decode %lld flags 0x%lx type %d size %ld already-decoded %d",
@@ -418,6 +423,23 @@ pascal ComponentResult RDNAVC_DrawBand(RDNAVCGlobals *storage, ImageSubCodecDeco
 		if (r) {
 			say("reading a picture out failed (%d)", r);
 			return codecErr;
+		}
+		if (debug()) {
+			/* what was written: a picture that is all zeros (green) was never decoded; the sum is compared with ffmpeg's
+			 * decode of the same stream by scripts/uvd-picsums.py */
+			long row, x;
+			unsigned long sum = 2166136261UL, zero = 0;
+
+			for (row = 0; row < rec->height; row++) {
+				const UInt8 *in = (const UInt8 *)drp->baseAddr + row * drp->rowBytes;
+
+				for (x = 0; x < rec->width * 2; x++) {
+					zero += in[x] == 0;
+					sum = (sum ^ in[x]) * 16777619UL;
+				}
+			}
+			say("DrawBand: display %lld picture %p sum %08lx zero %lu%%", rec->display, (void *)rec->frame,
+			    sum & 0xffffffffUL, zero * 100 / ((unsigned long)rec->width * 2 * rec->height));
 		}
 	} else {
 		/* no picture (the sample held none, or it is not one to start from): black */

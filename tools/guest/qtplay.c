@@ -4,11 +4,15 @@
  * threads) and check every picture that comes out against ffmpeg's decode of the same stream. Nothing is shown
  * on the screen. Pictures QuickTime does not ask for in time are simply not compared.
  *
- *   qtplay movie.mp4 reference.yuv [fps] [-s seconds]
+ *   qtplay movie.mp4 reference.yuv|- [fps] [-s seconds] [-v]
  *
  * reference.yuv is yuv420p at the movie's size, one picture per 1/fps second (25 by default); the picture at
  * movie time t is compared with number round(t * fps). The decompressor is whatever QuickTime chooses, so it
- * tests what an installed component does to a program that knows nothing of it. Builds on the G5:
+ * tests what an installed component does to a program that knows nothing of it. QuickTime converts the pixel
+ * buffers it hands out, so the comparison with the reference is not exact; -v lists every picture shown with how
+ * many of its bytes are zero (a picture the decoder never wrote is all zeros: green) and a checksum, which is
+ * enough to see by eye whether a static clip stays the same picture; "-" as the reference does only that. Builds
+ * on the G5:
  *   gcc-4.0 -arch ppc -isysroot /Developer/SDKs/MacOSX10.4u.sdk -mmacosx-version-min=10.4 -o qtplay qtplay.c \
  *       -framework QuickTime -framework CoreServices -framework CoreVideo -framework CoreFoundation
  *
@@ -38,7 +42,7 @@ int main(int argc, char **argv)
 {
 	const char *movie_path = NULL, *ref_path = NULL;
 	double fps = 25, limit = 0;
-	int a;
+	int a, verbose = 0;
 	FILE *f;
 	long size;
 	unsigned char *ref;
@@ -62,6 +66,8 @@ int main(int argc, char **argv)
 	for (a = 1; a < argc; a++) {
 		if (!strcmp(argv[a], "-s") && a + 1 < argc)
 			limit = atof(argv[++a]);
+		else if (!strcmp(argv[a], "-v"))
+			verbose = 1;
 		else if (!movie_path)
 			movie_path = argv[a];
 		else if (!ref_path)
@@ -73,16 +79,21 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: qtplay movie.mp4 reference.yuv [fps] [-s seconds]\n");
 		return 2;
 	}
-	f = fopen(ref_path, "rb");
-	if (!f)
-		return 1;
-	fseek(f, 0, SEEK_END);
-	size = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	ref = malloc(size);
-	if (!ref || fread(ref, 1, size, f) != (size_t)size)
-		return 1;
-	fclose(f);
+	if (strcmp(ref_path, "-")) {
+		f = fopen(ref_path, "rb");
+		if (!f)
+			return 1;
+		fseek(f, 0, SEEK_END);
+		size = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		ref = malloc(size);
+		if (!ref || fread(ref, 1, size, f) != (size_t)size)
+			return 1;
+		fclose(f);
+	} else {
+		ref = NULL;
+		size = 0;
+	}
 
 	if (EnterMovies())
 		return 1;
@@ -105,6 +116,8 @@ int main(int argc, char **argv)
 	duration = GetMovieDuration(movie);
 	printf("%ux%u, %.2f s, %lu pictures in the reference\n", w, h, (double)duration / scale,
 	       (unsigned long)(size / frame_bytes));
+	if (verbose && !ref)
+		printf("(no reference: listing only)\n");
 
 	attrs = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 	pbattrs = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -158,7 +171,26 @@ int main(int argc, char **argv)
 				}
 			}
 			shown++;
-			if (CVPixelBufferGetPixelFormatType(img) != k422YpCbCr8PixelFormat) {
+			if (verbose && CVPixelBufferGetPixelFormatType(img) == k422YpCbCr8PixelFormat) {
+				const unsigned char *base;
+				size_t rb = CVPixelBufferGetBytesPerRow(img), nz = 0, tot = 0, row, x;
+				unsigned long sum = 0;
+
+				CVPixelBufferLockBaseAddress(img, 0);
+				base = CVPixelBufferGetBaseAddress(img);
+				for (row = 0; row < CVPixelBufferGetHeight(img); row++)
+					for (x = 0; x < CVPixelBufferGetWidth(img) * 2; x++, tot++) {
+						unsigned char c = base[row * rb + x];
+
+						nz += c == 0;
+						sum = sum * 31 + c;
+					}
+				CVPixelBufferUnlockBaseAddress(img, 0);
+				printf("t %.3f  zero bytes %3lu%%  sum %08lx\n", t, (unsigned long)(nz * 100 / (tot ? tot : 1)), sum);
+			}
+			if (!ref) {
+				/* nothing to compare with */
+			} else if (CVPixelBufferGetPixelFormatType(img) != k422YpCbCr8PixelFormat) {
 				wrong_format++;
 			} else if (t >= 0) {
 				long n = (long)floor(t * fps + 0.5);
@@ -204,6 +236,8 @@ int main(int argc, char **argv)
 	}
 	printf("%u pictures shown in %.2f s (%u compared, %u wrong, %u wrong format)\n", shown, now_s() - t0, compared,
 	       bad, wrong_format);
+	if (!ref)
+		return 0;
 	printf("%s\n", bad || wrong_format || !compared ? "FAIL" : "PASS: every picture shown is identical to ffmpeg's");
 	return bad != 0 || wrong_format != 0 || !compared;
 }
