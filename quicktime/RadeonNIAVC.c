@@ -122,6 +122,9 @@ pascal ComponentResult RDNAVC_Open(RDNAVCGlobals *storage, ComponentInstance sel
 pascal ComponentResult RDNAVC_Close(RDNAVCGlobals *storage, ComponentInstance self)
 {
 	if (storage) {
+		if (debug())
+			say("Close: inst %p session %p prepared %d", (void *)storage, (void *)storage->session,
+			    (int)storage->prepared);
 		pthread_mutex_lock(&gLock);
 		if (storage->session)
 			rdnvd_h264_close(storage->session);
@@ -306,7 +309,7 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 	storage->width = (**desc).width;
 	storage->height = (**desc).height;
 	/* QuickTime opens several instances to ask about one movie: the decoder (100 MB of video memory) waits for the first picture */
-	say("taking a %ldx%ld stream (NAL length size %u)", storage->width, storage->height, nal);
+	say("taking a %ldx%ld stream (NAL length size %u) inst %p", storage->width, storage->height, nal, (void *)storage);
 
 	if (!storage->wantedPixelTypes) {
 		storage->wantedPixelTypes = (OSType **)NewHandleClear(2 * sizeof(OSType));
@@ -362,6 +365,8 @@ pascal ComponentResult RDNAVC_BeginBand(RDNAVCGlobals *storage, CodecDecompressP
 			return codecErr;
 		}
 		storage->prepared = true;
+		if (debug())
+			say("prepared: inst %p session %p", (void *)storage, (void *)storage->session);
 	}
 	rec->width = (**p->imageDescription).width;
 	rec->height = (**p->imageDescription).height;
@@ -373,7 +378,8 @@ pascal ComponentResult RDNAVC_BeginBand(RDNAVCGlobals *storage, CodecDecompressP
 	rec->display = p->frameTime ? (long long)p->frameTime->value.lo : -1LL;
 	drp->frameType = frame_type((const UInt8 *)drp->codecData, rec->dataSize, storage->nalLengthSize);
 	if (debug())
-		say("BeginBand: frame %ld display %lld decode %lld flags 0x%lx type %d size %ld already-decoded %d",
+		say("BeginBand: inst %p frame %ld display %lld decode %lld flags 0x%lx type %d size %ld already-decoded %d",
+		    (void *)storage,
 		    p->frameTime ? (long)p->frameTime->frameNumber : -1L,
 		    p->frameTime ? (long long)p->frameTime->value.lo : -1LL,
 		    p->frameTime ? (long long)p->frameTime->decodeTime : -1LL,
@@ -394,7 +400,7 @@ pascal ComponentResult RDNAVC_DecodeBand(RDNAVCGlobals *storage, ImageSubCodecDe
 	pthread_mutex_unlock(&gLock);
 	rec->decoded = true;
 	if (debug())
-		say("DecodeBand: result %d, picture %p", r, (void *)rec->frame);
+		say("DecodeBand: inst %p result %d, picture %p", (void *)storage, r, (void *)rec->frame);
 	if (r) {
 		rec->failed = true;
 		say("decoding a sample failed (%d)", r);
@@ -409,7 +415,7 @@ pascal ComponentResult RDNAVC_DrawBand(RDNAVCGlobals *storage, ImageSubCodecDeco
 	ComponentResult err = noErr;
 
 	if (debug())
-		say("DrawBand: decoded %d picture %p", (int)rec->decoded, (void *)rec->frame);
+		say("DrawBand: inst %p decoded %d picture %p", (void *)storage, (int)rec->decoded, (void *)rec->frame);
 	if (!rec->decoded)
 		err = RDNAVC_DecodeBand(storage, drp, 0);
 	if (err)
@@ -438,8 +444,8 @@ pascal ComponentResult RDNAVC_DrawBand(RDNAVCGlobals *storage, ImageSubCodecDeco
 					sum = (sum ^ in[x]) * 16777619UL;
 				}
 			}
-			say("DrawBand: display %lld picture %p sum %08lx zero %lu%%", rec->display, (void *)rec->frame,
-			    sum & 0xffffffffUL, zero * 100 / ((unsigned long)rec->width * 2 * rec->height));
+			say("DrawBand: display %lld picture %p sum %08lx zero %lu%% inst %p", rec->display, (void *)rec->frame,
+			    sum & 0xffffffffUL, zero * 100 / ((unsigned long)rec->width * 2 * rec->height), (void *)storage);
 		}
 	} else {
 		/* no picture (the sample held none, or it is not one to start from): black */
@@ -461,7 +467,7 @@ pascal ComponentResult RDNAVC_EndBand(RDNAVCGlobals *storage, ImageSubCodecDecom
 	RDNAVCDecompressRecord *rec = (RDNAVCDecompressRecord *)drp->userDecompressRecord;
 
 	if (debug())
-		say("EndBand: result %d picture %p", (int)result, (void *)rec->frame);
+		say("EndBand: inst %p result %d picture %p", (void *)storage, (int)result, (void *)rec->frame);
 	if (rec->frame) {
 		pthread_mutex_lock(&gLock);
 		rdnvd_frame_release(rec->frame);
