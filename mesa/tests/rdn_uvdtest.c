@@ -2,7 +2,7 @@
  * rdn_uvdtest: decode one H.264 picture on the card's video decoder (UVD)
  * through Mesa's pipe_video_codec and compare it with a reference.
  *
- *   rdn_uvdtest stream.h264 reference.yuv [-l level] [-o out.nv12]
+ *   rdn_uvdtest stream.h264 reference.yuv [-l level] [-n count] [-o out.nv12]
  *
  * stream.h264: Annex B with one SPS, one PPS and one IDR slice (4:2:0, 8
  * bits, CAVLC or CABAC, one slice group); scripts/uvd-testvec.sh makes
@@ -259,7 +259,7 @@ static double now_ms(void)
 int main(int argc, char **argv)
 {
 	const char *stream_path = NULL, *ref_path = NULL, *out_path = NULL;
-	unsigned level = 0;
+	unsigned level = 0, count = 1, n;
 	size_t stream_size, ref_size, i;
 	uint8_t *stream, *ref;
 	const uint8_t *sps_nal = NULL, *pps_nal = NULL, *slice_nal = NULL;
@@ -284,6 +284,8 @@ int main(int argc, char **argv)
 	for (a = 1; a < argc; a++) {
 		if (!strcmp(argv[a], "-l") && a + 1 < argc)
 			level = atoi(argv[++a]);
+		else if (!strcmp(argv[a], "-n") && a + 1 < argc)
+			count = atoi(argv[++a]);
 		else if (!strcmp(argv[a], "-o") && a + 1 < argc)
 			out_path = argv[++a];
 		else if (!stream_path)
@@ -292,7 +294,7 @@ int main(int argc, char **argv)
 			ref_path = argv[a];
 	}
 	if (!stream_path || !ref_path) {
-		fprintf(stderr, "usage: rdn_uvdtest stream.h264 reference.yuv [-l level] [-o out.nv12]\n");
+		fprintf(stderr, "usage: rdn_uvdtest stream.h264 reference.yuv [-l level] [-n count] [-o out.nv12]\n");
 		return 2;
 	}
 	stream = read_file(stream_path, &stream_size);
@@ -416,18 +418,22 @@ int main(int argc, char **argv)
 	buffers[1] = picture;
 	sizes[1] = slice_size;
 
+	/* With -n, the same picture again and again: every one has to come out right (checked below), and the rate is the decoder's. */
 	t0 = now_ms();
-	codec->begin_frame(codec, target, &desc.base);
-	codec->decode_bitstream(codec, target, &desc.base, 2, buffers, sizes);
-	if (codec->end_frame(codec, target, &desc.base)) {
-		fprintf(stderr, "uvdtest: end_frame failed\n");
-		return 1;
+	for (n = 0; n < count; n++) {
+		codec->begin_frame(codec, target, &desc.base);
+		codec->decode_bitstream(codec, target, &desc.base, 2, buffers, sizes);
+		if (codec->end_frame(codec, target, &desc.base)) {
+			fprintf(stderr, "uvdtest: end_frame failed\n");
+			return 1;
+		}
+		if (!fence || !codec->fence_wait(codec, fence, 5000ull * 1000 * 1000)) {
+			fprintf(stderr, "uvdtest: the decoder did not finish in 5 s (picture %u)\n", n);
+			return 1;
+		}
 	}
-	if (!fence || !codec->fence_wait(codec, fence, 5000ull * 1000 * 1000)) {
-		fprintf(stderr, "uvdtest: the decoder did not finish in 5 s\n");
-		return 1;
-	}
-	printf("decoded in %.1f ms\n", now_ms() - t0);
+	printf("decoded %u pictures in %.1f ms (%.2f ms each)\n", count, now_ms() - t0,
+	       (now_ms() - t0) / count);
 
 	target->get_resources(target, res);
 	{
