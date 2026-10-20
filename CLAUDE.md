@@ -9,8 +9,9 @@ loaded in every session. Detail lives in `docs/agents/` and `docs/`.
   by reading the code, `git log` or the docs: hard rules, safety, decisions
   settled by the user, pointers.
 - No dated history, results, measurements, per-feature switches, experiment
-  notes or "how X works". Those go in `docs/JOURNAL.md` (history) or the
-  matching `docs/agents/` file (current state).
+  notes or "how X works". Those go in `docs/JOURNAL.md` (history, written
+  once when a session's goal is fully achieved) or the matching
+  `docs/agents/` file (current state).
 - A new fact about a subject goes in that subject's `docs/agents/` file, not
   here. If it needs a new file, create one and add one line to the table
   below.
@@ -53,7 +54,7 @@ machine: Power Mac G5 Late 2005. Development runs Tiger under
 | Subject | File |
 |---|---|
 | Plan, milestones, what the user owes | `docs/PLAN.md` (read first, with the tail of `docs/JOURNAL.md`) |
-| Experiment log; append an entry for every experiment, negative ones too | `docs/JOURNAL.md` |
+| Experiment log; append one entry only when a session's goal is fully achieved (not per experiment, not for partial or in-progress work) | `docs/JOURNAL.md` |
 | Phase 1 state: kext, G5, DisplayPort, Open Firmware, guest, host | `docs/agents/platform-state.md` |
 | Phase 2 state: Mesa, GL bundle, extensions, speed, games, Core Image, GART | `docs/agents/accel-state.md` |
 | Scripts, build and run commands, guest and QEMU lifecycle | `docs/agents/commands.md` |
