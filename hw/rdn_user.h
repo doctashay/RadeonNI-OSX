@@ -44,7 +44,8 @@ enum {
 	 * height. Where the surface's picture is kept: a linear buffer of
 	 * 32-bit pixels, top row first, which the kext shows to whoever
 	 * locks the surface for reading (the window server). Width 0 takes
-	 * the buffer away again.
+	 * the buffer away again. Offset UINT32_MAX with the other fields zero
+	 * releases the registration, including an unattached reservation.
 	 */
 	RDN_UC_SURFACE_BUFFER,
 	/* struct out: struct rdn_user_surfaces, every surface with a buffer */
@@ -190,6 +191,10 @@ enum {
 	RDN_UC_UVD_SUBMIT_WORDS,
 	/* scalars in: address low/high words, byte length; out: GART offset. */
 	RDN_UC_GART_BIND64,
+	/* Surface backing metadata, restricted to its owning task. */
+	RDN_UC_SURFACE_BACKING,
+	/* scalar in: surface ID; out: metadata, with id 0 when absent. */
+	RDN_UC_SURFACE_QUERY,
 	RDN_UC_METHOD_COUNT
 };
 
@@ -202,6 +207,13 @@ enum {
 #define RDN_UC_UVD_F_SEGMENT		(1u << 18)
 #define RDN_UC_UVD_F_APERTURE		(1u << 19)
 #define RDN_UC_UVD_F_SPLIT		(1u << 31)
+struct rdn_user_backing {
+	uint32_t address_lo, address_hi, row_bytes, width, height;
+};
+
+struct rdn_user_surface_info {
+	uint32_t id, offset, row_bytes, width, height;
+};
 
 struct rdn_user_info {
 	uint32_t version;		/* RDN_USER_VERSION */
