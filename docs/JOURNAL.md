@@ -7390,7 +7390,7 @@ After the sync barrier build (kext + winsys) Player still failed at its first de
 
 A paced decode session (one session, `rdn_uvdtest -A -P 400`, recovery off, so nothing of ours restarts the block) with winprobe.app started in the
 background (`open -g`, harmless) and then brought to the front by AppleScript (`activate`): the pictures go wrong one second after the first `activate`
-(three runs, same place: au 42 at 17:57:05 and 17:06:51; a fresh process afterwards fails). With the Dock-less, menu-less bundle (LSUIElement) activating it
+(three runs, same place: au 42 at 16:57:05 and 17:06:51; a fresh process afterwards fails). With the Dock-less, menu-less bundle (LSUIElement) activating it
 did nothing, activating Finder one second later broke the decoder. So the trigger is the frontmost (menu bar owning) application changing: a normal launch
 of any application (Calculator, TextEdit, QuickTime Player, winprobe.app), an AppleScript `activate` of one, or a switch back to Finder. Not triggers: windows,
 GL windows, a shell-started program with a window, a background launch, a UIElement application.
