@@ -210,6 +210,8 @@ private:
 	UInt32 fUvdIbBase, fUvdIbNext;
 	/* The fence number to go on from when the block is started in the other place. */
 	UInt32 fUvdModeFenceBase;
+	/* How the next start of the block resets it: 0 for the first start, fUvdRestartBits when it moves between the aperture and a segment (the RLC runs already). */
+	UInt32 fUvdStartLevel;
 	UInt32 fUvdIbFence[kUvdIbSlots];
 	UInt32 uvdPickSegment(UInt32 force);
 	void uvdSegmentFree(void);

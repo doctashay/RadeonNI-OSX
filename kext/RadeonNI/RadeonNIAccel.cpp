@@ -732,6 +732,8 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 		fUvdDirty = false;
 		fUvdEpoch++;
 		fUvdModeFenceBase = fenceBase;
+		/* the RLC runs since the first start: loading it again breaks the decoder (docs/UVD.md), as it does at a restart */
+		fUvdStartLevel = fUvdRestartBits;
 	}
 	if (fUvdUp) {
 		*status = rdn_rreg(fAccel.card, 0xf6bc);
@@ -871,8 +873,11 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	IOLockLock(fLock);
 	if (flags & RDN_UVD_F_BLANK)
 		rdn_display_hold(fAccel.card, true);
+	rdn_uvd_set_reset_level(fUvdStartLevel);
 	r = rdn_uvd_init(&fUvd, &fAccel, ref, (const uint8_t *)fw, fwSize,
 			 RDN_UVD_DEFAULT_HANDLES, vcpuOff, ringOff, 4096, flags);
+	rdn_uvd_set_reset_level(0);
+	fUvdStartLevel = 0;
 	if (flags & RDN_UVD_F_BLANK)
 		rdn_display_hold(fAccel.card, false);
 	*status = rdn_rreg(fAccel.card, 0xf6bc);
@@ -1074,8 +1079,11 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, UInt32 force, const void *
 	IOLog("RadeonNI: UVD: firmware %lu bytes, in segment %lu of video memory (0x%lx), VCPU region at 0x%lx, ring at 0x%lx, reference clock %lu0 kHz; starting\n",
 	      (unsigned long)fwSize, (unsigned long)seg, (unsigned long)fUvdSegLo, (unsigned long)fUvdOwn[0].offset,
 	      (unsigned long)fUvdOwn[1].offset, (unsigned long)ref);
+	rdn_uvd_set_reset_level(fUvdStartLevel);
 	r = rdn_uvd_init_window(&fUvd, &fAccel, ref, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
 				fUvdVcpuShadow, fUvdOwn[0].offset, fUvdRingShadow, fUvdOwn[1].offset, 4096, flags);
+	rdn_uvd_set_reset_level(0);
+	fUvdStartLevel = 0;
 	*status = rdn_rreg(fAccel.card, 0xf6bc);
 	if (r) {
 		IOLog("RadeonNI: UVD did not start in the segment (%d), UVD_STATUS 0x%08lx\n", r, (unsigned long)*status);
