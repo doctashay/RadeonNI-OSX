@@ -7521,3 +7521,21 @@ The user asked why the window server and Quartz Extreme take 124 MB of the visib
   firmware window, ring, messages, bitstream, DPB and pictures must all be in it. The earlier "hidden memory does not work" test moved the picture buffer alone into another segment. Pointing the whole decoder at the
   second 256 MB (hidden, empty) was never tried; the CPU could not write the bitstream and messages there, so they would go through the GART or the aperture and a GPU copy (`hw/rdn_blit.c`), and read-out could be a GPU copy
   to system memory instead of CPU reads through the aperture. Idea only; a wrong segment setting has wedged the block before.
+
+## 2026-10-20 (night, later): the decoder in a hidden segment, built; waiting for the G5 to restart with the new kext
+
+The user asked to try the decoder in the video memory beyond the aperture, with allocation that picks another segment when one is in use. Design in `docs/UVD.md` ("The decoder in a hidden 256 MB segment").
+Written, all behind a switch that is off by default (the aperture start is unchanged):
+- `hw/rdn_uvd.c`: video memory through the register window (`rdn_vram_put`/`get`: `MM_INDEX` | 0x80000000 and `MM_DATA`, as Linux's `radeon_ttm_vram_read/write`), `rdn_uvd_init_window` (firmware region and ring are copies in system
+  memory, pushed to video memory; the fence word is read back through the window), the segment written to `UVD_LMI_ADDR_EXT`. `hw/rdn_mem.c`: allocation inside a range. `tests/uvd_model.c` runs the block in segment 1 through a model of the window
+  (and its fence protocol was the old one: fixed); `make test` passes natively and under qemu-ppc.
+- Kext: `RDN_UVD_F_SEGMENT` picks the hidden segment with the most room (at least 96 MB in one piece, the highest on a tie) and puts the firmware window, ring, scratch page and 16 indirect-buffer slots in it; new methods `RDN_UC_UVD_SEGMENT`,
+  `RDN_UC_ALLOC_UVD`, `RDN_UC_VRAM_PUT/GET` (16 KB pieces, bounds-checked, outside the block's own blocks), `RDN_UC_UVD_SUBMIT_WORDS` (the stream by value); ordinary hidden allocations avoid the segment while the rest has room; an idle block can be
+  moved between the aperture and a segment with `RDN_UVD_F_SEGMENT` / `RDN_UVD_F_APERTURE` in `RDN_UC_UVD_INIT` (for A/B tests, fence numbers go on).
+- Winsys: place `RDN_SEGMENT` for shareable buffers of a program that called `rdn_winsys_set_video` (rdnvd does), CPU maps give a copy in system memory, the decoder stream's flush uploads the dirty copies (the message whole, the bitstream as far
+  as `bsd_size`, word 22 of the message), clears the feedback counter in video memory and submits the words; `rdn_winsys_uvd_answered` reads the feedback with `vram_get`. The program asks for it with `RDN_UVD_SEGMENT=1` or the file
+  `/Library/Application Support/RadeonNI/uvd-segment`; the kext's mode is the mode for everyone once the block is up.
+- Builds: the Leopard kext (`scripts/leopard.sh build`, 587 undefined symbols, all known to Leopard), `rdn_uvdtest` and `librdnvd.dylib` for Darwin. On the G5: `~/seg/` has `rdn_uvdtest`, vectors (i, p, cabac, high, b at 128x96, p720) and the kext binary; the new kext binary is
+  INSTALLED (old one: `RadeonNI.kext/Contents/RadeonNI.before-segment-202610200742`) but the G5 has not been restarted, so the running kext is the old one. The restart was refused by the permission system here and left to the user.
+- Not done yet, in this order: first segment-mode run with the one-picture vector, then the vector suite and 720p, then speed (the bulk of the bitstream still goes through the register window; the plan is the command processor's DMA from a buffer behind the
+  GART), then the QuickTime component, then re-picking the segment when it is full.
