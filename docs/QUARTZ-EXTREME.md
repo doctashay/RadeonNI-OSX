@@ -27,9 +27,7 @@ debugger attached to `WindowServer` (`sudo gdb -p`), the bundle's log
    next to those flags. The kext publishes 2.
 3. **Video memory [V].** The framebuffer's VRAM range must be at least
    `GLCompositorMinimumVRAM` (16 MB). The kext reported 8 MB (the screen's
-   surfaces); with the accelerator on it now reports the first 31 MB of the aperture
-   (up to the cursor's picture; the rest is the kext's: the accelerator's heap, the decoder's
-   memory). It reported the whole aperture until 2026-10-19.
+   surfaces); with the accelerator on it now reports the whole aperture.
 4. **The accelerator [V].** Found through the framebuffer's `IOAccelTypes`
    path (`IOAccelFindAccelerator`); must conform to `IOAccelerator`.
 5. **`AccelCaps` [V]**, a 4-byte property of the accelerator. VMsvga2
