@@ -1051,7 +1051,8 @@ int RadeonNIAccel::dmaPut(UInt32 offset, const void *src, UInt32 bytes)
 	tail = bytes & 3;
 	bytes -= tail;
 	while (bytes) {
-		UInt32 n = bytes < fDmaBytes ? bytes : fDmaBytes, seq = 0;
+		UInt32 n = bytes < fDmaBytes ? bytes : fDmaBytes;
+		uint32_t seq = 0;
 
 		bcopy(p, fDmaCpu, n);
 		rdnStoreBarrier();
