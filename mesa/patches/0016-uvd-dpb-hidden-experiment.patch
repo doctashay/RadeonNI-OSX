@@ -1,0 +1,70 @@
+--- a/src/gallium/drivers/r600/radeon_video.c
++++ b/src/gallium/drivers/r600/radeon_video.c
+@@ -51,6 +51,29 @@
+ 	return buffer->res != NULL;
+ }
+ 
++/* osx-gpu: as rvid_create_buffer, in video memory the CPU cannot map (see radeon_video.h) */
++bool rvid_create_hidden_buffer(struct pipe_screen *screen, struct rvid_buffer *buffer,
++			       unsigned size)
++{
++	struct pipe_resource templ;
++
++	memset(buffer, 0, sizeof(*buffer));
++	buffer->usage = PIPE_USAGE_DEFAULT;
++	memset(&templ, 0, sizeof(templ));
++	templ.target = PIPE_BUFFER;
++	templ.format = PIPE_FORMAT_R8_UNORM;
++	templ.bind = PIPE_BIND_SHARED;
++	templ.usage = PIPE_USAGE_DEFAULT;
++	templ.flags = R600_RESOURCE_FLAG_UNMAPPABLE;
++	templ.width0 = size;
++	templ.height0 = 1;
++	templ.depth0 = 1;
++	templ.array_size = 1;
++	buffer->res = r600_as_resource(screen->resource_create(screen, &templ));
++
++	return buffer->res != NULL;
++}
++
+ /* destroy a buffer */
+ void rvid_destroy_buffer(struct rvid_buffer *buffer)
+ {
+--- a/src/gallium/drivers/r600/radeon_video.h
++++ b/src/gallium/drivers/r600/radeon_video.h
+@@ -28,6 +28,13 @@
+ bool rvid_create_buffer(struct pipe_screen *screen, struct rvid_buffer *buffer,
+ 			unsigned size, unsigned usage);
+ 
++/*
++ * osx-gpu: a buffer only the video engine and the command processor touch (the decoder's picture
++ * buffer): in video memory the CPU cannot reach, so that it does not use the aperture's share.
++ */
++bool rvid_create_hidden_buffer(struct pipe_screen *screen, struct rvid_buffer *buffer,
++			       unsigned size);
++
+ /* destroy a buffer */
+ void rvid_destroy_buffer(struct rvid_buffer *buffer);
+ 
+--- a/src/gallium/drivers/r600/radeon_uvd.c
++++ b/src/gallium/drivers/r600/radeon_uvd.c
+@@ -10,6 +10,7 @@
+ #include <errno.h>
+ #include <unistd.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "pipe/p_video_codec.h"
+ 
+@@ -1059,7 +1060,10 @@
+ 
+ 	dpb_size = calc_dpb_size(dec);
+ 	if (dpb_size) {
+-		if (!rvid_create_buffer(dec->screen, &dec->dpb, dpb_size, PIPE_USAGE_DEFAULT)) {
++		/* osx-gpu (experiment): RDN_UVD_DPB_HIDDEN=1 puts it in the video memory beyond the aperture */
++		if (!(getenv("RDN_UVD_DPB_HIDDEN") ?
++		      rvid_create_hidden_buffer(dec->screen, &dec->dpb, dpb_size) :
++		      rvid_create_buffer(dec->screen, &dec->dpb, dpb_size, PIPE_USAGE_DEFAULT))) {
+ 			RVID_ERR("Can't allocated dpb.\n");
+ 			goto error;
+ 		}

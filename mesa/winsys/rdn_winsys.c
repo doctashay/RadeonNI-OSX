@@ -491,7 +491,20 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
    }
    ws->mem_stats.creates++;
    if (r && want == RDN_HIDDEN) {
+      /*
+       * Debugging (docs/UVD.md, the decoder's second segment): RDN_HIDDEN_FILL_MB=n puts the next hidden buffer of 256 KB or
+       * more n MB further into the hidden memory, by allocating that much first and giving it back after.
+       */
+      const char *fill = getenv("RDN_HIDDEN_FILL_MB");
+      uint64_t filler = 0;
+      bool filled = false;
+
+      if (fill && size >= (256 << 10) &&
+          !ws->dev->alloc_hidden(ws->dev, (uint64_t)atoi(fill) << 20, 4096, &filler))
+         filled = true;
       r = ws->dev->alloc_hidden(ws->dev, size, alignment, &bo->offset);
+      if (filled)
+         ws->dev->free(ws->dev, filler);
       if (!r)
          bo->region = RDN_HIDDEN;
    }
