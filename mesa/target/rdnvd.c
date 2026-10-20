@@ -89,6 +89,13 @@ struct rdnvd_session {
 
 /* ---- surfaces ---------------------------------------------------------------- */
 
+/* Memory the winsys kept of buffers that were let go goes back to the kext, where the next decoder (here or in another program) can have it. */
+static void trim_cache(struct rdnvd *d)
+{
+	if (d && d->screen)
+		rdn_winsys_trim(((struct r600_common_screen *)d->screen)->ws);
+}
+
 static void frame_destroy(struct frame_buf *f)
 {
 	if (f->buf)
@@ -153,7 +160,14 @@ static void frame_unref(struct frame_buf *f)
 	}
 	if (s)
 		frame_unlink(s, f);
-	frame_destroy(f);
+	{
+		struct rdnvd *d = f->d;
+
+		frame_destroy(f);
+		/* the picture of a closed session: nobody will ask for its memory again */
+		if (!s)
+			trim_cache(d);
+	}
 }
 
 /* ---- the decoder ---------------------------------------------------------------- */
@@ -170,19 +184,11 @@ static enum pipe_video_profile profile_for(const struct rdnvd_h264_sps *sps)
 	return PIPE_VIDEO_PROFILE_UNKNOWN;		/* Extended: data partitioning, SP/SI */
 }
 
-/* Memory the winsys kept of buffers that were let go goes back to the kext, where the next decoder (here or in another program) can have it. */
-static void trim_cache(struct rdnvd *d)
-{
-	if (d && d->screen)
-		rdn_winsys_trim(((struct r600_common_screen *)d->screen)->ws);
-}
-
 static void codec_close(struct rdnvd_session *s)
 {
 	if (s->codec) {
 		s->codec->destroy(s->codec);
 		s->codec = NULL;
-		trim_cache(s->d);
 	}
 	/* Buffers of the old sequence that nobody holds go now; held ones go when released. */
 	while (s->free) {
@@ -193,6 +199,8 @@ static void codec_close(struct rdnvd_session *s)
 		frame_destroy(f);
 	}
 	s->gen++;
+	/* what the winsys kept of them goes back to the kext, where the next decoder (here or in another program) can have it */
+	trim_cache(s->d);
 }
 
 /*
