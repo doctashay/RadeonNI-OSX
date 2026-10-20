@@ -3,7 +3,8 @@
  * application the way a user would (background launch, then activate, then wait for it to quit), and after each step says which 4 KB pages
  * of video memory changed and which of them lie in the video decoder's own memory (its firmware window, ring and scratch page). Nothing is written to the card.
  *
- *   vramdiff app.app          (the application must quit by itself, e.g. winprobe.app, whose window lasts 40 s)
+ *   vramdiff app.app          (the application must quit by itself, e.g. winprobe.app, whose window lasts 300 s, so quit it by AppleScript)
+ *   vramdiff -c 'command' from_kb to_kb      the pages of that range that change while the command runs (for instance a decode session)
  *
  * Builds on the G5 (IOKit only), with hw/rdn_user.h next to it:
  *   gcc-4.0 -arch ppc -isysroot /Developer/SDKs/MacOSX10.4u.sdk -mmacosx-version-min=10.4 -I. -o vramdiff vramdiff.c -framework IOKit -framework CoreFoundation
@@ -22,7 +23,7 @@
 
 #include "rdn_user.h"
 
-#define FROM		(16u << 20)
+static uint32_t from_off = 16u << 20;
 #define PAGE		4096u
 
 static volatile uint32_t *aperture;
@@ -34,7 +35,7 @@ static void snapshot(uint32_t *dst)
 	size_t i, words = span / 4;
 
 	for (i = 0; i < words; i++)
-		dst[i] = aperture[FROM / 4 + i];
+		dst[i] = aperture[from_off / 4 + i];
 }
 
 /* In the decoder's own memory: its firmware window and ring (two ranges from RDN_UC_UVD_INFO) and the page after the ring */
@@ -60,7 +61,7 @@ static void diff(const uint32_t *a, const uint32_t *b, const char *what)
 				differs = a[p * PAGE / 4 + w] != b[p * PAGE / 4 + w];
 		if (differs) {
 			changed++;
-			if (in_uvd(FROM + (uint32_t)(p * PAGE)))
+			if (in_uvd(from_off + (uint32_t)(p * PAGE)))
 				in++;
 			if (!open) {
 				open = 1;
@@ -69,9 +70,9 @@ static void diff(const uint32_t *a, const uint32_t *b, const char *what)
 			last = p;
 		} else if (open) {
 			if (shown++ < 40) {
-				uint32_t off = FROM + (uint32_t)(first * PAGE);
+				uint32_t off = from_off + (uint32_t)(first * PAGE);
 
-				printf("   0x%08x-0x%08x (%lu KB)%s  now: %08x %08x %08x %08x\n", off, FROM + (uint32_t)((last + 1) * PAGE) - 1,
+				printf("   0x%08x-0x%08x (%lu KB)%s  now: %08x %08x %08x %08x\n", off, from_off + (uint32_t)((last + 1) * PAGE) - 1,
 				       (unsigned long)((last - first + 1) * 4), in_uvd(off) ? "  IN THE DECODER'S MEMORY" : "",
 				       (unsigned)b[first * PAGE / 4], (unsigned)b[first * PAGE / 4 + 1], (unsigned)b[first * PAGE / 4 + 2],
 				       (unsigned)b[first * PAGE / 4 + 3]);
@@ -106,11 +107,28 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	aperture = (volatile uint32_t *)(uintptr_t)addr;
-	span = (size_t)len - FROM;
+	span = (size_t)len - from_off;
 	if (IOConnectMethodScalarIScalarO(conn, RDN_UC_UVD_INFO, 0, 3, &up, &vcpu, &ring))
 		up = 0;
 	printf("aperture %lu MB, watching from 16 MB; decoder %s (firmware window at 0x%x, ring at 0x%x)\n", (unsigned long)(len >> 20),
 	       up ? "up" : "not up", vcpu, ring);
+	if (argc >= 5 && !strcmp(argv[1], "-c")) {
+		/* a range, around one command */
+		from_off = (uint32_t)atoi(argv[3]) * 1024;
+		span = ((size_t)atoi(argv[4]) * 1024) - from_off;
+		a = malloc(span);
+		b = malloc(span);
+		if (!a || !b)
+			return 1;
+		snapshot(a);
+		snapshot(b);
+		diff(a, b, "control: nothing started");
+		snapshot(a);
+		system(argv[2]);
+		snapshot(b);
+		diff(a, b, argv[2]);
+		return 0;
+	}
 	a = malloc(span);
 	b = malloc(span);
 	if (!a || !b) {

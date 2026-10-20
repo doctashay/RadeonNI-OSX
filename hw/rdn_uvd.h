@@ -52,6 +52,7 @@
 #define RDN_UVD_F_SWAP2		(1 << 14)	/* test: copy the firmware with the 16-bit halves of each word exchanged (addr ^ 2) */
 #define RDN_UVD_F_BLANK		(1 << 15)	/* test (kext): the display controllers stop reading video memory while UVD starts */
 #define RDN_UVD_F_PLL		(1 << 16)	/* with MINIMAL: the clocks go up (Linux's 533/400 MHz) at the first command stream, rdn_uvd_wake(), and down at rdn_uvd_idle(); without it the block runs on the bypass clock */
+#define RDN_UVD_F_WINDOWS	(1 << 17)	/* with MINIMAL: also the heap and the stack/session windows of the VCPU's memory (uvd_v2_2_resume() writes all three); without them the firmware's heap and stack are at video memory address 0 */
 #define RDN_UVD_F_GART		(1 << 9)	/* (kext) the VCPU region and ring in GART memory: addresses with bits 32-39 zero */
 
 struct rdn_uvd {
