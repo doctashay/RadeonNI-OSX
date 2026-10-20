@@ -631,8 +631,8 @@ IOReturn RadeonNIAccel::allocVram(UInt32 size, UInt32 align, UInt32 *offset,
 	IOLockLock(fLock);
 	if (segment) {
 		/* the decoder's own 256 MB (docs/UVD.md) */
-		r = fUvdSeg ? rdn_mem_alloc_range(fUvdSegMem, size, align, fUvdSegLo, fUvdSegHi, &off) : -1;
-	} else if (hidden && fUvdSeg && fUvdSegMem == &fHidden) {
+		r = (fUvdSeg || fUvdSplit) ? rdn_mem_alloc_range(fUvdSegMem, size, align, fUvdSegLo, fUvdSegHi, &off) : -1;
+	} else if (hidden && (fUvdSeg || fUvdSplit) && fUvdSegMem == &fHidden) {
 		/* the segment is kept for the decoder while the rest of the hidden memory has room */
 		r = rdn_mem_alloc_range(&fHidden, size, align, fHiddenOffset, fUvdSegLo, &off);
 		if (r)
@@ -690,6 +690,7 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	 */
 	bool wantSegment = (flags & RDN_UVD_F_SEGMENT) != 0;
 	bool wantAperture = (flags & RDN_UVD_F_APERTURE) != 0;
+	bool wantSplit = (flags & RDN_UVD_F_SPLIT) != 0;
 
 	UInt32 force = (flags >> RDN_UVD_F_SEGMENT_AT) & 7;
 
@@ -701,7 +702,7 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	bool noDma = (flags & RDN_UVD_F_NO_DMA) != 0;
 
 	fUvdNoFlush = (flags & RDN_UVD_F_NO_FLUSH) != 0;
-	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24) | RDN_UVD_F_PUSH_APERTURE | RDN_UVD_F_NO_DMA | RDN_UVD_F_NO_FLUSH);
+	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24) | RDN_UVD_F_PUSH_APERTURE | RDN_UVD_F_NO_DMA | RDN_UVD_F_NO_FLUSH | RDN_UVD_F_SPLIT);
 	if (!flags)
 		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI | RDN_UVD_F_PLL | RDN_UVD_F_WINDOWS;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;
@@ -712,7 +713,9 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	int r;
 
 	IOLockLock(fLock);
-	if (fUvdUp && ((wantSegment && (!fUvdSeg || (force && force != fUvdSeg))) || (wantAperture && fUvdSeg)) &&
+	if (fUvdUp && (wantSegment || wantSplit || wantAperture) &&
+	    !(wantSegment ? fUvdSeg && (!force || force == fUvdSeg) :
+	      wantSplit ? fUvdSplit && (!force || force == fUvdSplit) : !fUvdSeg && !fUvdSplit) &&
 	    !fUvdUsers && !fUvdLive) {
 		/*
 		 * Asked for the other place and nothing runs: start again there. The fence numbers go on and the epoch changes,
@@ -720,8 +723,11 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 		 */
 		UInt32 fenceBase = fUvd.fence_emitted;
 
-		IOLog("RadeonNI: UVD: from %s to %s\n", fUvdSeg ? "a segment" : "the aperture", fUvdSeg ? "the aperture" : "a segment");
+		IOLog("RadeonNI: UVD: from %s to %s\n", fUvdSeg ? "a segment" : fUvdSplit ? "split mode" : "the aperture",
+		      wantSegment ? "a segment" : wantSplit ? "split mode" : "the aperture");
 		rdn_uvd_fini(&fUvd);
+		fUvdSplit = 0;
+		rdn_uvd_set_decode_segment(-1);
 		if (fUvdSeg) {
 			uvdSegmentFree();
 		} else {
@@ -849,6 +855,28 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 		return kIOReturnSuccess;
 	}
 
+	if (wantSplit && !wantSegment && ref && fHiddenSize) {
+		UInt32 seg;
+
+		(void)dmaStageUp();
+		IOLockLock(fLock);
+		seg = uvdPickSegment(force == 7 ? 0 : force);
+		if (seg) {
+			fUvdSplit = seg;
+			fUvdSegLo = seg << 28;
+			fUvdSegHi = fUvdSegLo + (1u << 28);
+			fUvdSegMem = &fHidden;
+			rdn_uvd_set_decode_segment((int)seg);
+			IOLog("RadeonNI: UVD: split mode: the firmware, ring and messages in the aperture, the decoder's buffers in segment %lu (0x%lx)\n",
+			      (unsigned long)seg, (unsigned long)fUvdSegLo);
+		} else {
+			rdn_uvd_set_decode_segment(-1);
+			IOLog("RadeonNI: UVD: split mode: no segment has room; in the aperture\n");
+		}
+		IOLockUnlock(fLock);
+	} else if (!wantSegment) {
+		rdn_uvd_set_decode_segment(-1);
+	}
 	if (wantSegment && ref && fHiddenSize) {
 		if (noDma || !dmaStageUp()) {
 			rdn_uvd_set_put_hook(0, 0);
@@ -896,6 +924,8 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 		IOLockUnlock(fLock);
 		IOLog("RadeonNI: UVD did not start (%d), UVD_STATUS 0x%08lx\n", r,
 		      (unsigned long)*status);
+		fUvdSplit = 0;
+		rdn_uvd_set_decode_segment(-1);
 		freeVram(vcpuOff);
 		freeVram(ringOff);
 		IOFree(fw, fwSize);
@@ -1175,7 +1205,7 @@ bool RadeonNIAccel::uvdSegmentCheck(UInt32 offset, UInt32 bytes)
 {
 	UInt32 i;
 
-	if (!fUvdSeg || offset < fUvdSegLo || (uint64_t)offset + bytes > fUvdSegHi || offset + bytes < offset)
+	if (!(fUvdSeg || fUvdSplit) || offset < fUvdSegLo || (uint64_t)offset + bytes > fUvdSegHi || offset + bytes < offset)
 		return false;
 	for (i = 0; i < kUvdOwn; i++)
 		if (fUvdOwn[i].size && offset < fUvdOwn[i].offset + fUvdOwn[i].size &&
@@ -1199,6 +1229,7 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, UInt32 force, const void *
 
 	if (!seg)
 		return kIOReturnNoMemory;
+	rdn_uvd_set_decode_segment(-1);
 	sizes[0] = vcpuBytes;
 	sizes[1] = 8192;			/* the ring (4096 bytes and its fence word) */
 	sizes[2] = 4096;			/* the scratch page */
@@ -1278,9 +1309,9 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, UInt32 force, const void *
 void RadeonNIAccel::uvdSegmentInfo(UInt32 *mode, UInt32 *first, UInt32 *size)
 {
 	IOLockLock(fLock);
-	*mode = fUvdUp && fUvdSeg ? 1 : 0;
-	*first = fUvdSeg ? fUvdSegLo : 0;
-	*size = fUvdSeg ? fUvdSegHi - fUvdSegLo : 0;
+	*mode = fUvdUp ? (fUvdSeg ? 1 : fUvdSplit ? 2 : 0) : 0;
+	*first = *mode ? fUvdSegLo : 0;
+	*size = *mode ? fUvdSegHi - fUvdSegLo : 0;
 	IOLockUnlock(fLock);
 }
 
@@ -1348,7 +1379,7 @@ IOReturn RadeonNIAccel::vramGet(task_t task, UInt32 offset, UInt32 address, UInt
 		return kIOReturnBadArgument;
 	IOLockLock(fLock);
 	/* reading the block's own memory is harmless, but the check is the same as for writing, less the own blocks */
-	ok = fUvdUp && fUvdSeg && offset >= fUvdSegLo && (uint64_t)offset + bytes <= fUvdSegHi && offset + bytes > offset;
+	ok = fUvdUp && (fUvdSeg || fUvdSplit) && offset >= fUvdSegLo && (uint64_t)offset + bytes <= fUvdSegHi && offset + bytes > offset;
 	IOLockUnlock(fLock);
 	if (!ok)
 		return kIOReturnBadArgument;
@@ -1365,7 +1396,7 @@ IOReturn RadeonNIAccel::vramGet(task_t task, UInt32 offset, UInt32 address, UInt
 		UInt32 n = bytes - done < kPiece ? bytes - done : kPiece;
 
 		IOLockLock(fLock);
-		if (!fUvdUp || !fUvdSeg || rdn_vram_get(fAccel.card, offset + done, piece, n))
+		if (!fUvdUp || !(fUvdSeg || fUvdSplit) || rdn_vram_get(fAccel.card, offset + done, piece, n))
 			ret = kIOReturnIOError;
 		IOLockUnlock(fLock);
 		if (ret == kIOReturnSuccess && memory->writeBytes(done, piece, n) != n)

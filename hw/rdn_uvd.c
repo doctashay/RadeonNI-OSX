@@ -550,13 +550,28 @@ void rdn_uvd_set_ext_nibbles(unsigned mask)
 	ext_nibbles = mask & 0xf;
 }
 
+/*
+ * Split mode (docs/UVD.md): the firmware window, ring, messages and feedback stay where the CPU writes them properly (the aperture), and
+ * the decoder's own buffers (reference pictures, output, and what else its other clients read) are in a segment beyond it: nibbles 1 and 2
+ * of UVD_LMI_ADDR_EXT name that one. -1: the same segment as the firmware.
+ */
+static int decode_segment = -1;
+
+void rdn_uvd_set_decode_segment(int segment)
+{
+	decode_segment = segment;
+}
+
 static uint32_t ext_value(uint32_t segment)
 {
 	uint32_t v = 0, i;
 
 	for (i = 0; i < 4; i++)
-		if (ext_nibbles & (1u << i))
-			v |= (segment & 0xf) << (4 * i);
+		if (ext_nibbles & (1u << i)) {
+			uint32_t n = (decode_segment >= 0 && (i == 1 || i == 2)) ? (uint32_t)decode_segment : segment;
+
+			v |= (n & 0xf) << (4 * i);
+		}
 	return v;
 }
 

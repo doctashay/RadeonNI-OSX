@@ -393,22 +393,25 @@ static int dev_uvd_submit(struct rdn_device *dev, uint64_t offset, uint32_t word
  * The decoder in a segment (docs/UVD.md). An older kext lacks RDN_UC_UVD_SEGMENT: then the flag is not sent (it would
  * select a start variant) and the decoder is in the aperture.
  */
-static int dev_uvd_start(struct rdn_device *dev, bool want_segment, uint64_t *first, uint64_t *size)
+static int dev_uvd_start(struct rdn_device *dev, int want, uint64_t *first, uint64_t *size, bool *split)
 {
 	struct darwin_device *d = (struct darwin_device *)dev;
 	int up = 0, vcpu = 0, ring = 0, status = 0, mode = 0, f = 0, s = 0;
 	bool known = !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_SEGMENT, 0, 3, &mode, &f, &s);
 
 	*first = *size = 0;
+	*split = false;
 	if (!(!IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_INFO, 0, 3, &up, &vcpu, &ring) && up) &&
-	    IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_INIT, 1, 1, known && want_segment ? (int)RDN_UC_UVD_F_SEGMENT : 0,
-					  &status)) {
+	    IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_INIT, 1, 1,
+					  known && want == 1 ? (int)RDN_UC_UVD_F_SEGMENT :
+					  known && want == 2 ? (int)RDN_UC_UVD_F_SPLIT : 0, &status)) {
 		fprintf(stderr, "rdn: the video decoder did not start\n");
 		return -1;
 	}
 	if (known && !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_SEGMENT, 0, 3, &mode, &f, &s) && mode) {
 		*first = (uint32_t)f;
 		*size = (uint32_t)s;
+		*split = mode == 2;
 	}
 	return 0;
 }

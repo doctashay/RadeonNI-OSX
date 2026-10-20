@@ -199,7 +199,8 @@ private:
 	 * is in the aperture), [fUvdSegLo, fUvdSegHi) its bytes. The block's own memory (firmware window, ring,
 	 * scratch page, indirect buffer slots) is in it; the shadows are the library's system memory copies of the first two.
 	 */
-	UInt32 fUvdSeg, fUvdSegLo, fUvdSegHi;
+	/* fUvdSplit: the block runs in the aperture and the decoder's own buffers are in this hidden segment (split mode; fUvdSeg is 0 then). */
+	UInt32 fUvdSeg, fUvdSplit, fUvdSegLo, fUvdSegHi;
 	/* Where the segment's memory comes from (fHidden; fMem for segment 7, the aperture's own, a test), and dumps made of a stalled stream. */
 	struct rdn_mem *fUvdSegMem;
 	UInt32 fUvdDumps;

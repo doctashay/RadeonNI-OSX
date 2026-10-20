@@ -457,31 +457,33 @@ static void rdn_mem_stats_exit(void)
 }
 
 /*
- * The decoder in a segment of the video memory beyond the aperture (docs/UVD.md). While it is being tried it is on only when
- * asked for: RDN_UVD_SEGMENT=1 in the program's environment, or "1" in the file below. Whoever starts the decoder first
+ * The decoder and a segment of the video memory beyond the aperture (docs/UVD.md). While it is being tried it is on only when
+ * asked for: RDN_UVD_SEGMENT in the program's environment, or the file below, 1 for all of the decoder in the segment, 2 for "split". Whoever starts the decoder first
  * decides; after that the decoder's place is the kext's, whatever a later program asks.
  */
 #define RDN_UVD_SEGMENT_FILE "/Library/Application Support/RadeonNI/uvd-segment"
 
-static bool rdn_segment_wanted(void)
+static int rdn_segment_wanted(void)
 {
-   static int on = -1;
+   static int mode = -1;
 
-   if (on < 0) {
+   if (mode < 0) {
       const char *e = getenv("RDN_UVD_SEGMENT");
 
       if (e) {
-         on = atoi(e) != 0;
+         mode = atoi(e);
       } else {
          FILE *f = fopen(RDN_UVD_SEGMENT_FILE, "r");
          int c = f ? fgetc(f) : EOF;
 
          if (f)
             fclose(f);
-         on = c == '1';
+         mode = c == '1' ? 1 : c == '2' ? 2 : 0;
       }
+      if (mode < 0 || mode > 2)
+         mode = 0;
    }
-   return on;
+   return mode;
 }
 
 /* With the lock held: the decoder is started (once per process) in the place asked for, and where it runs is noted. */
@@ -491,11 +493,13 @@ static bool rdn_uvd_prepare(struct radeon_drm_winsys *ws)
       return true;
    if (ws->dev->uvd_start) {
       uint64_t first = 0, size = 0;
+      bool split = false;
 
-      if (ws->dev->uvd_start(ws->dev, rdn_segment_wanted(), &first, &size))
+      if (ws->dev->uvd_start(ws->dev, rdn_segment_wanted(), &first, &size, &split))
          return false;
-      ws->uvd_seg = size != 0 && ws->dev->uvd_alloc && ws->dev->vram_put && ws->dev->vram_get &&
+      ws->uvd_seg = size != 0 && !split && ws->dev->uvd_alloc && ws->dev->vram_put && ws->dev->vram_get &&
                     ws->dev->uvd_submit_words;
+      ws->uvd_split = size != 0 && split && ws->dev->uvd_alloc && ws->dev->vram_put && ws->dev->vram_get;
       ws->uvd_ready = true;
    } else {
       ws->uvd_ready = !ws->dev->uvd_init(ws->dev);
@@ -553,7 +557,7 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
     * decoder reads its messages from the 256 MB of video memory it lives in.
     */
    if (ws->video && !(flags & RADEON_FLAG_NO_INTERPROCESS_SHARING) && ws->dev->uvd_start &&
-       rdn_uvd_prepare(ws) && ws->uvd_seg)
+       rdn_uvd_prepare(ws) && (ws->uvd_seg || (ws->uvd_split && !(domain == RADEON_DOMAIN_GTT))))
       want = RDN_SEGMENT;
    else if ((flags & RADEON_FLAG_NO_CPU_ACCESS) && ws->dev->alloc_hidden)
       want = RDN_HIDDEN;
@@ -1330,6 +1334,29 @@ static uint32_t rdn_le32_at(const uint8_t *p)
 }
 
 /*
+ * Split mode: what the program wrote into the copies of the segment's buffers that the stream names goes to video memory (all of each; a
+ * stream names few of them and the CPU maps only what it fills). With the lock not held.
+ */
+static int rdn_uvd_upload_dirty(struct radeon_drm_winsys *ws, struct rdn_cs *cs)
+{
+   unsigned i;
+   int r = 0;
+
+   for (i = 0; i < cs->num_buffers && !r; i++) {
+      struct rdn_bo *bo = cs->buffers[i].bo;
+
+      if (bo->region != RDN_SEGMENT || !bo->dirty || !bo->shadow)
+         continue;
+      r = ws->dev->vram_put(ws->dev, bo->offset, bo->shadow, bo->base.size);
+      if (!r) {
+         bo->dirty = false;
+         bo->shadow_valid = false;
+      }
+   }
+   return r;
+}
+
+/*
  * Where in the decode message (little-endian words) the bitstream's length is, ruvd_msg.body.decode.bsd_size (radeon_uvd.h):
  * 4 words of header, stream_type, decode_flags, the two sizes, the reference buffer (4 words), the display buffer's
  * description (8 words), use_addr_macro, the bitstream's address and then its size.
@@ -1504,8 +1531,11 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
       }
       ib_size = align64(rcs->current.cdw * 4, 4096);
       simple_mtx_lock(&ws->lock);
+      /* Split mode: the segment's buffers the program filled go there first. */
+      r = ws->uvd_split ? rdn_uvd_upload_dirty(ws, cs) : 0;
       /* A decoder in a segment takes the stream by value (the kext keeps it in video memory itself). */
-      r = ws->uvd_seg ? 0 : rdn_ib_alloc(ws, ib_size, &offset);
+      if (!r)
+         r = ws->uvd_seg ? 0 : rdn_ib_alloc(ws, ib_size, &offset);
       if (!r && ws->uvd_seg) {
          r = rdn_uvd_segment_submit(ws, cs, rcs, &dbg, fence);
       } else if (!r) {
@@ -1517,7 +1547,8 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
             unsigned k3;
 
             for (k3 = 0; k3 < dbg.n; k3++)
-               if (dbg.cmd[k3] == 3 && dbg.bo[k3]->region != RDN_GART && dbg.bo[k3]->region != RDN_USER)
+               if (dbg.cmd[k3] == 3 && dbg.bo[k3]->region != RDN_GART && dbg.bo[k3]->region != RDN_USER &&
+                   dbg.bo[k3]->region != RDN_SEGMENT)
                   memset((uint8_t *)ws->dev->aperture + dbg.bo[k3]->offset + dbg.offset[k3] + 4, 0, 4);
          }
          memcpy((uint8_t *)ws->dev->aperture + offset, rcs->current.buf,
@@ -1546,7 +1577,8 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
             unsigned msg_off = 0, fb_off = 0, k2;
 
             for (k2 = 0; k2 < dbg.n; k2++) {
-               if (dbg.bo[k2]->region == RDN_GART || dbg.bo[k2]->region == RDN_USER)
+               if (dbg.bo[k2]->region == RDN_GART || dbg.bo[k2]->region == RDN_USER ||
+                   (dbg.bo[k2]->region == RDN_SEGMENT && !ws->uvd_seg))
                   continue;
                if (dbg.cmd[k2] == 0) {
                   msg = dbg.bo[k2];

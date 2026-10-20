@@ -140,16 +140,17 @@ struct rdn_device {
 
    /*
     * Optional: the decoder in a 256 MB segment of the video memory beyond the aperture (docs/UVD.md), where the CPU
-    * cannot reach it. uvd_start() starts the decoder unless it is up, asking for the segment with `want_segment`
-    * (a decoder that is up stays where it is), and says where it runs: *segment_first and *segment_size, the bytes
-    * of the segment as offsets in video memory, or both 0 for the aperture. In a segment, everything the decoder
-    * touches must be in it: uvd_alloc() is alloc_hidden() inside it (freed with free()); vram_put() and vram_get()
+    * cannot reach it. uvd_start() starts the decoder unless it is up, asking for the segment with `want` (1: all of
+    * it in the segment; 2: "split": the firmware, ring, messages and feedback stay in the aperture and only the buffers
+    * the decoder's other clients use go to the segment; 0: the aperture; a decoder that is up stays where it is), and
+    * says where it runs: *segment_first and *segment_size, the bytes of the segment as offsets in video memory, or
+    * both 0 for the aperture, and *split. In a segment (not split), everything the decoder touches must be in it: uvd_alloc() is alloc_hidden() inside it (freed with free()); vram_put() and vram_get()
     * copy bytes between the program's memory and video memory inside the segment, slowly; uvd_submit_words() runs
     * decoder command words given by value (instead of uvd_submit()'s offset in the aperture) and returns a fence.
     * All NULL when the device cannot.
     */
-   int (*uvd_start)(struct rdn_device *dev, bool want_segment, uint64_t *segment_first,
-                    uint64_t *segment_size);
+   int (*uvd_start)(struct rdn_device *dev, int want, uint64_t *segment_first,
+                    uint64_t *segment_size, bool *split);
    int (*uvd_alloc)(struct rdn_device *dev, uint64_t size, uint64_t align,
                     uint64_t *offset);
    int (*vram_put)(struct rdn_device *dev, uint64_t offset, const void *src,

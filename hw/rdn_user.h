@@ -169,8 +169,9 @@ enum {
 	 * RDN_UC_UVD_INIT's flags asks for it (alone it means the default start, in a segment); the kext keeps the aperture
 	 * when no segment has room, and the mode it started in is the mode for every program.
 	 *
-	 * RDN_UC_UVD_SEGMENT: scalars out: 1 if the block runs in a segment (0: in the aperture, as ever), the segment's
-	 * first byte (an offset in video memory) and its size.
+	 * RDN_UC_UVD_SEGMENT: scalars out: 1 if the block runs in a segment (0: in the aperture, as ever; 2: split mode, the
+	 * block in the aperture and the decoder's own buffers in a segment), the segment's first byte (an offset in video
+	 * memory) and its size.
 	 */
 	RDN_UC_UVD_SEGMENT,
 	/* scalars in: size, alignment; out: offset. Like RDN_UC_ALLOC_HIDDEN, inside the decoder's segment. Freed with RDN_UC_FREE. */
@@ -198,6 +199,7 @@ enum {
 /* RDN_UC_UVD_INIT's flags (the same bits as RDN_UVD_F_* in hw/rdn_uvd.h): the decoder in a segment, back in the aperture. */
 #define RDN_UC_UVD_F_SEGMENT		(1u << 18)
 #define RDN_UC_UVD_F_APERTURE		(1u << 19)
+#define RDN_UC_UVD_F_SPLIT		(1u << 31)
 
 struct rdn_user_info {
 	uint32_t version;		/* RDN_USER_VERSION */
