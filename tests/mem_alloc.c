@@ -85,6 +85,37 @@ int main(void)
 		printf("FAIL: memory not whole after freeing everything\n");
 		return 1;
 	}
+	{
+		/* allocation inside a range */
+		uint64_t lo = BASE + (64ull << 20), hi = lo + (32ull << 20), a, b, c, big;
+
+		/* the check above took everything */
+		rdn_mem_free(&mem, BASE);
+		if (rdn_mem_alloc_range(&mem, 16ull << 20, 4096, lo, hi, &a) || a != lo ||
+		    !rdn_mem_alloc_range(&mem, 17ull << 20, 4096, lo, hi, &b) ||
+		    rdn_mem_alloc_range(&mem, 16ull << 20, 1ull << 20, lo + 4096, hi, &b) ||
+		    b != lo + (16ull << 20) ||
+		    rdn_mem_available_range(&mem, lo, hi, &big) != 0 || big != 0 ||
+		    !rdn_mem_alloc_range(&mem, 4096, 4096, lo, hi, &c)) {
+			printf("FAIL: allocation inside a range\n");
+			return 1;
+		}
+		rdn_mem_free(&mem, a);
+		rdn_mem_free(&mem, b);
+		if (rdn_mem_available_range(&mem, lo, hi, &big) != (32ull << 20) || big != (32ull << 20) ||
+		    rdn_mem_available(&mem) != SIZE ||
+		    rdn_mem_alloc_range(&mem, 1ull << 20, 1ull << 22, lo + 1, hi, &c) ||
+		    (c & ((1ull << 22) - 1)) || c < lo + 1 || c + (1ull << 20) > hi ||
+		    rdn_mem_available_range(&mem, lo, hi, &big) != (31ull << 20)) {
+			printf("FAIL: free space of a range\n");
+			return 1;
+		}
+		rdn_mem_free(&mem, c);
+		if (rdn_mem_available(&mem) != SIZE) {
+			printf("FAIL: memory not whole after the range tests\n");
+			return 1;
+		}
+	}
 	rdn_mem_fini(&mem);
 	printf("PASS: %d allocations, %d refused for lack of room, digest %08x\n",
 	       allocs, failures, (unsigned)digest);

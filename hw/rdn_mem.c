@@ -56,11 +56,11 @@ void rdn_mem_fini(struct rdn_mem *mem)
 	mem->head = NULL;
 }
 
-int rdn_mem_alloc(struct rdn_mem *mem, uint64_t size, uint64_t align,
-		  uint64_t *offset)
+int rdn_mem_alloc_range(struct rdn_mem *mem, uint64_t size, uint64_t align,
+			uint64_t lo, uint64_t hi, uint64_t *offset)
 {
 	struct rdn_mem_block *b, *tail;
-	uint64_t start, pad;
+	uint64_t start, pad, end;
 
 	if (!size)
 		size = 1;
@@ -69,14 +69,17 @@ int rdn_mem_alloc(struct rdn_mem *mem, uint64_t size, uint64_t align,
 	for (b = mem->head; b; b = b->next) {
 		if (b->used)
 			continue;
-		start = (b->start + align - 1) & ~(align - 1);
-		pad = start - b->start;
-		if (pad > b->size || b->size - pad < size)
+		/* What of the free block lies in [lo, hi). */
+		start = b->start > lo ? b->start : lo;
+		end = b->start + b->size < hi ? b->start + b->size : hi;
+		start = (start + align - 1) & ~(align - 1);
+		if (start >= end || end - start < size)
 			continue;
+		pad = start - b->start;
 		/* Split off what is left behind the allocation ... */
-		if (b->size - pad > size) {
-			tail = block_new(mem, start + size, b->size - pad - size,
-					 false);
+		if (b->start + b->size > start + size) {
+			tail = block_new(mem, start + size,
+					 b->start + b->size - (start + size), false);
 			if (!tail)
 				return -ENOMEM;
 			tail->next = b->next;
@@ -98,6 +101,13 @@ int rdn_mem_alloc(struct rdn_mem *mem, uint64_t size, uint64_t align,
 		return 0;
 	}
 	return -ENOMEM;
+}
+
+int rdn_mem_alloc(struct rdn_mem *mem, uint64_t size, uint64_t align,
+		  uint64_t *offset)
+{
+	return rdn_mem_alloc_range(mem, size, align, mem->base,
+				   mem->base + mem->size, offset);
 }
 
 void rdn_mem_free(struct rdn_mem *mem, uint64_t offset)
@@ -131,5 +141,26 @@ uint64_t rdn_mem_available(struct rdn_mem *mem)
 	for (b = mem->head; b; b = b->next)
 		if (!b->used)
 			total += b->size;
+	return total;
+}
+
+uint64_t rdn_mem_available_range(struct rdn_mem *mem, uint64_t lo, uint64_t hi,
+				 uint64_t *largest)
+{
+	struct rdn_mem_block *b;
+	uint64_t total = 0, big = 0;
+
+	for (b = mem->head; b; b = b->next) {
+		uint64_t start = b->start > lo ? b->start : lo;
+		uint64_t end = b->start + b->size < hi ? b->start + b->size : hi;
+
+		if (b->used || start >= end)
+			continue;
+		total += end - start;
+		if (end - start > big)
+			big = end - start;
+	}
+	if (largest)
+		*largest = big;
 	return total;
 }
