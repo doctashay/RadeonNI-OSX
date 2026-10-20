@@ -65,3 +65,7 @@ _gldCreateProgram
 _gldDestroyProgram
 _gldObjectPurgeable
 _gldObjectUnpurgeable
+
+_RDNGLRequestCompatibilityContext
+_RDNGLMakeCurrent
+_RDNGLGetProcAddress
