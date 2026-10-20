@@ -222,6 +222,8 @@ private:
 	uint64_t fDmaGpu;
 	UInt32 fDmaAt, fDmaBytes;
 	bool dmaStageUp(void);
+	/* Diagnosis: how many bytes of the firmware window in video memory differ from the file (the firmware changes a few of its own when it runs). */
+	void uvdLogWindow(const char *when);
 	int dmaPut(UInt32 offset, const void *src, UInt32 bytes);
 	static int dmaPutHook(void *cookie, uint32_t offset, const void *src, uint32_t bytes);
 	UInt32 uvdPickSegment(UInt32 force);

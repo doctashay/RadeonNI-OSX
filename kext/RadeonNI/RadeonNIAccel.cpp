@@ -963,6 +963,7 @@ void RadeonNIAccel::uvdRestart(UInt32 level)
 		return;
 	}
 	IOLog("RadeonNI: UVD restarted (epoch %lu, reset level %lu)\n", (unsigned long)fUvdEpoch, (unsigned long)level);
+	uvdLogWindow("after the restart");
 }
 
 /*
@@ -1068,6 +1069,34 @@ int RadeonNIAccel::dmaPut(UInt32 offset, const void *src, UInt32 bytes)
 	if (tail)
 		r = rdn_vram_put(fAccel.card, offset, p, tail);
 	return r;
+}
+
+void RadeonNIAccel::uvdLogWindow(const char *when)
+{
+	UInt32 fwSize = 0, at, n, bad = 0, first = 0, last = 0, i;
+	void *fw;
+	UInt8 chunk[256];
+
+	if (!fUvdSeg)
+		return;
+	fw = copyFirmware("FW_UVD", &fwSize);
+	if (!fw)
+		return;
+	for (at = 0; at < fwSize; at += n) {
+		n = fwSize - at < sizeof(chunk) ? fwSize - at : (UInt32)sizeof(chunk);
+		if (rdn_vram_get(fAccel.card, fUvdOwn[0].offset + at, chunk, n))
+			break;
+		for (i = 0; i < n; i++)
+			if (chunk[i] != ((const UInt8 *)fw)[at + i]) {
+				if (!bad)
+					first = at + i;
+				last = at + i;
+				bad++;
+			}
+	}
+	IOFree(fw, fwSize);
+	IOLog("RadeonNI: UVD: firmware window %s: %lu of %lu bytes differ from the file (first at %lu, last at %lu)\n", when,
+	      (unsigned long)bad, (unsigned long)fwSize, (unsigned long)first, (unsigned long)last);
 }
 
 int RadeonNIAccel::dmaPutHook(void *cookie, uint32_t offset, const void *src, uint32_t bytes)
@@ -1226,6 +1255,7 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, UInt32 force, const void *
 		fUvdModeFenceBase = 0;
 	}
 	IOLog("RadeonNI: UVD is up in segment %lu, UVD_STATUS 0x%08lx\n", (unsigned long)seg, (unsigned long)*status);
+	uvdLogWindow("after the start");
 	return kIOReturnSuccess;
 }
 
@@ -1969,6 +1999,7 @@ bool RadeonNIAccel::uvdFenceWait(UInt32 fence, UInt32 timeoutMs)
 
 			fUvdDumps++;
 			rdn_uvd_dump(&fUvd, "a stream did not finish");
+			uvdLogWindow("at the stall");
 			if (fUvdSeg && !rdn_vram_get(fAccel.card, at + 4096, word, 4))
 				IOLog("RadeonNI: UVD: fence word %02x%02x%02x%02x (waiting for %lu), wptr %lu\n", word[0], word[1], word[2], word[3],
 				      (unsigned long)fence, (unsigned long)fUvd.wptr);
