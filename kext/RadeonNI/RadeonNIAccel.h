@@ -77,7 +77,7 @@ public:
 	/* For the user client. All of these take the lock themselves. */
 	void getInfo(struct rdn_user_info *info);
 	IOReturn allocVram(UInt32 size, UInt32 align, UInt32 *offset,
-			   bool hidden = false);
+			   bool hidden = false, bool segment = false);
 	void hiddenInfo(UInt32 *offset, UInt32 *size);
 	/* A program's memory in the GART (rdn_user.h). */
 	void gartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages);
@@ -110,6 +110,12 @@ public:
 	/* Start the block again: the sessions programs left in the firmware (they end without destroying them) go. */
 	void uvdRestart(UInt32 level);
 	IOReturn uvdInfo(UInt32 *up, UInt32 *vcpuOffset, UInt32 *ringOffset);
+	/* The decoder in a segment beyond the aperture (docs/UVD.md). */
+	void uvdSegmentInfo(UInt32 *mode, UInt32 *first, UInt32 *size);
+	IOReturn vramPut(task_t task, UInt32 offset, UInt32 address, UInt32 bytes);
+	IOReturn vramGet(task_t task, UInt32 offset, UInt32 address, UInt32 bytes);
+	IOReturn uvdSubmitWords(task_t task, UInt32 address, UInt32 words, UInt32 *fence, UInt32 *handles,
+				UInt32 *count, UInt32 *epoch);
 	/* Debugging (RDN_UC_IBLOG): kind '3' a command buffer, 'U' a decoder stream, 'F' 'C' a screen fill or copy, 'M' a mark. */
 	void ibRecord(UInt32 kind, void *client, UInt32 offset, UInt32 words);
 	IOReturn ibLogControl(UInt32 op, UInt32 *ms);
@@ -185,7 +191,26 @@ private:
 	/* The session messages in a stream of commands: type (0 create, 2 destroy) and handle of each. */
 	struct UvdMsg { UInt32 type, handle; };
 	enum { kMaxUvdMsgs = 8 };
-	UInt32 uvdFind(UInt32 offset, UInt32 words, UvdMsg *msgs);
+	UInt32 uvdFind(const volatile UInt32 *w, UInt32 words, UvdMsg *msgs);
+	IOReturn uvdSubmitCommon(uint64_t ibAddress, UInt32 words, UvdMsg *msgs, UInt32 n, UInt32 *fence, UInt32 *handles,
+				 UInt32 *count, UInt32 *epoch);
+	/*
+	 * The decoder in a 256 MB segment of the video memory beyond the aperture: fUvdSeg is its number (0: the block
+	 * is in the aperture), [fUvdSegLo, fUvdSegHi) its bytes. The block's own memory (firmware window, ring,
+	 * scratch page, indirect buffer slots) is in it; the shadows are the library's system memory copies of the first two.
+	 */
+	UInt32 fUvdSeg, fUvdSegLo, fUvdSegHi;
+	enum { kUvdOwn = 4, kUvdIbSlots = 16 };
+	struct { UInt32 offset, size; } fUvdOwn[kUvdOwn];
+	UInt8 *fUvdVcpuShadow, *fUvdRingShadow;
+	UInt32 fUvdVcpuShadowBytes, fUvdRingShadowBytes;
+	UInt32 fUvdIbBase, fUvdIbNext;
+	UInt32 fUvdIbFence[kUvdIbSlots];
+	UInt32 uvdPickSegment(void);
+	void uvdSegmentFree(void);
+	bool uvdSegmentCheck(UInt32 offset, UInt32 bytes);
+	IOReturn uvdStartSegment(UInt32 flags, const void *fw, UInt32 fwSize, uint32_t ref, UInt32 *status);
+	bool uvdReadMessageHeader(uint64_t address, UInt8 *out);
 	IOBufferMemoryDescriptor *fUvdGartMem;
 	UInt32 fUvdGartAt;
 	/* The power state the card was last put in (hw/rdn_pm.h). */
@@ -290,6 +315,11 @@ public:
 	IOReturn methodIbLog(UInt32 op, UInt32 *ms);
 	IOReturn methodDebug(UInt32 op, UInt32 *status);
 	IOReturn methodAllocHidden(UInt32 size, UInt32 align, UInt32 *offset);
+	IOReturn methodUvdSegment(UInt32 *mode, UInt32 *first, UInt32 *size);
+	IOReturn methodAllocUvd(UInt32 size, UInt32 align, UInt32 *offset);
+	IOReturn methodVramPut(UInt32 offset, UInt32 address, UInt32 bytes);
+	IOReturn methodVramGet(UInt32 offset, UInt32 address, UInt32 bytes);
+	IOReturn methodUvdSubmitWords(UInt32 address, UInt32 words, UInt32 *fence);
 	IOReturn methodHiddenInfo(UInt32 *offset, UInt32 *size);
 	IOReturn methodGartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages);
 	IOReturn methodGartBind(UInt32 address, UInt32 size, UInt32 *offset);

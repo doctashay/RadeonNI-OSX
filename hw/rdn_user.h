@@ -164,6 +164,29 @@ enum {
 	 * 5 reset the decoder's whole block with SRBM_SOFT_RESET (same), 20 to 83 set how the block is restarted (20 + RDN_UVD_RESET_* bits: 1 sub-blocks, 2 no RLC, 4 no stall, 8 no clock idling, 16 no rewrite, 32 no register programming). Out: SRBM_STATUS (0xE50) 20 ms after the operation.
 	 */
 	RDN_UC_DEBUG,
+	/*
+	 * The decoder in a 256 MB segment of the video memory beyond the aperture (docs/UVD.md). RDN_UVD_F_SEGMENT in
+	 * RDN_UC_UVD_INIT's flags asks for it (alone it means the default start, in a segment); the kext keeps the aperture
+	 * when no segment has room, and the mode it started in is the mode for every program.
+	 *
+	 * RDN_UC_UVD_SEGMENT: scalars out: 1 if the block runs in a segment (0: in the aperture, as ever), the segment's
+	 * first byte (an offset in video memory) and its size.
+	 */
+	RDN_UC_UVD_SEGMENT,
+	/* scalars in: size, alignment; out: offset. Like RDN_UC_ALLOC_HIDDEN, inside the decoder's segment. Freed with RDN_UC_FREE. */
+	RDN_UC_ALLOC_UVD,
+	/*
+	 * scalars in: offset in video memory, address in the caller's memory, byte count. Copy into (PUT) or out of (GET) the
+	 * decoder's segment through the register window (a few MB a second): the bytes must lie inside the segment and outside
+	 * the decoder's own blocks (firmware, ring, indirect buffers).
+	 */
+	RDN_UC_VRAM_PUT,
+	RDN_UC_VRAM_GET,
+	/*
+	 * scalars in: address in the caller's memory of UVD command words (host order), their number (at most 1024);
+	 * out: fence. As RDN_UC_UVD_SUBMIT, with the indirect buffer given by value (the kext keeps it in its own slot of the segment).
+	 */
+	RDN_UC_UVD_SUBMIT_WORDS,
 	RDN_UC_METHOD_COUNT
 };
 

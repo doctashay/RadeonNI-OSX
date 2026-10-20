@@ -489,6 +489,15 @@ void RadeonNIAccel::retire(IOService *provider)
 			rdn_uvd_fini(&fUvd);
 			fUvdUp = false;
 		}
+		if (fUvdVcpuShadow) {
+			IOFree(fUvdVcpuShadow, fUvdVcpuShadowBytes);
+			fUvdVcpuShadow = 0;
+		}
+		if (fUvdRingShadow) {
+			IOFree(fUvdRingShadow, fUvdRingShadowBytes);
+			fUvdRingShadow = 0;
+		}
+		fUvdSeg = 0;
 		rdn_accel_fini(&fAccel);
 		rdn_mem_fini(&fMem);
 		if (fHiddenSize) {
@@ -608,7 +617,7 @@ void RadeonNIAccel::hiddenInfo(UInt32 *offset, UInt32 *size)
 }
 
 IOReturn RadeonNIAccel::allocVram(UInt32 size, UInt32 align, UInt32 *offset,
-				  bool hidden)
+				  bool hidden, bool segment)
 {
 	uint64_t off = 0;
 	int r;
@@ -617,10 +626,23 @@ IOReturn RadeonNIAccel::allocVram(UInt32 size, UInt32 align, UInt32 *offset,
 		return kIOReturnBadArgument;
 	if (align < 4096)
 		align = 4096;
-	if (hidden && !fHiddenSize)
+	if ((hidden || segment) && !fHiddenSize)
 		return kIOReturnNoMemory;
 	IOLockLock(fLock);
-	r = rdn_mem_alloc(hidden ? &fHidden : &fMem, size, align, &off);
+	if (segment) {
+		/* the decoder's own 256 MB (docs/UVD.md) */
+		r = fUvdSeg ? rdn_mem_alloc_range(&fHidden, size, align, fUvdSegLo, fUvdSegHi, &off) : -1;
+	} else if (hidden && fUvdSeg) {
+		/* the segment is kept for the decoder while the rest of the hidden memory has room */
+		r = rdn_mem_alloc_range(&fHidden, size, align, fHiddenOffset, fUvdSegLo, &off);
+		if (r)
+			r = rdn_mem_alloc_range(&fHidden, size, align, fUvdSegHi,
+						(uint64_t)fHiddenOffset + fHiddenSize, &off);
+		if (r)
+			r = rdn_mem_alloc(&fHidden, size, align, &off);
+	} else {
+		r = rdn_mem_alloc(hidden ? &fHidden : &fMem, size, align, &off);
+	}
 	IOLockUnlock(fLock);
 	if (r)
 		return kIOReturnNoMemory;
@@ -662,7 +684,13 @@ IOReturn RadeonNIAccel::submit(UInt32 offset, UInt32 words, UInt32 *fence)
  */
 IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 {
-	/* No flags: the start that works (docs/UVD.md); other values select the older variants, for experiments. */
+	/*
+	 * No flags: the start that works (docs/UVD.md); other values select the older variants, for experiments. RDN_UVD_F_SEGMENT
+	 * alone asks for that start with the block in a segment beyond the aperture.
+	 */
+	bool wantSegment = (flags & RDN_UVD_F_SEGMENT) != 0;
+
+	flags &= ~RDN_UVD_F_SEGMENT;
 	if (!flags)
 		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI | RDN_UVD_F_PLL | RDN_UVD_F_WINDOWS;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;
@@ -783,6 +811,16 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 		return kIOReturnSuccess;
 	}
 
+	if (wantSegment && ref && fHiddenSize) {
+		IOLockLock(fLock);
+		ret = uvdStartSegment(flags, fw, fwSize, ref, status);
+		IOLockUnlock(fLock);
+		if (ret == kIOReturnSuccess) {
+			IOFree(fw, fwSize);
+			return kIOReturnSuccess;
+		}
+		IOLog("RadeonNI: UVD: not in a segment (%d); in the aperture\n", (int)ret);
+	}
 	ret = allocVram(vcpuBytes, 4096, &vcpuOff, false);
 	if (ret == kIOReturnSuccess)
 		ret = allocVram(4096 + RDN_UVD_RING_EXTRA, 4096, &ringOff, false);
@@ -851,8 +889,12 @@ void RadeonNIAccel::uvdRestart(UInt32 level)
 	fenceBase = fUvd.fence_emitted;
 	rdn_uvd_set_reset_level(level);
 	rdn_uvd_fini(&fUvd);
-	r = rdn_uvd_init(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
-			 fUvd.vcpu_offset, fUvd.ring_offset, 4096, fUvdFlags);
+	if (fUvdSeg)
+		r = rdn_uvd_init_window(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
+					fUvdVcpuShadow, fUvdOwn[0].offset, fUvdRingShadow, fUvdOwn[1].offset, 4096, fUvdFlags);
+	else
+		r = rdn_uvd_init(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
+				 fUvd.vcpu_offset, fUvd.ring_offset, 4096, fUvdFlags);
 	rdn_uvd_set_reset_level(0);
 	IOFree(fw, fwSize);
 	/* the fence numbers go on, for programs that remember the newest one they saw reached */
@@ -873,13 +915,267 @@ void RadeonNIAccel::uvdRestart(UInt32 level)
 }
 
 /*
+ * The decoder in a 256 MB segment of the video memory beyond the aperture (docs/UVD.md). The segment is the hidden
+ * one with the most room that has at least 96 MB free in one piece, the highest on a tie (hidden allocations are first
+ * fit from the bottom). Called with fLock held. 0 if there is none.
+ */
+UInt32 RadeonNIAccel::uvdPickSegment(void)
+{
+	const uint64_t kMinFree = 96ull << 20;
+	UInt32 n, best = 0;
+	uint64_t bestFree = 0;
+
+	if (!fHiddenSize)
+		return 0;
+	for (n = 1; n <= 6; n++) {
+		uint64_t lo = (uint64_t)n << 28, hi = lo + (1ull << 28), big = 0, avail;
+
+		if (lo < fHiddenOffset || hi > (uint64_t)fHiddenOffset + fHiddenSize)
+			continue;
+		avail = rdn_mem_available_range(&fHidden, lo, hi, &big);
+		if (big >= kMinFree && avail >= bestFree) {
+			best = n;
+			bestFree = avail;
+		}
+	}
+	return best;
+}
+
+/* Give back what a start in a segment took (fLock held). */
+void RadeonNIAccel::uvdSegmentFree(void)
+{
+	UInt32 i;
+
+	for (i = 0; i < kUvdOwn; i++)
+		if (fUvdOwn[i].size) {
+			rdn_mem_free(&fHidden, fUvdOwn[i].offset);
+			fUvdOwn[i].size = 0;
+		}
+	if (fUvdVcpuShadow) {
+		IOFree(fUvdVcpuShadow, fUvdVcpuShadowBytes);
+		fUvdVcpuShadow = 0;
+	}
+	if (fUvdRingShadow) {
+		IOFree(fUvdRingShadow, fUvdRingShadowBytes);
+		fUvdRingShadow = 0;
+	}
+	fUvdSeg = 0;
+	fUvdScratch = 0;
+}
+
+/* May a program put or get these bytes? Inside the segment and outside the block's own memory (fLock held). */
+bool RadeonNIAccel::uvdSegmentCheck(UInt32 offset, UInt32 bytes)
+{
+	UInt32 i;
+
+	if (!fUvdSeg || offset < fUvdSegLo || (uint64_t)offset + bytes > fUvdSegHi || offset + bytes < offset)
+		return false;
+	for (i = 0; i < kUvdOwn; i++)
+		if (fUvdOwn[i].size && offset < fUvdOwn[i].offset + fUvdOwn[i].size &&
+		    fUvdOwn[i].offset < offset + bytes)
+			return false;
+	return true;
+}
+
+/*
+ * Start the block with its firmware window, ring, scratch page and indirect buffer slots in a segment, the way
+ * rdn_uvd_init_window() wants them. Called with fLock held; on failure nothing stays taken.
+ */
+IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, const void *fw, UInt32 fwSize, uint32_t ref, UInt32 *status)
+{
+	UInt32 seg = uvdPickSegment(), i;
+	UInt32 vcpuBytes = rdn_uvd_vcpu_bytes(fwSize, RDN_UVD_DEFAULT_HANDLES);
+	UInt32 sizes[kUvdOwn];
+	uint64_t lo, hi, at;
+	int r;
+
+	if (!seg)
+		return kIOReturnNoMemory;
+	sizes[0] = vcpuBytes;
+	sizes[1] = 8192;			/* the ring (4096 bytes and its fence word) */
+	sizes[2] = 4096;			/* the scratch page */
+	sizes[3] = kUvdIbSlots * 4096;	/* the indirect buffer slots */
+	lo = (uint64_t)seg << 28;
+	hi = lo + (1ull << 28);
+	for (i = 0; i < kUvdOwn; i++) {
+		if (rdn_mem_alloc_range(&fHidden, sizes[i], 4096, lo, hi, &at)) {
+			uvdSegmentFree();
+			return kIOReturnNoMemory;
+		}
+		fUvdOwn[i].offset = (UInt32)at;
+		fUvdOwn[i].size = sizes[i];
+	}
+	fUvdVcpuShadowBytes = vcpuBytes;
+	fUvdRingShadowBytes = 4096 + RDN_UVD_RING_EXTRA;
+	fUvdVcpuShadow = (UInt8 *)IOMalloc(fUvdVcpuShadowBytes);
+	fUvdRingShadow = (UInt8 *)IOMalloc(fUvdRingShadowBytes);
+	if (!fUvdVcpuShadow || !fUvdRingShadow) {
+		uvdSegmentFree();
+		return kIOReturnNoMemory;
+	}
+	bzero(fUvdVcpuShadow, fUvdVcpuShadowBytes);
+	bzero(fUvdRingShadow, fUvdRingShadowBytes);
+	fUvdSeg = seg;
+	fUvdSegLo = (UInt32)lo;
+	fUvdSegHi = (UInt32)hi;
+	IOLog("RadeonNI: UVD: firmware %lu bytes, in segment %lu of video memory (0x%lx), VCPU region at 0x%lx, ring at 0x%lx, reference clock %lu0 kHz; starting\n",
+	      (unsigned long)fwSize, (unsigned long)seg, (unsigned long)fUvdSegLo, (unsigned long)fUvdOwn[0].offset,
+	      (unsigned long)fUvdOwn[1].offset, (unsigned long)ref);
+	r = rdn_uvd_init_window(&fUvd, &fAccel, ref, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
+				fUvdVcpuShadow, fUvdOwn[0].offset, fUvdRingShadow, fUvdOwn[1].offset, 4096, flags);
+	*status = rdn_rreg(fAccel.card, 0xf6bc);
+	if (r) {
+		IOLog("RadeonNI: UVD did not start in the segment (%d), UVD_STATUS 0x%08lx\n", r, (unsigned long)*status);
+		uvdSegmentFree();
+		return kIOReturnIOError;
+	}
+	fUvdScratch = fUvdOwn[2].offset;
+	fUvdIbBase = fUvdOwn[3].offset;
+	fUvdIbNext = 0;
+	for (i = 0; i < kUvdIbSlots; i++)
+		fUvdIbFence[i] = 0;
+	fUvdUp = true;
+	fUvdRestartBits = RDN_UVD_RESET_SUB | RDN_UVD_RESET_NO_RLC;
+	fUvdFlags = flags | RDN_UVD_F_EXT;
+	fUvdRef = ref;
+	IOLog("RadeonNI: UVD is up in segment %lu, UVD_STATUS 0x%08lx\n", (unsigned long)seg, (unsigned long)*status);
+	return kIOReturnSuccess;
+}
+
+void RadeonNIAccel::uvdSegmentInfo(UInt32 *mode, UInt32 *first, UInt32 *size)
+{
+	IOLockLock(fLock);
+	*mode = fUvdUp && fUvdSeg ? 1 : 0;
+	*first = fUvdSeg ? fUvdSegLo : 0;
+	*size = fUvdSeg ? fUvdSegHi - fUvdSegLo : 0;
+	IOLockUnlock(fLock);
+}
+
+/*
+ * Bytes between a program's memory and the segment, through the register window, 16 KB at a time with the lock let go of
+ * between the pieces (the window is slow, and the 3D engine's users want the lock).
+ */
+static IOMemoryDescriptor *taskMemory(task_t task, UInt32 address, UInt32 bytes, bool toTask);
+
+IOReturn RadeonNIAccel::vramPut(task_t task, UInt32 offset, UInt32 address, UInt32 bytes)
+{
+	const UInt32 kPiece = 16384;
+	IOMemoryDescriptor *memory;
+	UInt8 *piece;
+	UInt32 done = 0;
+	IOReturn ret = kIOReturnSuccess;
+	bool ok;
+
+	if (!bytes || bytes > (16u << 20))
+		return kIOReturnBadArgument;
+	IOLockLock(fLock);
+	ok = fUvdUp && uvdSegmentCheck(offset, bytes);
+	IOLockUnlock(fLock);
+	if (!ok)
+		return kIOReturnBadArgument;
+	memory = taskMemory(task, address, bytes, false);
+	if (!memory)
+		return kIOReturnVMError;
+	piece = (UInt8 *)IOMalloc(kPiece);
+	if (!piece) {
+		memory->complete();
+		memory->release();
+		return kIOReturnNoMemory;
+	}
+	while (done < bytes && ret == kIOReturnSuccess) {
+		UInt32 n = bytes - done < kPiece ? bytes - done : kPiece;
+
+		if (memory->readBytes(done, piece, n) != n) {
+			ret = kIOReturnVMError;
+			break;
+		}
+		IOLockLock(fLock);
+		if (!fUvdUp || !uvdSegmentCheck(offset + done, n) || rdn_vram_put(fAccel.card, offset + done, piece, n))
+			ret = kIOReturnIOError;
+		IOLockUnlock(fLock);
+		done += n;
+	}
+	IOFree(piece, kPiece);
+	memory->complete();
+	memory->release();
+	return ret;
+}
+
+IOReturn RadeonNIAccel::vramGet(task_t task, UInt32 offset, UInt32 address, UInt32 bytes)
+{
+	const UInt32 kPiece = 16384;
+	IOMemoryDescriptor *memory;
+	UInt8 *piece;
+	UInt32 done = 0;
+	IOReturn ret = kIOReturnSuccess;
+	bool ok;
+
+	if (!bytes || bytes > (16u << 20))
+		return kIOReturnBadArgument;
+	IOLockLock(fLock);
+	/* reading the block's own memory is harmless, but the check is the same as for writing, less the own blocks */
+	ok = fUvdUp && fUvdSeg && offset >= fUvdSegLo && (uint64_t)offset + bytes <= fUvdSegHi && offset + bytes > offset;
+	IOLockUnlock(fLock);
+	if (!ok)
+		return kIOReturnBadArgument;
+	memory = taskMemory(task, address, bytes, true);
+	if (!memory)
+		return kIOReturnVMError;
+	piece = (UInt8 *)IOMalloc(kPiece);
+	if (!piece) {
+		memory->complete();
+		memory->release();
+		return kIOReturnNoMemory;
+	}
+	while (done < bytes && ret == kIOReturnSuccess) {
+		UInt32 n = bytes - done < kPiece ? bytes - done : kPiece;
+
+		IOLockLock(fLock);
+		if (!fUvdUp || !fUvdSeg || rdn_vram_get(fAccel.card, offset + done, piece, n))
+			ret = kIOReturnIOError;
+		IOLockUnlock(fLock);
+		if (ret == kIOReturnSuccess && memory->writeBytes(done, piece, n) != n)
+			ret = kIOReturnVMError;
+		done += n;
+	}
+	IOFree(piece, kPiece);
+	memory->complete();
+	memory->release();
+	return ret;
+}
+
+/*
+ * The first bytes of the message at a video memory address, for uvdFind(): through the aperture when it lies there, through the register
+ * window when it lies in the decoder's segment. Called with fLock held.
+ */
+bool RadeonNIAccel::uvdReadMessageHeader(uint64_t address, UInt8 *out)
+{
+	uint64_t at;
+	UInt32 i;
+
+	if (address < fAccel.vram_base)
+		return false;
+	at = address - fAccel.vram_base;
+	if (at + 12 <= fAccel.aperture_size) {
+		volatile UInt8 *m = (volatile UInt8 *)fAccel.aperture + at;
+
+		for (i = 0; i < 12; i++)
+			out[i] = m[i];
+		return true;
+	}
+	if (fUvdSeg && at >= fUvdSegLo && at + 12 <= fUvdSegHi)
+		return rdn_vram_get(fAccel.card, (uint32_t)at, out, 12) == 0;
+	return false;
+}
+
+/*
  * The session messages in a program's command stream. The stream is register writes: the message's address goes to
  * GPCOM_VCPU_DATA0 and DATA1, and a write of 0 to GPCOM_VCPU_CMD says "the message is there". Its first words,
  * little-endian, are its size, its type (0 create, 2 destroy) and the stream handle. Reads only; called with fLock held.
+ * `w` is the stream's words (in the aperture, or a copy of the kext's own).
  */
-UInt32 RadeonNIAccel::uvdFind(UInt32 offset, UInt32 words, UvdMsg *msgs)
+UInt32 RadeonNIAccel::uvdFind(const volatile UInt32 *w, UInt32 words, UvdMsg *msgs)
 {
-	volatile UInt32 *w = (volatile UInt32 *)((UInt8 *)fAccel.aperture + offset);
 	UInt32 i = 0, data0 = 0, data1 = 0, n = 0;
 
 	while (i < words) {
@@ -904,13 +1200,11 @@ UInt32 RadeonNIAccel::uvdFind(UInt32 offset, UInt32 words, UvdMsg *msgs)
 				data1 = value;
 			} else if (reg == UVD_GPCOM_VCPU_CMD && (value >> 1) == 0) {
 				uint64_t addr = ((uint64_t)data1 << 32) | data0;
-				uint64_t at = addr - fAccel.vram_base;
-				volatile UInt8 *m;
+				UInt8 m[12];
 				UInt32 type_;
 
-				if (addr < fAccel.vram_base || at + 12 > fAccel.aperture_size)
+				if (!uvdReadMessageHeader(addr, m))
 					continue;
-				m = (volatile UInt8 *)fAccel.aperture + at;
 				type_ = m[4] | m[5] << 8 | m[6] << 16 | (UInt32)m[7] << 24;
 				if ((type_ == 0 || type_ == 2) && n < kMaxUvdMsgs) {
 					msgs[n].type = type_;
@@ -941,30 +1235,46 @@ void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch
 		fUvdClocksUp = rdn_uvd_wake(&fUvd) == 0;
 	}
 	for (i = 0; i < count; i++) {
-		volatile UInt8 *m = (volatile UInt8 *)fAccel.aperture + fUvdScratch;
-		volatile UInt32 *ib = (volatile UInt32 *)((UInt8 *)fAccel.aperture + fUvdScratch + 1024);
+		UInt8 message[64];
+		UInt32 stream[16];
 		uint64_t addr = rdn_vram_addr(&fAccel, fUvdScratch);
 		UInt32 j, handle = handles[i];
 		uint32_t seq = 0;
 
 		for (j = 0; j < 64; j++)
-			m[j] = 0;
-		m[0] = 0xe4;
-		m[1] = 0x0d;
-		m[4] = 2;
-		m[8] = handle;
-		m[9] = handle >> 8;
-		m[10] = handle >> 16;
-		m[11] = handle >> 24;
-		ib[0] = RDN_UVD_PACKET0(UVD_GPCOM_VCPU_DATA0, 0);
-		ib[1] = (UInt32)addr;
-		ib[2] = RDN_UVD_PACKET0(UVD_GPCOM_VCPU_DATA1, 0);
-		ib[3] = (UInt32)(addr >> 32);
-		ib[4] = RDN_UVD_PACKET0(UVD_GPCOM_VCPU_CMD, 0);
-		ib[5] = 0;
+			message[j] = 0;
+		message[0] = 0xe4;
+		message[1] = 0x0d;
+		message[4] = 2;
+		message[8] = handle;
+		message[9] = handle >> 8;
+		message[10] = handle >> 16;
+		message[11] = handle >> 24;
+		stream[0] = RDN_UVD_PACKET0(UVD_GPCOM_VCPU_DATA0, 0);
+		stream[1] = (UInt32)addr;
+		stream[2] = RDN_UVD_PACKET0(UVD_GPCOM_VCPU_DATA1, 0);
+		stream[3] = (UInt32)(addr >> 32);
+		stream[4] = RDN_UVD_PACKET0(UVD_GPCOM_VCPU_CMD, 0);
+		stream[5] = 0;
 		for (j = 6; j < 16; j++)
-			ib[j] = RDN_UVD_PACKET0(UVD_NO_OP, 0);
-		rdnStoreBarrier();
+			stream[j] = RDN_UVD_PACKET0(UVD_NO_OP, 0);
+		if (fUvdSeg) {
+			/* beyond the aperture: through the register window */
+			if (rdn_vram_put(fAccel.card, fUvdScratch, message, 64) ||
+			    rdn_vram_put(fAccel.card, fUvdScratch + 1024, stream, 64)) {
+				IOLog("RadeonNI: UVD: could not write a program's session end\n");
+				break;
+			}
+		} else {
+			volatile UInt8 *m = (volatile UInt8 *)fAccel.aperture + fUvdScratch;
+			volatile UInt32 *ib = (volatile UInt32 *)((UInt8 *)fAccel.aperture + fUvdScratch + 1024);
+
+			for (j = 0; j < 64; j++)
+				m[j] = message[j];
+			for (j = 0; j < 16; j++)
+				ib[j] = stream[j];
+			rdnStoreBarrier();
+		}
 		if (rdn_uvd_ib_submit(&fUvd, rdn_vram_addr(&fAccel, fUvdScratch + 1024), 16, &seq)) {
 			IOLog("RadeonNI: UVD: could not end a program's session\n");
 			break;
@@ -983,21 +1293,34 @@ void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch
 IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UInt32 *handles,
 				  UInt32 *count, UInt32 *epoch)
 {
-	uint32_t seq = 0;
-	int r = 0;
 	UvdMsg msgs[kMaxUvdMsgs];
-	UInt32 n, i, k;
-	bool creates = false;
+	UInt32 n;
 
 	if (offset < HEAP_OFFSET || (offset & 3) || !words ||
 	    words > (fAccel.aperture_size - offset) / 4)
 		return kIOReturnBadArgument;
 	IOLockLock(fLock);
-	if (!fUvdUp) {
+	/* a block in a segment takes its streams by value (uvdSubmitWords) */
+	if (!fUvdUp || fUvdSeg) {
 		IOLockUnlock(fLock);
 		return kIOReturnNotReady;
 	}
-	n = uvdFind(offset, words, msgs);
+	n = uvdFind((const volatile UInt32 *)((UInt8 *)fAccel.aperture + offset), words, msgs);
+	return uvdSubmitCommon(rdn_vram_addr(&fAccel, offset), words, msgs, n, fence, handles, count, epoch);
+}
+
+/*
+ * The rest of a submission, with fLock held (and released here): the stream is at `ibAddress` in video memory, `msgs`
+ * its `n` session messages.
+ */
+IOReturn RadeonNIAccel::uvdSubmitCommon(uint64_t ibAddress, UInt32 words, UvdMsg *msgs, UInt32 n, UInt32 *fence,
+					UInt32 *handles, UInt32 *count, UInt32 *epoch)
+{
+	uint32_t seq = 0;
+	int r = 0;
+	UInt32 i, k;
+	bool creates = false;
+
 	for (i = 0; i < n; i++)
 		if (msgs[i].type == 0)
 			creates = true;
@@ -1022,7 +1345,7 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 	/* the program's stores to the write-combined window must be in the card before the doorbell (eieio does not order them) */
 	rdnStoreBarrier();
 	if (!r)
-		r = rdn_uvd_ib_submit(&fUvd, rdn_vram_addr(&fAccel, offset), words, &seq);
+		r = rdn_uvd_ib_submit(&fUvd, ibAddress, words, &seq);
 	if (!r) {
 		fUvdLastSeq = seq;
 		fUvdDirty = true;
@@ -1047,6 +1370,80 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 		return kIOReturnIOError;
 	*fence = seq;
 	return kIOReturnSuccess;
+}
+
+/*
+ * Copy to or from a program's memory (kIODirectionOut: the kext reads it). The pages are wired for the time.
+ */
+static IOMemoryDescriptor *taskMemory(task_t task, UInt32 address, UInt32 bytes, bool toTask)
+{
+	IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddress((vm_address_t)address, bytes,
+								     toTask ? kIODirectionIn : kIODirectionOut, task);
+
+	if (!memory)
+		return 0;
+	if (memory->prepare() != kIOReturnSuccess) {
+		memory->release();
+		return 0;
+	}
+	return memory;
+}
+
+/*
+ * A stream of decoder commands given by value, for a block in a segment: the words are copied into one of the kext's slots in
+ * the segment and run from there.
+ */
+IOReturn RadeonNIAccel::uvdSubmitWords(task_t task, UInt32 address, UInt32 words, UInt32 *fence, UInt32 *handles,
+				       UInt32 *count, UInt32 *epoch)
+{
+	UvdMsg msgs[kMaxUvdMsgs];
+	IOMemoryDescriptor *memory;
+	UInt32 *stream, n, slot, at;
+	IOReturn ret = kIOReturnSuccess;
+	bool copied;
+
+	if (!words || words > 1024 || (address & 3))
+		return kIOReturnBadArgument;
+	stream = (UInt32 *)IOMalloc(words * 4);
+	if (!stream)
+		return kIOReturnNoMemory;
+	memory = taskMemory(task, address, words * 4, false);
+	copied = memory && memory->readBytes(0, stream, words * 4) == words * 4;
+	if (memory) {
+		memory->complete();
+		memory->release();
+	}
+	if (!copied) {
+		IOFree(stream, words * 4);
+		return kIOReturnVMError;
+	}
+	IOLockLock(fLock);
+	if (!fUvdUp || !fUvdSeg) {
+		IOLockUnlock(fLock);
+		IOFree(stream, words * 4);
+		return kIOReturnNotReady;
+	}
+	n = uvdFind(stream, words, msgs);
+	/* the slot's last stream must have run before it is written over */
+	slot = fUvdIbNext;
+	if (fUvdIbFence[slot] && !rdn_uvd_fence_done(&fUvd, fUvdIbFence[slot]) &&
+	    rdn_uvd_fence_wait(&fUvd, fUvdIbFence[slot], 200)) {
+		IOLockUnlock(fLock);
+		IOFree(stream, words * 4);
+		return kIOReturnBusy;
+	}
+	at = fUvdIbBase + slot * 4096;
+	if (rdn_vram_put(fAccel.card, at, stream, words * 4)) {
+		IOLockUnlock(fLock);
+		IOFree(stream, words * 4);
+		return kIOReturnIOError;
+	}
+	fUvdIbNext = (slot + 1) % kUvdIbSlots;
+	ret = uvdSubmitCommon(rdn_vram_addr(&fAccel, at), words, msgs, n, fence, handles, count, epoch);
+	if (ret == kIOReturnSuccess)
+		fUvdIbFence[slot] = *fence;
+	IOFree(stream, words * 4);
+	return ret;
 }
 
 /*
@@ -2145,6 +2542,16 @@ IOExternalMethod *RadeonNIUserClient::getTargetAndMethodForIndex(
 		  kIOUCScalarIScalarO, 1, 1 },
 		{ 0, (IOMethod)&RadeonNIUserClient::methodDebug,
 		  kIOUCScalarIScalarO, 1, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdSegment,
+		  kIOUCScalarIScalarO, 0, 3 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodAllocUvd,
+		  kIOUCScalarIScalarO, 2, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodVramPut,
+		  kIOUCScalarIScalarO, 3, 0 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodVramGet,
+		  kIOUCScalarIScalarO, 3, 0 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdSubmitWords,
+		  kIOUCScalarIScalarO, 2, 1 },
 	};
 
 	if (index >= RDN_UC_METHOD_COUNT)
@@ -2204,6 +2611,46 @@ IOReturn RadeonNIUserClient::methodAllocHidden(UInt32 size, UInt32 align,
 	if (r == kIOReturnSuccess)
 		fOffsets[fCount++] = *offset;
 	return r;
+}
+
+IOReturn RadeonNIUserClient::methodAllocUvd(UInt32 size, UInt32 align, UInt32 *offset)
+{
+	IOReturn r;
+
+	if (fCount >= kMaxAllocations)
+		return kIOReturnNoResources;
+	r = fAccel->allocVram(size, align, offset, false, true);
+	if (r == kIOReturnSuccess)
+		fOffsets[fCount++] = *offset;
+	return r;
+}
+
+IOReturn RadeonNIUserClient::methodUvdSegment(UInt32 *mode, UInt32 *first, UInt32 *size)
+{
+	fAccel->uvdSegmentInfo(mode, first, size);
+	return kIOReturnSuccess;
+}
+
+IOReturn RadeonNIUserClient::methodVramPut(UInt32 offset, UInt32 address, UInt32 bytes)
+{
+	return fAccel->vramPut(fTask, offset, address, bytes);
+}
+
+IOReturn RadeonNIUserClient::methodVramGet(UInt32 offset, UInt32 address, UInt32 bytes)
+{
+	return fAccel->vramGet(fTask, offset, address, bytes);
+}
+
+IOReturn RadeonNIUserClient::methodUvdSubmitWords(UInt32 address, UInt32 words, UInt32 *fence)
+{
+	IOReturn ret = fAccel->uvdSubmitWords(fTask, address, words, fence, fUvdHandles, &fUvdHandleCount,
+					      &fUvdHandleEpoch);
+
+	if (ret == kIOReturnSuccess && !fUvdUser) {
+		fUvdUser = true;
+		fAccel->uvdUser(true);
+	}
+	return ret;
 }
 
 IOReturn RadeonNIUserClient::methodHiddenInfo(UInt32 *offset, UInt32 *size)
