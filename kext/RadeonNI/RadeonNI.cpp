@@ -129,6 +129,13 @@ UInt32 RadeonNI::readReg(UInt32 offset)
 
 void RadeonNI::writeReg(UInt32 offset, UInt32 value)
 {
+#if defined(__ppc__) || defined(__ppc64__)
+	/*
+	 * A program's command buffers are stored through the write-combined window of video memory and a register write rings the
+	 * doorbell that makes the card read them: eieio does not order those stores before it, sync does.
+	 */
+	__asm__ __volatile__("sync" : : : "memory");
+#endif
 	OSWriteLittleInt32(fRegs, offset, value);
 	OSSynchronizeIO();
 }
