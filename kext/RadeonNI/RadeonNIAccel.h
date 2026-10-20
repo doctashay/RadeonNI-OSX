@@ -204,7 +204,7 @@ private:
 	/* Where the segment's memory comes from (fHidden; fMem for segment 7, the aperture's own, a test), and dumps made of a stalled stream. */
 	struct rdn_mem *fUvdSegMem;
 	UInt32 fUvdDumps;
-	enum { kUvdOwn = 5, kUvdIbSlots = 16 };
+	enum { kUvdOwn = 4, kUvdIbSlots = 16 };
 	struct { UInt32 offset, size; } fUvdOwn[kUvdOwn];
 	UInt8 *fUvdVcpuShadow, *fUvdRingShadow;
 	UInt32 fUvdVcpuShadowBytes, fUvdRingShadowBytes;
@@ -218,8 +218,6 @@ private:
 	 * Staging in the GART for the command processor's DMA into video memory the CPU cannot map: the register window's writes do
 	 * not reach the decoder the way DMA does (docs/UVD.md). dmaPut() is called with fLock held.
 	 */
-	UInt32 fUvdFlushPage;
-	bool fUvdNoFlush;
 	IOBufferMemoryDescriptor *fDmaMem;
 	UInt8 *fDmaCpu;
 	uint64_t fDmaGpu;

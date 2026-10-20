@@ -701,8 +701,7 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	rdn_uvd_set_push_via_aperture((flags & RDN_UVD_F_PUSH_APERTURE) != 0);
 	bool noDma = (flags & RDN_UVD_F_NO_DMA) != 0;
 
-	fUvdNoFlush = (flags & RDN_UVD_F_NO_FLUSH) != 0;
-	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24) | RDN_UVD_F_PUSH_APERTURE | RDN_UVD_F_NO_DMA | RDN_UVD_F_NO_FLUSH | RDN_UVD_F_SPLIT);
+	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24) | RDN_UVD_F_PUSH_APERTURE | RDN_UVD_F_NO_DMA | RDN_UVD_F_SPLIT);
 	if (!flags)
 		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI | RDN_UVD_F_PLL | RDN_UVD_F_WINDOWS;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;
@@ -965,6 +964,16 @@ void RadeonNIAccel::uvdRestart(UInt32 level)
 
 	if (!fUvdUp || !fUvdDirty || (fUvdFlags & RDN_UVD_F_GART))
 		return;
+	if (fUvdSeg) {
+		/* the firmware window cannot be written again so that it boots (docs/UVD.md): no restarts with everything in a segment */
+		static bool said;
+
+		if (!said) {
+			said = true;
+			IOLog("RadeonNI: UVD: no restart of a block that runs wholly in a segment\n");
+		}
+		return;
+	}
 	fw = copyFirmware("FW_UVD", &fwSize);
 	if (!fw)
 		return;
@@ -972,18 +981,8 @@ void RadeonNIAccel::uvdRestart(UInt32 level)
 	fenceBase = fUvd.fence_emitted;
 	rdn_uvd_set_reset_level(level);
 	rdn_uvd_fini(&fUvd);
-	if (fUvdSeg) {
-		/* the firmware window goes to its other place: the decoder does not boot from the old one again (stale lines?) */
-		UInt32 other = fUvdOwn[4].offset;
-
-		fUvdOwn[4].offset = fUvdOwn[0].offset;
-		fUvdOwn[0].offset = other;
-		r = rdn_uvd_init_window(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
-					fUvdVcpuShadow, fUvdOwn[0].offset, fUvdRingShadow, fUvdOwn[1].offset, 4096, fUvdFlags);
-	}
-	else
-		r = rdn_uvd_init(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
-				 fUvd.vcpu_offset, fUvd.ring_offset, 4096, fUvdFlags);
+	r = rdn_uvd_init(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
+			 fUvd.vcpu_offset, fUvd.ring_offset, 4096, fUvdFlags);
 	rdn_uvd_set_reset_level(0);
 	IOFree(fw, fwSize);
 	/* the fence numbers go on, for programs that remember the newest one they saw reached */
@@ -1001,7 +1000,6 @@ void RadeonNIAccel::uvdRestart(UInt32 level)
 		return;
 	}
 	IOLog("RadeonNI: UVD restarted (epoch %lu, reset level %lu)\n", (unsigned long)fUvdEpoch, (unsigned long)level);
-	uvdLogWindow("after the restart");
 }
 
 /*
@@ -1234,7 +1232,6 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, UInt32 force, const void *
 	sizes[1] = 8192;			/* the ring (4096 bytes and its fence word) */
 	sizes[2] = 4096;			/* the scratch page */
 	sizes[3] = kUvdIbSlots * 4096;	/* the indirect buffer slots */
-	sizes[4] = vcpuBytes;			/* a second place for the firmware window, for restarts (docs/UVD.md) */
 	lo = (uint64_t)seg << 28;
 	hi = lo + (1ull << 28);
 	fUvdSegMem = &fHidden;
@@ -1267,13 +1264,6 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, UInt32 force, const void *
 	IOLog("RadeonNI: UVD: firmware %lu bytes, in segment %lu of video memory (0x%lx), VCPU region at 0x%lx, ring at 0x%lx, reference clock %lu0 kHz; starting\n",
 	      (unsigned long)fwSize, (unsigned long)seg, (unsigned long)fUvdSegLo, (unsigned long)fUvdOwn[0].offset,
 	      (unsigned long)fUvdOwn[1].offset, (unsigned long)ref);
-	if (!fUvdFlushPage) {
-		uint64_t page = 0;
-
-		if (!rdn_mem_alloc(&fMem, 4096, 4096, &page))
-			fUvdFlushPage = (UInt32)page;
-	}
-	rdn_uvd_set_coherency_page(fUvdFlushPage != 0 && !fUvdNoFlush, fUvdFlushPage);
 	rdn_uvd_set_reset_level(fUvdStartLevel);
 	r = rdn_uvd_init_window(&fUvd, &fAccel, ref, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
 				fUvdVcpuShadow, fUvdOwn[0].offset, fUvdRingShadow, fUvdOwn[1].offset, 4096, flags);
