@@ -41,6 +41,8 @@ struct rdn_gart {
 int rdn_gart_enable(struct rdn_gart *gart, struct rdn_accel *accel,
 		    uint32_t table_offset, uint64_t dummy);
 void rdn_gart_disable(struct rdn_gart *gart);
+/* Re-enable translation after the caller restores the saved page table. */
+int rdn_gart_resume(struct rdn_gart *gart);
 
 /* Point page `page` of the range at a bus address, or back at the dummy. */
 void rdn_gart_set_page(struct rdn_gart *gart, uint32_t page, uint64_t bus_addr);

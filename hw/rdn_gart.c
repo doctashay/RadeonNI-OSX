@@ -93,9 +93,8 @@ void rdn_gart_flush(struct rdn_gart *gart)
 int rdn_gart_enable(struct rdn_gart *gart, struct rdn_accel *accel,
 		    uint32_t table_offset, uint64_t dummy)
 {
-	struct rdn_card *card = accel->card;
 	uint64_t vram_end = accel->vram_base + accel->vram_size - 1;
-	uint32_t tmp, page;
+	uint32_t page;
 
 	if ((table_offset & 0xfff) || (dummy & 0xfff) ||
 	    table_offset + RDN_GART_TABLE_BYTES > accel->aperture_size ||
@@ -108,6 +107,31 @@ int rdn_gart_enable(struct rdn_gart *gart, struct rdn_accel *accel,
 	gart->dummy = dummy;
 	for (page = 0; page < RDN_GART_PAGES; page++)
 		write_entry(gart, page, dummy);
+	return rdn_gart_resume(gart);
+}
+
+int rdn_gart_resume(struct rdn_gart *gart)
+{
+	struct rdn_accel *accel;
+	struct rdn_card *card;
+	uint64_t vram_end, dummy;
+	uint32_t table_offset, tmp;
+
+	if (!gart || !gart->accel || !gart->accel->card)
+		return -EINVAL;
+	accel = gart->accel;
+	card = accel->card;
+	table_offset = gart->table_offset;
+	dummy = gart->dummy;
+	if (!accel->vram_size || (table_offset & 0xfff) || (dummy & 0xfff) ||
+	    accel->aperture_size < RDN_GART_TABLE_BYTES ||
+	    table_offset > accel->aperture_size - RDN_GART_TABLE_BYTES)
+		return -EINVAL;
+	vram_end = accel->vram_base + accel->vram_size - 1;
+	if (accel->vram_base < RDN_GART_GPU_START +
+	    (uint64_t)RDN_GART_PAGES * RDN_GART_PAGE_SIZE &&
+	    vram_end >= RDN_GART_GPU_START)
+		return -EINVAL;
 
 	/*
 	 * evergreen_mc_program(), the system aperture only: video memory is
