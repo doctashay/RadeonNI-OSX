@@ -121,3 +121,32 @@ Design notes, not a decision (the user decides):
 `docs/PLAN.md`, A7 ("eviction"). Do not start before a program runs out of
 memory in practice; so far none has (Call of Duty 2's overflow was the vertex
 range, fixed another way). The piglit subtests are the only reason to look.
+
+## What it would take, as of 2026-10-20 (a design answer; nothing built)
+
+Asked after the decoder's buffers were moved out of the aperture (split mode, `docs/UVD.md`), which is eviction's cousin done by hand for one client.
+
+**The obstacle is that addresses are absolute.** The winsys reports `r600_has_virtual_memory = true`, so Mesa's r600 writes `gpu_address` (cached in every `r600_resource` at creation) straight into command
+packets, texture and buffer descriptors and state objects, and the kext allocator never moves anything. A buffer that moved would leave stale addresses in queued and in-flight command buffers and in the descriptors of
+bound textures. Linux solves it in one of two ways, and **neither is what the card's family uses by default in Linux**:
+- *Relocation + command checker* (what `radeon` does on Barts, Turks and Caicos: `btc_asic` has no `.vm` entry, `r600_has_virtual_memory` is false): Mesa emits `PKT3_NOP` relocation indices after every packet that
+  carries an address, the kernel's checker (`evergreen_cs.c`, MIT, in `third_party/linux`) parses each indirect buffer, patches the real addresses in and TTM has placed (and may have moved) the buffers before the
+  submission. Needs: the checker ported into the kext (about 4000 lines for Evergreen; it also validates registers, which this kext's recorder only warns about today), Mesa told to use relocations (the code is there:
+  the `has_vm` branches in `evergreen_state.c`), the winsys passing buffer lists with the indirect buffer.
+- *GPU virtual memory* (Linux enables it only on Cayman, Trinity and the Southern Islands parts: `radeon_vm.c`, `ni.c`): every buffer gets a fixed virtual address and the page tables say where its pages are; a move is
+  a copy plus a page-table write. The kext already runs context 0 (the GART). Whether Turks' hardware has working contexts 1 to 7 is not known (the Linux driver never turns them on for it); it would need testing on the card.
+
+**What both need besides, in the order I would do it:**
+1. *The wiring limit first.* Eviction to system memory needs somewhere to evict to, and `gartBind` hangs above about 860 MB wired (the 512 MB cap): find out why (the DART?).
+2. *A buffer record in the kext* instead of a list of offsets per client: size, placement (aperture, hidden, GART), last fence, mapped and pinned flags, an LRU list, owner. The winsys's `last_use`/`last_write` fences exist but only in the program; they must reach the kext.
+3. *The move primitive*: now there (`rdn_cp_dma`, 2026-10-20: GART to video memory and back, ordered on the ring, with a fence); a move is a copy, a fence wait and the new address, never of a buffer a stream in flight uses.
+4. *Validation at submit*: every buffer a stream names resident where the engine can read it, evicting least recently used idle ones for room, failing (or splitting the stream: Mesa's `used_vram_kb` hook does that already) when the working set is larger than video memory.
+5. *The CPU side.* The whole aperture is mapped in every program, so a CPU pointer is aperture + offset and a move leaves it pointing at someone else's data. A map must pin (the winsys's `buffer_unmap` is a no-op today, and glthread keeps uploads mapped), or CPU-written data must have system memory as its home (stable pointers, the GPU reads it through the GART or from a cached copy in video memory: what Tiger's own OpenGL does).
+6. *Write-back*: a buffer the GPU wrote (render targets) needs a copy to system memory before it can go; the stream's `RADEON_USAGE_WRITE` flags say which.
+
+**What can never move:** the screen's surfaces and anything the window server was given an offset for (`RDN_UC_SURFACE_BUFFER`, Quartz Extreme), the kext's own memory (rings, GART table, firmware windows), and the decoder's buffers
+(it addresses physical video memory in one 256 MB segment; they stay pinned while a session lives, which split mode already does).
+
+**Whether to do it:** nothing has run out of memory in practice since the decoder's buffers left the aperture; the only users are the three piglit `large-tex` subtests. The cheap middle path that was taken for the
+decoder (put the GPU-only bulk in the hidden 768 MB, keep what the CPU writes in the aperture) is the same idea without a mover, and could be extended to textures and render targets (the winsys already sends
+`NO_CPU_ACCESS` buffers to the hidden memory). Eviction proper is a large piece of kernel work for a problem that does not yet exist.
