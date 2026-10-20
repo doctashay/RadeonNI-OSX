@@ -1056,6 +1056,8 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, const void *fw, UInt32 fwS
 	*status = rdn_rreg(fAccel.card, 0xf6bc);
 	if (r) {
 		IOLog("RadeonNI: UVD did not start in the segment (%d), UVD_STATUS 0x%08lx\n", r, (unsigned long)*status);
+		/* the block must not run on in memory that is given back */
+		rdn_uvd_fini(&fUvd);
 		uvdSegmentFree();
 		return kIOReturnIOError;
 	}
