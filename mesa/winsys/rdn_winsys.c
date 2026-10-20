@@ -1233,6 +1233,19 @@ static uint32_t rdn_le32_at(const uint8_t *p)
    return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
+/*
+ * Give the kext all the memory the cache keeps. A closed video decoder's buffers (some 65 MB at 1080p) would otherwise sit here until
+ * the program exits, out of reach of every other program and of the decoder room check.
+ */
+void rdn_winsys_trim(struct radeon_winsys *rws)
+{
+   struct radeon_drm_winsys *ws = rdn_winsys(rws);
+
+   simple_mtx_lock(&ws->lock);
+   rdn_cache_trim(ws, true);
+   simple_mtx_unlock(&ws->lock);
+}
+
 int rdn_winsys_uvd_answered(struct radeon_winsys *rws)
 {
    struct radeon_drm_winsys *ws = rdn_winsys(rws);

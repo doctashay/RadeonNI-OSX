@@ -32,6 +32,7 @@
 
 extern struct pipe_screen *osmesa_create_screen(void);
 extern int rdn_winsys_uvd_answered(struct radeon_winsys *ws);
+extern void rdn_winsys_trim(struct radeon_winsys *ws);
 extern bool rdn_target_uvd_reset(uint32_t *epoch);
 
 struct rdnvd {
@@ -169,11 +170,19 @@ static enum pipe_video_profile profile_for(const struct rdnvd_h264_sps *sps)
 	return PIPE_VIDEO_PROFILE_UNKNOWN;		/* Extended: data partitioning, SP/SI */
 }
 
+/* Memory the winsys kept of buffers that were let go goes back to the kext, where the next decoder (here or in another program) can have it. */
+static void trim_cache(struct rdnvd *d)
+{
+	if (d && d->screen)
+		rdn_winsys_trim(((struct r600_common_screen *)d->screen)->ws);
+}
+
 static void codec_close(struct rdnvd_session *s)
 {
 	if (s->codec) {
 		s->codec->destroy(s->codec);
 		s->codec = NULL;
+		trim_cache(s->d);
 	}
 	/* Buffers of the old sequence that nobody holds go now; held ones go when released. */
 	while (s->free) {
@@ -609,7 +618,7 @@ static unsigned dpb_slots(unsigned level, unsigned width_mbs, unsigned height_mb
 	return lean > refs + 1 ? lean : refs + 1;
 }
 
-static int room_for(unsigned width, unsigned height, unsigned slots)
+static int room_for(struct rdnvd *d, unsigned width, unsigned height, unsigned slots)
 {
 	unsigned w = (width + 15) & ~15u, h = (height + 15) & ~15u, mbs = w / 16 * (h / 16);
 	uint64_t image = (((uint64_t)((w + 31) & ~31u) * h * 3 / 2) + 1023) & ~1023ull;
@@ -621,6 +630,8 @@ static int room_for(unsigned width, unsigned height, unsigned slots)
 
 	if (dpb > 0x7fffffff || rest > 0x7fffffff)
 		return 0;
+	/* what this program's winsys keeps of buffers it let go of is memory the decoder can have */
+	trim_cache(d);
 	if (rdn_target_vram_alloc((uint32_t)dpb, &a)) {
 		if (rdn_target_vram_alloc((uint32_t)rest, &b)) {
 			rdn_target_vram_free(b);
@@ -638,14 +649,14 @@ RDNVD_PUBLIC int rdnvd_h264_room_for(struct rdnvd_session *s)
 
 	if (!sps)
 		return 0;
-	return room_for(sps->width_mbs * 16, sps->height_mbs * 16,
+	return room_for(s->d, sps->width_mbs * 16, sps->height_mbs * 16,
 			dpb_slots(sps->level_idc, sps->width_mbs, sps->height_mbs, sps->max_num_ref_frames ? sps->max_num_ref_frames : 1));
 }
 
 RDNVD_PUBLIC int rdnvd_h264_room(struct rdnvd *d, unsigned width, unsigned height)
 {
 	/* no stream to ask: the old size, 17 pictures */
-	return room_for(width, height, 17);
+	return room_for(d, width, height, 17);
 }
 
 RDNVD_PUBLIC int rdnvd_h264_prepare(struct rdnvd_session *s)

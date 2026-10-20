@@ -42,17 +42,20 @@ typedef struct {
 	UInt8 pad[2];
 } RDNAVCDecompressRecord;
 
-typedef struct {
+typedef struct RDNAVCGlobals {
 	ComponentInstance self, delegate, target;
 	struct rdnvd_session *session;
 	unsigned nalLengthSize;
 	Boolean prepared;
 	long width, height;
 	OSType **wantedPixelTypes;
+	struct RDNAVCGlobals *next;	/* gInstances */
 } RDNAVCGlobals;
 
 /* rdnvd is not thread safe, and QuickTime may call from several threads. */
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
+/* The instances of this program, under gLock: QuickTime makes a new one for a new window size before it lets the old one go. */
+static RDNAVCGlobals *gInstances;
 static struct rdnvd *gDevice;
 static int gDeviceTried;
 
@@ -97,6 +100,32 @@ pascal ComponentResult RDNAVC_Target(RDNAVCGlobals *storage, ComponentInstance t
 #define GET_DELEGATE_COMPONENT()	((storage) ? (storage)->delegate : NULL)
 #include <QuickTime/ComponentDispatchHelper.c>
 
+/* ---- the instances of this program ----------------------------------------------------- */
+
+static void unlink_instance(RDNAVCGlobals *g)
+{
+	RDNAVCGlobals **p;
+
+	pthread_mutex_lock(&gLock);
+	for (p = &gInstances; *p; p = &(*p)->next)
+		if (*p == g) {
+			*p = g->next;
+			break;
+		}
+	pthread_mutex_unlock(&gLock);
+}
+
+/* Whether another instance holds a decoder for a stream of this size: the one a resized window is about to replace (gLock held). */
+static int sibling_holds(const RDNAVCGlobals *me, long width, long height)
+{
+	const RDNAVCGlobals *g;
+
+	for (g = gInstances; g; g = g->next)
+		if (g != me && g->prepared && g->width == width && g->height == height)
+			return 1;
+	return 0;
+}
+
 /* ---- standard calls ------------------------------------------------------------------ */
 
 pascal ComponentResult RDNAVC_Open(RDNAVCGlobals *storage, ComponentInstance self)
@@ -109,9 +138,14 @@ pascal ComponentResult RDNAVC_Open(RDNAVCGlobals *storage, ComponentInstance sel
 	glob->self = self;
 	glob->target = self;
 	SetComponentInstanceStorage(self, (Handle)glob);
+	pthread_mutex_lock(&gLock);
+	glob->next = gInstances;
+	gInstances = glob;
+	pthread_mutex_unlock(&gLock);
 	/* The base image decompressor does the rest of the work: scaling, matrices, buffers, scheduling. */
 	err = OpenADefaultComponent(decompressorComponentType, kBaseCodecType, &glob->delegate);
 	if (err) {
+		unlink_instance(glob);
 		free(glob);
 		SetComponentInstanceStorage(self, NULL);
 		return err;
@@ -129,11 +163,14 @@ pascal ComponentResult RDNAVC_Close(RDNAVCGlobals *storage, ComponentInstance se
 		pthread_mutex_lock(&gLock);
 		if (storage->session)
 			rdnvd_h264_close(storage->session);
+		storage->session = NULL;
+		storage->prepared = false;
 		pthread_mutex_unlock(&gLock);
 		if (storage->delegate)
 			CloseComponent(storage->delegate);
 		if (storage->wantedPixelTypes)
 			DisposeHandle((Handle)storage->wantedPixelTypes);
+		unlink_instance(storage);
 		free(storage);
 	}
 	return noErr;
@@ -348,6 +385,16 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 	/* another decoder (this program's or another's) may have the card's video memory the decoder reaches */
 	pthread_mutex_lock(&gLock);
 	room = rdnvd_h264_room_for(storage->session);
+	/*
+	 * A window that is resized gets a new decompression session before the old one is let go (the Fit to Screen of QuickTime Player),
+	 * and the decoder is made at the first picture, by when the old one is gone. Declining here would hand the movie to QuickTime's
+	 * own decoder for good (it looked broken on a clip that this decoder gets right).
+	 */
+	if (!room && sibling_holds(storage, (**desc).width, (**desc).height)) {
+		room = 1;
+		say("another decoder of this program holds the memory for a %ldx%ld stream: taken, the decoder waits for it to go",
+		    (long)(**desc).width, (long)(**desc).height);
+	}
 	pthread_mutex_unlock(&gLock);
 	if (!room) {
 		say("declined: no video memory for a %ldx%ld decoder now (another decoder has it)", (long)(**desc).width,
@@ -408,15 +455,24 @@ pascal ComponentResult RDNAVC_BeginBand(RDNAVCGlobals *storage, CodecDecompressP
 	if (!storage->session)
 		return codecErr;
 	if (!storage->prepared) {
-		int r;
+		int r, tries = 0, waiting;
 
-		pthread_mutex_lock(&gLock);
-		r = rdnvd_h264_prepare(storage->session);
-		pthread_mutex_unlock(&gLock);
+		/* a decoder of the same stream that the new session replaces may still hold the memory for a moment */
+		for (;;) {
+			pthread_mutex_lock(&gLock);
+			r = rdnvd_h264_prepare(storage->session);
+			waiting = r && sibling_holds(storage, storage->width, storage->height);
+			pthread_mutex_unlock(&gLock);
+			if (!waiting || ++tries > 100)
+				break;
+			usleep(20000);
+		}
 		if (r) {
 			say("no room for the decoder (%d)", r);
 			return codecErr;
 		}
+		if (tries)
+			say("the decoder got its memory after %d ms", tries * 20);
 		storage->prepared = true;
 		if (debug())
 			say("prepared: inst %p session %p", (void *)storage, (void *)storage->session);
