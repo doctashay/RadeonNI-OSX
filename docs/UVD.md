@@ -159,6 +159,14 @@ The user's first look at the installed component (1080p clip): corrupt pictures,
    display time): all pictures shown in time and identical to ffmpeg's up to 1080p, also with Apple's decoder as the control. `tools/guest/qtplay.c` (movie with a visual
    context) shows pixel buffers whose values are not the decoder's (QuickTime converts them), so it cannot compare; it is kept for timing.
 
+### Did a clip run on the card? (2026-10-20)
+
+`tools/guest/gpucheck.sh clip.mp4` plays a clip in Player and prints the kext's count of video decoder streams (kind U in the recorder), the decoder's fence counter before and during, and Player's CPU use;
+`grep RadeonNIAVC /var/log/system.log` says "declined: no video memory for a WxH decoder now (another decoder has it)" when the component refused a clip and QuickTime used its own software decoder. The
+decoder's memory (about 125 MB at 1080p, Mesa's legacy sizing: the firmware assumes 17 reference pictures, `NUM_H264_REFS`) must fit the kext's 222 MB heap, so one 1080p decoder fits at a time, and
+Finder's icon preview or Quick Look of a 1080p clip takes it and keeps it while the file's preview is shown (seen with `~/Downloads/cs2_facu.mp4`, 1080x1920 at 60 fps, High 4.2, 11 Mbit/s: Player was declined and played it in software).
+Even on the card the pipeline decodes a 1080p picture in about 24 ms and reads it out in 11 ms (synchronously), roughly 30 pictures a second at best: 1080p60 is beyond it today.
+
 ### The decoder wedges when the frontmost application changes (open issue, 2026-10-19)
 
 **Newest lead (2026-10-19 night, not yet run on the card):** the minimal start never programmed the VCPU's cache windows 1 and 2 (heap, stack and sessions; Linux's `uvd_v2_2_resume()` does), so the firmware's
