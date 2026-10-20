@@ -33,6 +33,7 @@
 extern struct pipe_screen *osmesa_create_screen(void);
 extern int rdn_winsys_uvd_answered(struct radeon_winsys *ws);
 extern void rdn_winsys_trim(struct radeon_winsys *ws);
+extern void rdn_winsys_set_video(struct radeon_winsys *ws);
 extern bool rdn_target_uvd_reset(uint32_t *epoch);
 
 struct rdnvd {
@@ -537,6 +538,9 @@ RDNVD_PUBLIC struct rdnvd *rdnvd_open(void)
 	if (!d)
 		return NULL;
 	d->screen = osmesa_create_screen();
+	/* the winsys of a program that decodes: the decoder's buffers go where the decoder runs (docs/UVD.md) */
+	if (d->screen)
+		rdn_winsys_set_video(((struct r600_common_screen *)d->screen)->ws);
 	if (d->screen)
 		d->ctx = d->screen->context_create(d->screen, NULL, 0);
 	if (!d->ctx || !d->ctx->create_video_codec || !d->ctx->create_video_buffer) {

@@ -37,6 +37,12 @@ int rdn_winsys_uvd_answered(struct radeon_winsys *ws);
 /* Give the kext the memory the cache keeps (a closed decoder's buffers, for one). */
 void rdn_winsys_trim(struct radeon_winsys *ws);
 
+/*
+ * This winsys belongs to a program that decodes video: its shareable buffers are the decoder's, and with the decoder in a
+ * segment of the video memory beyond the aperture (docs/UVD.md) they are made there. Call it before the first buffer.
+ */
+void rdn_winsys_set_video(struct radeon_winsys *ws);
+
 typedef struct pipe_screen *(*rdn_screen_create_t)(struct radeon_winsys *,
                                                    const struct pipe_screen_config *);
 

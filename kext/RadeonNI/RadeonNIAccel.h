@@ -205,6 +205,8 @@ private:
 	UInt8 *fUvdVcpuShadow, *fUvdRingShadow;
 	UInt32 fUvdVcpuShadowBytes, fUvdRingShadowBytes;
 	UInt32 fUvdIbBase, fUvdIbNext;
+	/* The fence number to go on from when the block is started in the other place. */
+	UInt32 fUvdModeFenceBase;
 	UInt32 fUvdIbFence[kUvdIbSlots];
 	UInt32 uvdPickSegment(void);
 	void uvdSegmentFree(void);

@@ -58,7 +58,8 @@ uint32_t rdn_shim_tiling_config;
  * the GPU reaches through the GART.
  */
 /* RDN_USER: the program's own memory behind the GART, only ever given back. */
-enum rdn_place { RDN_VISIBLE, RDN_HIDDEN, RDN_GART, RDN_USER, RDN_REGIONS };
+/* RDN_SEGMENT: the video decoder's 256 MB of video memory beyond the aperture (docs/UVD.md); the CPU sees a copy. */
+enum rdn_place { RDN_VISIBLE, RDN_HIDDEN, RDN_GART, RDN_USER, RDN_SEGMENT, RDN_REGIONS };
 
 /* What r600 holds on to: a command buffer it may ask about or wait for. */
 struct rdn_fence {
@@ -98,6 +99,13 @@ struct rdn_bo {
    enum rdn_place region;
    /* The program's own memory behind the GART (rdn_buffer_from_ptr). */
    void *user;
+   /*
+    * In the decoder's segment (RDN_SEGMENT): what the CPU maps is this copy in system memory; `dirty` when it has
+    * been mapped for writing and not yet sent to video memory (before the next decoder stream that names the buffer),
+    * `shadow_valid` when it holds what video memory holds.
+    */
+   uint8_t *shadow;
+   bool dirty, shadow_valid;
 };
 
 struct rdn_cs_buffer {
@@ -254,7 +262,7 @@ static void rdn_ws_fence_reference(struct radeon_winsys *rws,
  * is called with the lock held.
  */
 #define RDN_CACHE_FLUSHES 128
-static const uint64_t RDN_CACHE_BYTES[RDN_REGIONS] = { 32ull << 20, 128ull << 20, 64ull << 20, 0 };
+static const uint64_t RDN_CACHE_BYTES[RDN_REGIONS] = { 32ull << 20, 128ull << 20, 64ull << 20, 0, 0 };
 
 static struct list_head *rdn_cache_bucket(struct radeon_drm_winsys *ws,
                                           uint64_t size, enum rdn_place region)
@@ -401,6 +409,7 @@ static void rdn_mem_stats_account(struct radeon_drm_winsys *ws, uint64_t size,
       rdn_stats_at_most.cached_bytes[1] = ws->cached_bytes[1];
       rdn_stats_at_most.cached_bytes[2] = ws->cached_bytes[2];
       rdn_stats_at_most.cached_bytes[3] = ws->cached_bytes[3];
+      rdn_stats_at_most.cached_bytes[4] = ws->cached_bytes[4];
    }
 }
 
@@ -413,7 +422,7 @@ static void rdn_mem_stats_print(const char *when)
       return;
    static const char *const where[RDN_REGIONS] = {
       "in the aperture", "beyond the aperture", "in system memory (GART)",
-      "the program's own memory (GART)"
+      "the program's own memory (GART)", "in the decoder's segment"
    };
 
    for (h = 0; h < RDN_REGIONS; h++) {
@@ -447,6 +456,73 @@ static void rdn_mem_stats_exit(void)
    rdn_cs_stats_print();
 }
 
+/*
+ * The decoder in a segment of the video memory beyond the aperture (docs/UVD.md). While it is being tried it is on only when
+ * asked for: RDN_UVD_SEGMENT=1 in the program's environment, or "1" in the file below. Whoever starts the decoder first
+ * decides; after that the decoder's place is the kext's, whatever a later program asks.
+ */
+#define RDN_UVD_SEGMENT_FILE "/Library/Application Support/RadeonNI/uvd-segment"
+
+static bool rdn_segment_wanted(void)
+{
+   static int on = -1;
+
+   if (on < 0) {
+      const char *e = getenv("RDN_UVD_SEGMENT");
+
+      if (e) {
+         on = atoi(e) != 0;
+      } else {
+         FILE *f = fopen(RDN_UVD_SEGMENT_FILE, "r");
+         int c = f ? fgetc(f) : EOF;
+
+         if (f)
+            fclose(f);
+         on = c == '1';
+      }
+   }
+   return on;
+}
+
+/* With the lock held: the decoder is started (once per process) in the place asked for, and where it runs is noted. */
+static bool rdn_uvd_prepare(struct radeon_drm_winsys *ws)
+{
+   if (ws->uvd_ready)
+      return true;
+   if (ws->dev->uvd_start) {
+      uint64_t first = 0, size = 0;
+
+      if (ws->dev->uvd_start(ws->dev, rdn_segment_wanted(), &first, &size))
+         return false;
+      ws->uvd_seg = size != 0 && ws->dev->uvd_alloc && ws->dev->vram_put && ws->dev->vram_get &&
+                    ws->dev->uvd_submit_words;
+      ws->uvd_ready = true;
+   } else {
+      ws->uvd_ready = !ws->dev->uvd_init(ws->dev);
+   }
+   return ws->uvd_ready;
+}
+
+/* The CPU's view of a buffer in the decoder's segment: a copy in system memory (made when first wanted). */
+static void *rdn_segment_shadow(struct radeon_drm_winsys *ws, struct rdn_bo *bo, enum pipe_map_flags usage)
+{
+   if (!bo->shadow) {
+      bo->shadow = CALLOC(1, bo->base.size);
+      if (!bo->shadow)
+         return NULL;
+      bo->shadow_valid = false;
+   }
+   /* A reader wants what video memory holds (slow: through the register window). */
+   if ((usage & PIPE_MAP_READ) && !(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) && !bo->shadow_valid) {
+      if (ws->dev->vram_get(ws->dev, bo->offset, bo->shadow, bo->base.size))
+         return NULL;
+      bo->shadow_valid = true;
+   }
+   if (usage & PIPE_MAP_WRITE)
+      bo->dirty = true;
+   return bo->shadow;
+}
+
 static struct pb_buffer_lean *
 rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
                   enum radeon_bo_domain domain, enum radeon_bo_flag flags)
@@ -476,7 +552,10 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
     * the video decoder's message and bitstream buffers are such, and the
     * decoder reads its messages from the 256 MB of video memory it lives in.
     */
-   if ((flags & RADEON_FLAG_NO_CPU_ACCESS) && ws->dev->alloc_hidden)
+   if (ws->video && !(flags & RADEON_FLAG_NO_INTERPROCESS_SHARING) && ws->dev->uvd_start &&
+       rdn_uvd_prepare(ws) && ws->uvd_seg)
+      want = RDN_SEGMENT;
+   else if ((flags & RADEON_FLAG_NO_CPU_ACCESS) && ws->dev->alloc_hidden)
       want = RDN_HIDDEN;
    else if (domain == RADEON_DOMAIN_GTT && ws->dev->gart_alloc &&
             (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING))
@@ -490,6 +569,19 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
       ws->mem_stats.cache_hits++;
    }
    ws->mem_stats.creates++;
+   if (want == RDN_SEGMENT) {
+      /* Nowhere else will do: the decoder reaches only its segment. What the cache holds may make room. */
+      if (r) {
+         r = ws->dev->uvd_alloc(ws->dev, size, alignment, &bo->offset);
+         if (r) {
+            rdn_cache_trim(ws, true);
+            r = ws->dev->uvd_alloc(ws->dev, size, alignment, &bo->offset);
+         }
+         if (!r)
+            bo->region = RDN_SEGMENT;
+      }
+      goto placed;
+   }
    if (r && want == RDN_HIDDEN) {
       /*
        * Debugging (docs/UVD.md, the decoder's second segment): RDN_HIDDEN_FILL_MB=n puts the next hidden buffer of 256 KB or
@@ -542,6 +634,7 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
          ws->mem_stats.overflowed++;
       }
    }
+placed:
    if (!r) {
       ws->allocated_bytes += size;
       rdn_mem_stats_account(ws, size, bo->region, 1);
@@ -604,6 +697,7 @@ static void rdn_buffer_destroy(struct radeon_winsys *rws, struct pb_buffer_lean 
       rdn_mem_stats_account(ws, bo->base.size, bo->region, -1);
       simple_mtx_unlock(&ws->lock);
    }
+   FREE(bo->shadow);
    FREE(bo);
 }
 
@@ -726,11 +820,13 @@ static void *rdn_buffer_map(struct radeon_winsys *rws, struct pb_buffer_lean *bu
          rdn_buffer_wait(rws, buf, OS_TIMEOUT_INFINITE, wait_usage);
       }
       /* The aperture's cache of host accesses; system memory has none. */
-      if (bo->region != RDN_GART)
+      if (bo->region != RDN_GART && bo->region != RDN_SEGMENT)
          ws->dev->sync_for_cpu(ws->dev);
    }
    if (bo->user)
       return bo->user;
+   if (bo->region == RDN_SEGMENT)
+      return (bo->flags & RADEON_FLAG_NO_CPU_ACCESS) ? NULL : rdn_segment_shadow(ws, bo, usage);
    if (bo->region == RDN_GART)
       return ws->dev->gart_cpu(ws->dev, bo->offset);
    return (uint8_t *)ws->dev->aperture + bo->offset;
@@ -911,8 +1007,7 @@ static bool rdn_cs_create(struct radeon_cmdbuf *rcs, struct radeon_winsys_ctx *c
          return false;
       simple_mtx_lock(&ws->lock);
       /* Started by the first stream that wants it. */
-      ready = ws->uvd_ready || !ws->dev->uvd_init(ws->dev);
-      ws->uvd_ready = ready;
+      ready = rdn_uvd_prepare(ws);
       simple_mtx_unlock(&ws->lock);
       if (!ready)
          return false;
@@ -1208,7 +1303,8 @@ static bool rdn_uvd_relocate(struct rdn_cs *cs, struct radeon_cmdbuf *rcs, struc
                return false;
             bo = cs->buffers[index].bo;
             /* Only video memory: the program's own memory is out of the decoder's reach. */
-            if (bo->region == RDN_GART || bo->region == RDN_USER || w[data0] >= bo->base.size)
+            if (bo->region == RDN_GART || bo->region == RDN_USER || w[data0] >= bo->base.size ||
+                (cs->ws->uvd_seg && bo->region != RDN_SEGMENT))
                return false;
             address = rdn_buffer_get_virtual_address(&bo->base) + w[data0];
             last_bo = bo;
@@ -1234,6 +1330,62 @@ static uint32_t rdn_le32_at(const uint8_t *p)
 }
 
 /*
+ * Where in the decode message (little-endian words) the bitstream's length is, ruvd_msg.body.decode.bsd_size (radeon_uvd.h):
+ * 4 words of header, stream_type, decode_flags, the two sizes, the reference buffer (4 words), the display buffer's
+ * description (8 words), use_addr_macro, the bitstream's address and then its size.
+ */
+#define RDN_UVD_MSG_BSD_SIZE 88
+
+/*
+ * A stream for a decoder in a segment: what the program wrote into the copies of the buffers it names goes to video memory
+ * (the message whole, the bitstream as far as the message says it goes), the feedback's counter is cleared there, and the
+ * stream's words are handed over by value. With the lock held.
+ */
+static int rdn_uvd_segment_submit(struct radeon_drm_winsys *ws, struct rdn_cs *cs, struct radeon_cmdbuf *rcs,
+                                  struct rdn_uvd_dbg *dbg, struct rdn_fence *fence)
+{
+   static const uint8_t zero[4];
+   struct rdn_bo *msg = NULL, *fb = NULL;
+   unsigned msg_off = 0, fb_off = 0, k, i;
+   uint64_t bs_bytes = 0;
+   int r;
+
+   for (k = 0; k < dbg->n; k++) {
+      if (dbg->cmd[k] == 0) {
+         msg = dbg->bo[k];
+         msg_off = dbg->offset[k];
+      } else if (dbg->cmd[k] == 3) {
+         fb = dbg->bo[k];
+         fb_off = dbg->offset[k];
+      }
+   }
+   if (msg && msg->shadow && msg_off + RDN_UVD_MSG_BSD_SIZE + 4 <= msg->base.size &&
+       rdn_le32_at(msg->shadow + msg_off + 4) == 1)
+      bs_bytes = align64(rdn_le32_at(msg->shadow + msg_off + RDN_UVD_MSG_BSD_SIZE), 128);
+   for (i = 0; i < cs->num_buffers; i++) {
+      struct rdn_bo *bo = cs->buffers[i].bo;
+      uint64_t bytes = bo->base.size;
+
+      if (bo->region != RDN_SEGMENT || !bo->dirty || !bo->shadow)
+         continue;
+      for (k = 0; k < dbg->n; k++)
+         if (dbg->cmd[k] == 0x100 && dbg->bo[k] == bo && bs_bytes && bs_bytes < bytes)
+            bytes = bs_bytes;
+      r = ws->dev->vram_put(ws->dev, bo->offset, bo->shadow, bytes);
+      if (r)
+         return r;
+      bo->dirty = false;
+      bo->shadow_valid = false;
+   }
+   if (fb) {
+      r = ws->dev->vram_put(ws->dev, fb->offset + fb_off + 4, zero, 4);
+      if (r)
+         return r;
+   }
+   return ws->dev->uvd_submit_words(ws->dev, rcs->current.buf, rcs->current.cdw, &fence->number);
+}
+
+/*
  * Give the kext all the memory the cache keeps. A closed video decoder's buffers (some 65 MB at 1080p) would otherwise sit here until
  * the program exits, out of reach of every other program and of the decoder room check.
  */
@@ -1246,6 +1398,11 @@ void rdn_winsys_trim(struct radeon_winsys *rws)
    simple_mtx_unlock(&ws->lock);
 }
 
+void rdn_winsys_set_video(struct radeon_winsys *rws)
+{
+   rdn_winsys(rws)->video = true;
+}
+
 int rdn_winsys_uvd_answered(struct radeon_winsys *rws)
 {
    struct radeon_drm_winsys *ws = rdn_winsys(rws);
@@ -1254,6 +1411,14 @@ int rdn_winsys_uvd_answered(struct radeon_winsys *rws)
    /* asked again while the answer is late: the flag stays until the next stream is submitted */
    if (!ws->uvd_check)
       return 1;
+   if (ws->uvd_seg) {
+      uint8_t counter[4];
+
+      /* only a decode message (type 1) is answered; the word is read from video memory the CPU cannot map */
+      if (ws->uvd_msg_type != 1 || ws->dev->vram_get(ws->dev, ws->uvd_fb_at + 4, counter, 4))
+         return 1;
+      return rdn_le32_at(counter) == ws->uvd_msg_num;
+   }
    ws->dev->sync_for_cpu(ws->dev);
    msg = (const uint8_t *)ws->dev->aperture + ws->uvd_msg_at;
    fb = (const uint8_t *)ws->dev->aperture + ws->uvd_fb_at;
@@ -1309,8 +1474,11 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
       }
       ib_size = align64(rcs->current.cdw * 4, 4096);
       simple_mtx_lock(&ws->lock);
-      r = rdn_ib_alloc(ws, ib_size, &offset);
-      if (!r) {
+      /* A decoder in a segment takes the stream by value (the kext keeps it in video memory itself). */
+      r = ws->uvd_seg ? 0 : rdn_ib_alloc(ws, ib_size, &offset);
+      if (!r && ws->uvd_seg) {
+         r = rdn_uvd_segment_submit(ws, cs, rcs, &dbg, fence);
+      } else if (!r) {
          {
             /*
              * The feedback's counter is cleared first: what the buffer held from an earlier decode (or an earlier program,
@@ -1362,18 +1530,30 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
             if (ws->uvd_check) {
                ws->uvd_msg_at = msg->offset + msg_off;
                ws->uvd_fb_at = fb->offset + fb_off;
+               if (ws->uvd_seg && msg->shadow) {
+                  /* the message is not read back through the aperture: its copy has what the feedback must echo */
+                  ws->uvd_msg_type = rdn_le32_at(msg->shadow + msg_off + 4);
+                  ws->uvd_msg_num = rdn_le32_at(msg->shadow + msg_off + 12);
+               } else {
+                  ws->uvd_check = !ws->uvd_seg;
+               }
             }
          }
          busy.number = fence->number;
          busy.used = true;
-         ib->offset = offset;
-         ib->size = ib_size;
-         ib->busy = busy;
-         list_addtail(&ib->list, &ws->pending_ibs);
+         if (ws->uvd_seg) {
+            /* no command buffer of ours in video memory to give back later */
+            FREE(ib);
+         } else {
+            ib->offset = offset;
+            ib->size = ib_size;
+            ib->busy = busy;
+            list_addtail(&ib->list, &ws->pending_ibs);
+         }
          simple_mtx_unlock(&ws->lock);
          if ((rdn_sync_mode() & 1) || rdn_uvd_debug())
             rdn_fence_wait(ws, fence, OS_TIMEOUT_INFINITE);
-         if (rdn_uvd_debug()) {
+         if (rdn_uvd_debug() && !ws->uvd_seg) {
             unsigned k;
 
             ws->dev->sync_for_cpu(ws->dev);

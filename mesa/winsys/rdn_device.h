@@ -139,6 +139,27 @@ struct rdn_device {
                          uint64_t timeout_ns);
 
    /*
+    * Optional: the decoder in a 256 MB segment of the video memory beyond the aperture (docs/UVD.md), where the CPU
+    * cannot reach it. uvd_start() starts the decoder unless it is up, asking for the segment with `want_segment`
+    * (a decoder that is up stays where it is), and says where it runs: *segment_first and *segment_size, the bytes
+    * of the segment as offsets in video memory, or both 0 for the aperture. In a segment, everything the decoder
+    * touches must be in it: uvd_alloc() is alloc_hidden() inside it (freed with free()); vram_put() and vram_get()
+    * copy bytes between the program's memory and video memory inside the segment, slowly; uvd_submit_words() runs
+    * decoder command words given by value (instead of uvd_submit()'s offset in the aperture) and returns a fence.
+    * All NULL when the device cannot.
+    */
+   int (*uvd_start)(struct rdn_device *dev, bool want_segment, uint64_t *segment_first,
+                    uint64_t *segment_size);
+   int (*uvd_alloc)(struct rdn_device *dev, uint64_t size, uint64_t align,
+                    uint64_t *offset);
+   int (*vram_put)(struct rdn_device *dev, uint64_t offset, const void *src,
+                   uint64_t bytes);
+   int (*vram_get)(struct rdn_device *dev, uint64_t offset, void *dst,
+                   uint64_t bytes);
+   int (*uvd_submit_words)(struct rdn_device *dev, const uint32_t *words,
+                           uint32_t count, uint32_t *fence);
+
+   /*
     * Optional: read the screen's size, place and pitch again (a mode set
     * changes them; `screen` is kept as the device last read it).
     */

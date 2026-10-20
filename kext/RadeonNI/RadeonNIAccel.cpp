@@ -689,8 +689,9 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	 * alone asks for that start with the block in a segment beyond the aperture.
 	 */
 	bool wantSegment = (flags & RDN_UVD_F_SEGMENT) != 0;
+	bool wantAperture = (flags & RDN_UVD_F_APERTURE) != 0;
 
-	flags &= ~RDN_UVD_F_SEGMENT;
+	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE);
 	if (!flags)
 		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI | RDN_UVD_F_PLL | RDN_UVD_F_WINDOWS;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;
@@ -701,6 +702,30 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	int r;
 
 	IOLockLock(fLock);
+	if (fUvdUp && ((wantSegment && !fUvdSeg) || (wantAperture && fUvdSeg)) && !fUvdUsers && !fUvdLive) {
+		/*
+		 * Asked for the other place and nothing runs: start again there. The fence numbers go on and the epoch changes,
+		 * as at any restart; a program that kept buffers of the old place does not use them again (tests only).
+		 */
+		UInt32 fenceBase = fUvd.fence_emitted;
+
+		IOLog("RadeonNI: UVD: from %s to %s\n", fUvdSeg ? "a segment" : "the aperture", fUvdSeg ? "the aperture" : "a segment");
+		rdn_uvd_fini(&fUvd);
+		if (fUvdSeg) {
+			uvdSegmentFree();
+		} else {
+			rdn_mem_free(&fMem, fUvd.vcpu_offset);
+			rdn_mem_free(&fMem, fUvd.ring_offset);
+			if (fUvdScratch)
+				rdn_mem_free(&fMem, fUvdScratch);
+			fUvdScratch = 0;
+		}
+		fUvdUp = false;
+		fUvdClocksUp = false;
+		fUvdDirty = false;
+		fUvdEpoch++;
+		fUvdModeFenceBase = fenceBase;
+	}
 	if (fUvdUp) {
 		*status = rdn_rreg(fAccel.card, 0xf6bc);
 		IOLockUnlock(fLock);
@@ -857,6 +882,11 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	fUvdRestartBits = RDN_UVD_RESET_SUB | RDN_UVD_RESET_NO_RLC;
 	fUvdFlags = flags;
 	fUvdRef = ref;
+	if (fUvdModeFenceBase) {
+		rdn_uvd_set_fence_base(&fUvd, fUvdModeFenceBase);
+		fUvdLastSeq = fUvdModeFenceBase;
+		fUvdModeFenceBase = 0;
+	}
 	IOLockUnlock(fLock);
 	if (!fUvdScratch)
 		(void)allocVram(4096, 4096, &fUvdScratch, false);
@@ -1038,6 +1068,11 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, const void *fw, UInt32 fwS
 	fUvdRestartBits = RDN_UVD_RESET_SUB | RDN_UVD_RESET_NO_RLC;
 	fUvdFlags = flags | RDN_UVD_F_EXT;
 	fUvdRef = ref;
+	if (fUvdModeFenceBase) {
+		rdn_uvd_set_fence_base(&fUvd, fUvdModeFenceBase);
+		fUvdLastSeq = fUvdModeFenceBase;
+		fUvdModeFenceBase = 0;
+	}
 	IOLog("RadeonNI: UVD is up in segment %lu, UVD_STATUS 0x%08lx\n", (unsigned long)seg, (unsigned long)*status);
 	return kIOReturnSuccess;
 }

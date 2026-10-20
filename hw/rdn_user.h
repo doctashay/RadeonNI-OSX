@@ -195,6 +195,10 @@ enum {
 #define RDN_UC_POWER_BOOT		2	/* what ASIC_Init leaves */
 #define RDN_UC_TEMPERATURE_BIAS		1000000
 
+/* RDN_UC_UVD_INIT's flags (the same bits as RDN_UVD_F_* in hw/rdn_uvd.h): the decoder in a segment, back in the aperture. */
+#define RDN_UC_UVD_F_SEGMENT		(1u << 18)
+#define RDN_UC_UVD_F_APERTURE		(1u << 19)
+
 struct rdn_user_info {
 	uint32_t version;		/* RDN_USER_VERSION */
 	uint32_t pci_device_id;

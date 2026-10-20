@@ -389,6 +389,88 @@ static int dev_uvd_submit(struct rdn_device *dev, uint64_t offset, uint32_t word
 	return 0;
 }
 
+/*
+ * The decoder in a segment (docs/UVD.md). An older kext lacks RDN_UC_UVD_SEGMENT: then the flag is not sent (it would
+ * select a start variant) and the decoder is in the aperture.
+ */
+static int dev_uvd_start(struct rdn_device *dev, bool want_segment, uint64_t *first, uint64_t *size)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	int up = 0, vcpu = 0, ring = 0, status = 0, mode = 0, f = 0, s = 0;
+	bool known = !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_SEGMENT, 0, 3, &mode, &f, &s);
+
+	*first = *size = 0;
+	if (!(!IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_INFO, 0, 3, &up, &vcpu, &ring) && up) &&
+	    IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_INIT, 1, 1, known && want_segment ? (int)RDN_UC_UVD_F_SEGMENT : 0,
+					  &status)) {
+		fprintf(stderr, "rdn: the video decoder did not start\n");
+		return -1;
+	}
+	if (known && !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_SEGMENT, 0, 3, &mode, &f, &s) && mode) {
+		*first = (uint32_t)f;
+		*size = (uint32_t)s;
+	}
+	return 0;
+}
+
+static int dev_uvd_alloc(struct rdn_device *dev, uint64_t size, uint64_t align, uint64_t *offset)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	int off = 0;
+
+	if (size > 0xffffffffull || align > 0x10000000ull ||
+	    IOConnectMethodScalarIScalarO(d->conn, RDN_UC_ALLOC_UVD, 2, 1, (int)size, (int)align, &off))
+		return -1;
+	*offset = (uint32_t)off;
+	return 0;
+}
+
+/* The kext takes at most 16 MB at a time. */
+static int dev_vram_put(struct rdn_device *dev, uint64_t offset, const void *src, uint64_t bytes)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	const uint8_t *p = (const uint8_t *)src;
+
+	while (bytes) {
+		uint64_t n = bytes < (4u << 20) ? bytes : (4u << 20);
+
+		if (IOConnectMethodScalarIScalarO(d->conn, RDN_UC_VRAM_PUT, 3, 0, (int)offset, (int)(uintptr_t)p, (int)n))
+			return -1;
+		offset += n;
+		p += n;
+		bytes -= n;
+	}
+	return 0;
+}
+
+static int dev_vram_get(struct rdn_device *dev, uint64_t offset, void *dst, uint64_t bytes)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	uint8_t *p = (uint8_t *)dst;
+
+	while (bytes) {
+		uint64_t n = bytes < (4u << 20) ? bytes : (4u << 20);
+
+		if (IOConnectMethodScalarIScalarO(d->conn, RDN_UC_VRAM_GET, 3, 0, (int)offset, (int)(uintptr_t)p, (int)n))
+			return -1;
+		offset += n;
+		p += n;
+		bytes -= n;
+	}
+	return 0;
+}
+
+static int dev_uvd_submit_words(struct rdn_device *dev, const uint32_t *words, uint32_t count, uint32_t *fence)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	int seq = 0;
+
+	if (IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_SUBMIT_WORDS, 2, 1, (int)(uintptr_t)words, (int)count, &seq))
+		return -1;
+	*fence = (uint32_t)seq;
+	return 0;
+}
+
 static long env_number(const char *name);
 static uint64_t now_us(void);
 
@@ -721,6 +803,15 @@ struct rdn_device *rdn_device_open(void)
 			}
 			d->base.uvd_submit = dev_uvd_submit;
 			d->base.uvd_fence_wait = dev_uvd_fence_wait;
+			/* the decoder in a segment: the kext tells by answering the method */
+			if (!getenv("RDN_NO_UVD_SEGMENT") &&
+			    !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_UVD_SEGMENT, 0, 3, &up, &vcpu, &ring)) {
+				d->base.uvd_start = dev_uvd_start;
+				d->base.uvd_alloc = dev_uvd_alloc;
+				d->base.vram_put = dev_vram_put;
+				d->base.vram_get = dev_vram_get;
+				d->base.uvd_submit_words = dev_uvd_submit_words;
+			}
 		}
 	}
 	d->base.surface_region = dev_surface_region;

@@ -45,7 +45,7 @@ struct radeon_drm_winsys {
     */
    struct list_head cache_all;
    struct list_head cache_buckets[128];
-   uint64_t cached_bytes[4];   /* by region: enum rdn_place */
+   uint64_t cached_bytes[5];   /* by region: enum rdn_place (RDN_REGIONS in rdn_winsys.c) */
    /* The newest fence known to have been reached. */
    uint32_t last_done;
    bool have_last_done;
@@ -54,6 +54,13 @@ struct radeon_drm_winsys {
    bool have_uvd_last_done;
    bool uvd_ready;
    bool uvd_used;
+   /*
+    * A process that decodes (rdn_winsys_set_video): its shareable buffers are the decoder's. When the decoder runs in a
+    * segment of the video memory beyond the aperture (docs/UVD.md) they go there (uvd_seg), and the type and number of the
+    * newest decode message are what the feedback must carry (rdn_winsys_uvd_answered()).
+    */
+   bool video, uvd_seg;
+   uint32_t uvd_msg_type, uvd_msg_num;
    /* The newest decoder stream's message and feedback buffers as aperture offsets (rdn_winsys_uvd_answered()). */
    bool uvd_check;
    uint64_t uvd_msg_at, uvd_fb_at;
@@ -63,9 +70,9 @@ struct radeon_drm_winsys {
     * and by size class (class c: under 4 KB << c), and the most there was.
     */
    struct {
-      uint64_t bytes[4], count[4], padding[4];
-      uint64_t class_bytes[4][24], class_count[4][24];
-      uint64_t peak_bytes[4], creates, cache_hits, overflowed;
+      uint64_t bytes[5], count[5], padding[5];
+      uint64_t class_bytes[5][24], class_count[5][24];
+      uint64_t peak_bytes[5], creates, cache_hits, overflowed;
    } mem_stats;
    uint64_t num_flushes;
 };
