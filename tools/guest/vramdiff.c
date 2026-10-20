@@ -87,8 +87,8 @@ int main(int argc, char **argv)
 {
 	io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(RDN_UC_SERVICE_CLASS));
 	io_connect_t conn;
-	mach_vm_address_t addr = 0;
-	mach_vm_size_t len = 0;
+	vm_address_t addr = 0;
+	vm_size_t len = 0;
 	uint32_t *a, *b, *tmp;
 	char cmd[512];
 	int n;
