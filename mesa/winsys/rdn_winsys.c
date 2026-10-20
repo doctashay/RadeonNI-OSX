@@ -1374,6 +1374,18 @@ static int rdn_uvd_segment_submit(struct radeon_drm_winsys *ws, struct rdn_cs *c
       r = ws->dev->vram_put(ws->dev, bo->offset, bo->shadow, bytes);
       if (r)
          return r;
+      if (rdn_uvd_debug()) {
+         /* did the bytes arrive? */
+         uint8_t back[32];
+         unsigned n = bytes < sizeof(back) ? (unsigned)bytes : (unsigned)sizeof(back);
+
+         if (ws->dev->vram_get(ws->dev, bo->offset, back, n))
+            syslog(LOG_NOTICE, "RadeonNIAVC: uvd segment: read back of 0x%llx failed", (unsigned long long)bo->offset);
+         else
+            syslog(LOG_NOTICE, "RadeonNIAVC: uvd segment: put %llu bytes at 0x%llx (stream %s), %s",
+                   (unsigned long long)bytes, (unsigned long long)bo->offset,
+                   bo == msg ? "message" : "buffer", memcmp(back, bo->shadow, n) ? "READ BACK DIFFERENT" : "read back equal");
+      }
       bo->dirty = false;
       bo->shadow_valid = false;
    }
@@ -1381,6 +1393,17 @@ static int rdn_uvd_segment_submit(struct radeon_drm_winsys *ws, struct rdn_cs *c
       r = ws->dev->vram_put(ws->dev, fb->offset + fb_off + 4, zero, 4);
       if (r)
          return r;
+   }
+   if (rdn_uvd_debug()) {
+      char line[300];
+      int len = 0;
+
+      for (k = 0; k < dbg->n && len < (int)sizeof(line) - 40; k++)
+         len += snprintf(line + len, sizeof(line) - len, " %x@%llx+%x/%llx", dbg->cmd[k],
+                         (unsigned long long)dbg->bo[k]->offset, dbg->offset[k], (unsigned long long)dbg->bo[k]->base.size);
+      syslog(LOG_NOTICE, "RadeonNIAVC: uvd segment stream, %u words:%s; first words %08x %08x %08x %08x", rcs->current.cdw, line,
+             rcs->current.cdw > 0 ? rcs->current.buf[0] : 0, rcs->current.cdw > 1 ? rcs->current.buf[1] : 0,
+             rcs->current.cdw > 2 ? rcs->current.buf[2] : 0, rcs->current.cdw > 3 ? rcs->current.buf[3] : 0);
    }
    return ws->dev->uvd_submit_words(ws->dev, rcs->current.buf, rcs->current.cdw, &fence->number);
 }
@@ -1417,6 +1440,13 @@ int rdn_winsys_uvd_answered(struct radeon_winsys *rws)
       /* only a decode message (type 1) is answered; the word is read from video memory the CPU cannot map */
       if (ws->uvd_msg_type != 1 || ws->dev->vram_get(ws->dev, ws->uvd_fb_at + 4, counter, 4))
          return 1;
+      if (rdn_uvd_debug()) {
+         static unsigned said;
+
+         if (said++ < 40)
+            syslog(LOG_NOTICE, "RadeonNIAVC: uvd segment: feedback counter %u, expected %u (at 0x%llx)",
+                   (unsigned)rdn_le32_at(counter), (unsigned)ws->uvd_msg_num, (unsigned long long)(ws->uvd_fb_at + 4));
+      }
       return rdn_le32_at(counter) == ws->uvd_msg_num;
    }
    ws->dev->sync_for_cpu(ws->dev);
