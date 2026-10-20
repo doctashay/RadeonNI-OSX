@@ -159,15 +159,21 @@ The user's first look at the installed component (1080p clip): corrupt pictures,
    display time): all pictures shown in time and identical to ffmpeg's up to 1080p, also with Apple's decoder as the control. `tools/guest/qtplay.c` (movie with a visual
    context) shows pixel buffers whose values are not the decoder's (QuickTime converts them), so it cannot compare; it is kept for timing.
 
-### The decoder stalls in QuickTime Player (open issue, 2026-10-19)
+### The decoder wedges when the frontmost application changes (open issue, 2026-10-19)
 
-After the first picture, Player's "play" is the first decode that the firmware does not answer; nothing decodes until Player quits, and a restart of the firmware
-(three tries) does not bring it back. Headless runs with a gap and disk reads (`rdn_uvdtest -A -g 9000` plus cold reads, ten times) were all right on the new kext.
-What is built and works on the card: the kext restarts the block when a session starts with no other alive and on `RDN_UC_UVD_RESET` (epoch counter, fence numbers go
-on); `rdn_winsys_uvd_answered()` checks the feedback block (`feedback[1] == message[3]`); `rdnvd` waits up to 250 ms for it (`RDNVD_LATE_MS`: the first decodes after a
-restart are answered about 8 ms after their fence, the fence is not proof the picture is there), and on a stall resets, makes a new decoder and replays the access units since
-the last IDR (three tries in a row at most; `RDNVD_FAKE_STALL=n` tries it: 60 of 60 pictures right). What does not work: Player's stall itself. The kext's "minimal" start resets
-only the VCPU on a restart (`vcpu_stop`); a wedged decoder core would survive that, and Linux's full start resets every sub-block first (not tried).
+Not a QuickTime problem: on the G5 any change of the frontmost application (launching Calculator, TextEdit, QuickTime Player or `tools/guest/winprobe.m` the normal way, an AppleScript
+`activate`, a switch back to Finder) stops the decoder: commands and fences run, decodes get no feedback block and no picture, for every program, and neither the kext's
+restarts (VCPU, all sub-blocks) nor a library recovery bring it back; only a restart of the G5 does. A stall right at a launch has been repaired by the library's
+restart and replay; the one at the next switch or exit was not. Windows, GL windows, programs started from the shell, background launches (`open -g`) and Dock-less
+bundles do not trigger it. The registers `rdnuvd regs` reads are the same wedged and healthy; the firmware image is intact. Reproduce: `~/wpswitch.sh` style (a paced
+`rdn_uvdtest -A -P 400` session, then `open -g -a winprobe.app`, then `osascript -e 'tell application "..." to activate'`), see the journal of 2026-10-19.
+What is built and works on the card: the kext restarts the block when a session starts with no other alive (every restart resets all sub-blocks, `rdn_uvd_set_reset_level(1)`) and
+on `RDN_UC_UVD_RESET` (epoch counter, fence numbers go on); `rdn_winsys_uvd_answered()` checks the feedback block (`feedback[1] == message[3]`); `rdnvd` waits up to
+250 ms for it (`RDNVD_LATE_MS`: the first decodes after a restart are answered about 8 ms after their fence), and on a stall resets, makes a new decoder and replays the access
+units since the last IDR (three tries, then the decoder is given up for 2 s, 4 s, up to 30 s and data fails at once; `RDNVD_FAKE_STALL=n` tries it: 60 of 60 right).
+Do not start the block with PM_GLOBAL/PM_SCLK (`rdnuvd init 0x10d80`): the 3D engine's fences stopped completing. A level that also resets the whole block (SOFT_RESET_UVD)
+leaves the VCPU dead. A decoder that fails every picture instantly makes QuickTime ask for the next one at once (100 % of a core): the component should not be installed
+until the wedge is understood.
 
 ## Why
 

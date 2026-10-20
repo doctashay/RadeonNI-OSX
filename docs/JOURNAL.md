@@ -7385,3 +7385,20 @@ After the sync barrier build (kext + winsys) Player still failed at its first de
   main thread wait 250 ms per picture, 150 times over and over (the library now gives up for 2 s, 4 s, up to 30 s and fails data at once; QuickTime then asks
   for the next picture without pause, 100 % of a core: a failed decode must not be left to QuickTime).
 - The component is not installed on the G5 now (removed for these runs; `~/qt-build` has it, `scripts/qt-component.sh install` puts it back).
+
+## 2026-10-19 (night): the trigger is a change of the frontmost application; nothing in the registers we can read differs; a register-write sync does not help
+
+A paced decode session (one session, `rdn_uvdtest -A -P 400`, recovery off, so nothing of ours restarts the block) with winprobe.app started in the
+background (`open -g`, harmless) and then brought to the front by AppleScript (`activate`): the pictures go wrong one second after the first `activate`
+(three runs, same place: au 42 at 17:57:05 and 17:06:51; a fresh process afterwards fails). With the Dock-less, menu-less bundle (LSUIElement) activating it
+did nothing, activating Finder one second later broke the decoder. So the trigger is the frontmost (menu bar owning) application changing: a normal launch
+of any application (Calculator, TextEdit, QuickTime Player, winprobe.app), an AppleScript `activate` of one, or a switch back to Finder. Not triggers: windows,
+GL windows, a shell-started program with a window, a background launch, a UIElement application.
+- The 26 registers `rdnuvd regs` reads are identical in a healthy and in a wedged decoder (same idle state after the last user left).
+- The firmware image in the decoder's memory is intact after the break (`rdnuvd fwcheck`, 0 of 205080 bytes differ).
+- Tried without effect: `sync` before every register write in the kext (`RadeonNI::writeReg`), `sync` before the UVD doorbell, sub-block reset on restarts, 3 restarts.
+- Not tried: recording the window server's command buffers at the moment of the switch (a kext-side ring of the IBs it submits and a scan for writes to
+  registers outside the 3D engine's ranges, e.g. type-0 packets into 0xe000 to 0xffff, and WRITE_DATA to registers); stale words of old decoder IBs in reused IB memory
+  would be one way to write the decoder's registers. A second line: the memory controller's and RLC's state around the switch (their registers are not in the safe list).
+- State left on the G5: the QuickTime component is NOT installed (`scripts/qt-component.sh install` puts it back); kext with level-1 restarts, UVD sync, register-write
+  sync; `~/winprobe.app`, `~/winprobe-ui.app` (source `tools/guest/winprobe.m`), probe scripts in the G5's home.
