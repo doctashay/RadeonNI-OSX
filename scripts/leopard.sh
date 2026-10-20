@@ -81,13 +81,17 @@ check() {
     python3 -I - "$exports" "$out/undefined.txt" <<'PY'
 import re, sys, collections
 d, und = sys.argv[1], sys.argv[2]
-have = set()
-for n in ('System6.0', 'System6.0.ppc', 'IOKit', 'IOKit.ppc', 'Libkern', 'Libkern.ppc',
-          'BSDKernel', 'BSDKernel.ppc', 'Mach', 'Mach.ppc', 'Unsupported', 'Unsupported.ppc'):
+# What the kext may use: the libraries its Info.plist declares (com.apple.kernel.iokit, .libkern, .mach). The lists of
+# the others (BSD, unsupported, the whole kernel) hold more, but loading fails ("Undefined symbols") if the symbol is only there.
+have, elsewhere = set(), set()
+for n, mine in (('IOKit', True), ('IOKit.ppc', True), ('Libkern', True), ('Libkern.ppc', True), ('Mach', True),
+                ('Mach.ppc', True), ('System6.0', False), ('System6.0.ppc', False), ('BSDKernel', False),
+                ('BSDKernel.ppc', False), ('Unsupported', False), ('Unsupported.ppc', False)):
     for l in open('%s/%s.exports' % (d, n), errors='replace'):
         l = l.strip()
         if l and not l.startswith('#'):
-            have.add(l.split(':')[0])      # "name:target" is an alias
+            (have if mine else elsewhere).add(l.split(':')[0])      # "name:target" is an alias
+elsewhere -= have
 syms = [l.strip() for l in open(und) if l.strip()]
 FAMILY = ('IOPCI', 'IOAGP', 'IOFramebuffer', 'IOGraphics', 'IODisplay', 'IOFB', 'IOAccelerator')
 
@@ -104,6 +108,8 @@ for s in syms:
     c = cls(s)
     if c and c.startswith(FAMILY):
         fam[c] += 1
+    elif s in elsewhere:
+        unknown.append(s + '   (exported by the kernel, but not by a library the kext declares)')
     else:
         unknown.append(s)
 print('undefined: %d; in the kernel lists: %d; from the IOPCIFamily and '
