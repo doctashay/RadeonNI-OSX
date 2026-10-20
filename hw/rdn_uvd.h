@@ -53,6 +53,7 @@
 #define RDN_UVD_F_BLANK		(1 << 15)	/* test (kext): the display controllers stop reading video memory while UVD starts */
 #define RDN_UVD_F_PLL		(1 << 16)	/* with MINIMAL: the clocks go up (Linux's 533/400 MHz) at the first command stream, rdn_uvd_wake(), and down at rdn_uvd_idle(); without it the block runs on the bypass clock */
 #define RDN_UVD_F_WINDOWS	(1 << 17)	/* with MINIMAL: also the heap and the stack/session windows of the VCPU's memory (uvd_v2_2_resume() writes all three); without them the firmware's heap and stack are at video memory address 0 */
+#define RDN_UVD_F_SEGMENT	(1 << 18)	/* (kext) the block in a 256 MB segment beyond the aperture (docs/UVD.md); alone it means the default start with it */
 #define RDN_UVD_F_GART		(1 << 9)	/* (kext) the VCPU region and ring in GART memory: addresses with bits 32-39 zero */
 
 struct rdn_uvd {
@@ -70,6 +71,12 @@ struct rdn_uvd {
 	volatile uint8_t *vcpu_cpu, *ring_cpu;
 	uint64_t vcpu_gpu, ring_gpu;
 	bool in_vram;
+	/*
+	 * Video memory the CPU has no mapping of (beyond the aperture): vcpu_cpu and ring_cpu are copies in
+	 * system memory, kept in step through the register window (rdn_uvd_init_window()).
+	 */
+	bool windowed;
+	uint32_t ring_mark;	/* ring_begin(): where the words of this submission start */
 	uint32_t vcpu_offset;	/* firmware, heap, stack, sessions (video memory only) */
 	uint32_t vcpu_bytes;
 	uint32_t ring_offset;	/* (video memory only) */
@@ -131,6 +138,28 @@ int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 		     uint32_t handles, volatile uint8_t *vcpu_cpu, uint64_t vcpu_gpu,
 		     volatile uint8_t *ring_cpu, uint64_t ring_gpu,
 		     uint32_t ring_bytes, uint32_t flags);
+/*
+ * The same with the two regions in video memory the CPU cannot map, at `vcpu_offset` and `ring_offset` (4096-aligned, in
+ * one 256 MB segment of video memory beyond the aperture). `vcpu_shadow` and `ring_shadow` are memory of the
+ * caller's of the same sizes, which stay valid until rdn_uvd_fini(); the library keeps them in step with video memory
+ * (through rdn_vram_put and rdn_vram_get). The decoder's address extension registers are programmed for the segment
+ * (RDN_UVD_F_EXT is added).
+ */
+int rdn_uvd_init_window(struct rdn_uvd *uvd, struct rdn_accel *accel,
+			uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
+			uint32_t handles, volatile uint8_t *vcpu_shadow, uint32_t vcpu_offset,
+			volatile uint8_t *ring_shadow, uint32_t ring_offset,
+			uint32_t ring_bytes, uint32_t flags);
+
+/*
+ * Video memory through the register window (MM_INDEX with its top bit set, MM_DATA): any byte of it, at a few MB a
+ * second. `offset` counts from the start of video memory and stays below 2 GB. The window is one register pair of
+ * the card: the caller serialises it with every other use of the index/data pair (the library does, as it is not
+ * thread-safe).
+ */
+int rdn_vram_put(struct rdn_card *card, uint32_t offset, const void *src, uint32_t bytes);
+int rdn_vram_get(struct rdn_card *card, uint32_t offset, void *dst, uint32_t bytes);
+
 int rdn_uvd_init(struct rdn_uvd *uvd, struct rdn_accel *accel,
 		 uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
 		 uint32_t handles, uint32_t vcpu_offset, uint32_t ring_offset,

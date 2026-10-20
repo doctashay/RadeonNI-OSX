@@ -52,6 +52,11 @@ static uint32_t cmd_word(uint32_t offset)
 
 static void reg_write(uint32_t reg, uint32_t val);
 
+/* The register window (MM_INDEX / MM_DATA) over the model's video memory, for the run in a segment beyond the aperture. */
+static uint32_t window_index;
+static size_t window_size;
+static unsigned window_ops;
+
 static void run_packets(uint32_t offset, uint32_t words)
 {
 	uint32_t i = 0;
@@ -76,6 +81,22 @@ static void reg_write(uint32_t reg, uint32_t val)
 	if (getenv("UVD_MODEL_TRACE"))
 		fprintf(stderr, "W mmio %05x %08x 4\n", (unsigned)reg, (unsigned)val);
 	writes++;
+	if (reg == 4 && (window_index & 0x80000000u)) {
+		uint32_t at = window_index & 0x7fffffffu;
+
+		if (at + 4 > window_size || (at & 3)) {
+			printf("FAIL: window write at %08x\n", (unsigned)at);
+			failures++;
+			return;
+		}
+		mem[at] = val; mem[at + 1] = val >> 8; mem[at + 2] = val >> 16; mem[at + 3] = val >> 24;
+		window_ops++;
+		return;
+	}
+	if (reg == 0) {
+		window_index = val;
+		return;
+	}
 	regs[reg / 4] = val;
 	switch (reg) {
 	case UVD_RBC_RB_WPTR: {
@@ -103,8 +124,8 @@ static void reg_write(uint32_t reg, uint32_t val)
 		run_packets(regs[UVD_RBC_IB_BASE / 4], val);
 		break;
 	case UVD_GPCOM_VCPU_CMD:
-		if (val == 0) {	/* write the fence */
-			uint32_t off = regs[UVD_GPCOM_VCPU_DATA0 / 4], v = regs[UVD_GPCOM_VCPU_DATA1 / 4];
+		if (val == 0) {	/* write the fence: UVD_CONTEXT_ID's value to the address in DATA0 (uvd_v2_2_fence_emit) */
+			uint32_t off = regs[UVD_GPCOM_VCPU_DATA0 / 4], v = regs[UVD_CONTEXT_ID / 4];
 
 			mem[off] = v; mem[off + 1] = v >> 8; mem[off + 2] = v >> 16; mem[off + 3] = v >> 24;
 		}
@@ -118,6 +139,18 @@ static void reg_write(uint32_t reg, uint32_t val)
 static uint32_t reg_read(uint32_t reg)
 {
 	uint32_t v = regs[reg / 4];
+
+	if (reg == 4 && (window_index & 0x80000000u)) {
+		uint32_t at = window_index & 0x7fffffffu;
+
+		if (at + 4 > window_size || (at & 3)) {
+			printf("FAIL: window read at %08x\n", (unsigned)at);
+			failures++;
+			return 0;
+		}
+		window_ops++;
+		return mem_le32(at);
+	}
 
 	switch (reg) {
 	case CG_UPLL_FUNC_CNTL:
@@ -240,12 +273,12 @@ int main(int argc, char **argv)
 	check((regs[CG_UPLL_FUNC_CNTL / 4] & (UPLL_BYPASS_EN_MASK | UPLL_SLEEP_MASK)) ==
 	      (UPLL_BYPASS_EN_MASK | UPLL_SLEEP_MASK), "clocks down again after init (PLL bypassed and asleep)");
 
-	/* two indirect buffers, each writes UVD_CONTEXT_ID; the fence follows each */
+	/* two indirect buffers, each writes UVD_MPC_SET_ALU; the fence follows each */
 	r = rdn_uvd_wake(&uvd);
 	check(r == 0 && (regs[CG_UPLL_FUNC_CNTL / 4] & UPLL_BYPASS_EN_MASK) == 0 &&
 	      regs[CG_UPLL_FUNC_CNTL_3 / 4] == 970296, "wake: PLL out of bypass, fb divider 970296");
 	for (i = 0; i < 2; i++) {
-		uint32_t w0 = RDN_UVD_PACKET0(UVD_CONTEXT_ID, 0), w1 = 0x1000 + i;
+		uint32_t w0 = RDN_UVD_PACKET0(UVD_MPC_SET_ALU, 0), w1 = 0x1000 + i;
 
 		/* the IB's words are in the ring's byte order */
 		if (uvd.swapped) {
@@ -257,7 +290,7 @@ int main(int argc, char **argv)
 		r = rdn_uvd_ib_submit(&uvd, VRAM_BASE + ib_off, 2, &seq);
 		check(r == 0 && seq == i + 1, "IB submitted, fence numbered in turn");
 		check(rdn_uvd_fence_wait(&uvd, seq, 10) == 0, "fence reached");
-		check(regs[UVD_CONTEXT_ID / 4] == 0x1000 + i, "the IB ran");
+		check(regs[UVD_MPC_SET_ALU / 4] == 0x1000 + i, "the IB ran");
 	}
 	check(!rdn_uvd_fence_done(&uvd, 3), "a fence not yet emitted is not done");
 	check(rdn_uvd_ib_submit(&uvd, 0x100000000ull + ib_off, 2, &seq) < 0, "an IB outside the ring's 4 GB segment is refused");
@@ -265,6 +298,74 @@ int main(int argc, char **argv)
 	check(!uvd.ready && regs[UVD_VCPU_CNTL / 4] == 0, "stopped: VCPU clock off");
 
 	free(mem);
+
+	/*
+	 * The same in the second 256 MB segment of video memory, which the CPU cannot map: the firmware region and the ring are
+	 * copies in system memory, pushed through the register window; the segment goes to the address extension registers.
+	 */
+	{
+		const uint32_t seg = 0x10000000u, vcpu_at = seg + 0x100000, ring_at = seg + 0x10000, ibs_at = seg + 0x200000;
+		uint8_t *vcpu_shadow, *ring_shadow, probe[16], back[16];
+		uint32_t bytes = rdn_uvd_vcpu_bytes(FW_SIZE, RDN_UVD_DEFAULT_HANDLES);
+
+		window_size = seg + 0x400000;
+		mem = calloc(1, window_size);
+		vcpu_shadow = calloc(1, bytes);
+		ring_shadow = calloc(1, RING_BYTES + RDN_UVD_RING_EXTRA);
+		regs[UVD_RBC_RB_BASE / 4] = 0;
+		memset(mem + vcpu_at, 0x5a, bytes);	/* what video memory held before */
+		accel.aperture = NULL;
+		accel.aperture_size = 0;
+		window_ops = 0;
+		r = rdn_uvd_init_window(&uvd, &accel, 2700, fw, FW_SIZE, RDN_UVD_DEFAULT_HANDLES, vcpu_shadow, vcpu_at,
+					ring_shadow, ring_at, RING_BYTES, 0);
+		check(r == 0 && uvd.ready, "segment: init succeeds (VCPU boots, ring test passes through the window)");
+		check(memcmp(mem + vcpu_at, fw, FW_SIZE) == 0, "segment: firmware in video memory byte for byte");
+		check(mem[vcpu_at + FW_SIZE] == 0 && mem[vcpu_at + bytes - 1] == 0, "segment: the rest of the region cleared");
+		check(regs[UVD_LMI_ADDR_EXT / 4] == ((1u << 12) | 1u), "segment: address extension is segment 1 (twice)");
+		check(regs[UVD_VCPU_CACHE_OFFSET0 / 4] == (uint32_t)((VRAM_BASE + vcpu_at) >> 3), "segment: cache 0 at the firmware");
+		check(window_ops > bytes / 4, "segment: the bytes went through the window");
+		for (i = 0; i < 2; i++) {
+			uint32_t w[2];
+
+			w[0] = RDN_UVD_PACKET0(UVD_MPC_SET_ALU, 0);
+			w[1] = 0x2000 + i;
+			if (uvd.swapped) {
+				w[0] = bswap32(w[0]);
+				w[1] = bswap32(w[1]);
+			}
+			/* the IB's words are bytes in video memory, in the ring's byte order */
+			{
+				uint8_t ib[8];
+				uint32_t k;
+
+				for (k = 0; k < 2; k++) {
+					ib[k * 4] = (uint8_t)w[k]; ib[k * 4 + 1] = (uint8_t)(w[k] >> 8);
+					ib[k * 4 + 2] = (uint8_t)(w[k] >> 16); ib[k * 4 + 3] = (uint8_t)(w[k] >> 24);
+				}
+				check(rdn_vram_put(&card, ibs_at, ib, 8) == 0, "segment: IB written through the window");
+			}
+			r = rdn_uvd_ib_submit(&uvd, VRAM_BASE + ibs_at, 2, &seq);
+			check(r == 0 && seq == i + 1, "segment: IB submitted");
+			check(rdn_uvd_fence_wait(&uvd, seq, 10) == 0, "segment: fence read back through the window");
+			check(regs[UVD_MPC_SET_ALU / 4] == 0x2000 + i, "segment: the IB ran");
+		}
+		check(!rdn_uvd_fence_done(&uvd, 3), "segment: a fence not yet emitted is not done");
+		/* bytes at odd places */
+		for (i = 0; i < sizeof(probe); i++)
+			probe[i] = (uint8_t)(0x30 + i);
+		check(rdn_vram_put(&card, ibs_at + 0x101, probe, 7) == 0 && mem[ibs_at + 0x100] == 0 &&
+		      memcmp(mem + ibs_at + 0x101, probe, 7) == 0 && mem[ibs_at + 0x108] == 0,
+		      "window: an unaligned write leaves its neighbours alone");
+		memset(back, 0xee, sizeof(back));
+		check(rdn_vram_get(&card, ibs_at + 0x102, back, 5) == 0 && memcmp(back, probe + 1, 5) == 0 && back[5] == 0xee,
+		      "window: an unaligned read");
+		check(rdn_vram_put(&card, 0x7ffffff0u, probe, 16) < 0, "window: beyond 2 GB refused");
+		rdn_uvd_fini(&uvd);
+		free(vcpu_shadow);
+		free(ring_shadow);
+		free(mem);
+	}
 	printf("%s\n", failures ? "FAIL" : "PASS");
 	return failures != 0;
 }

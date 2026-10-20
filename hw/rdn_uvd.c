@@ -292,6 +292,80 @@ static uint32_t get_le32(volatile uint8_t *p)
 	return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* ---- video memory through the register window --------------------------- */
+
+#define MM_INDEX_HI		0x18
+#define MM_INDEX_FB		0x80000000u	/* in MM_INDEX: the address is in video memory, not a register */
+
+static void window_index(struct rdn_card *card, uint32_t at)
+{
+	wr(card, RDN_MMIO_INDEX, at | MM_INDEX_FB);
+}
+
+static void window_write(struct rdn_card *card, uint32_t at, uint32_t value)
+{
+	window_index(card, at);
+	wr(card, RDN_MMIO_DATA, value);
+}
+
+static uint32_t window_read(struct rdn_card *card, uint32_t at)
+{
+	window_index(card, at);
+	return rd(card, RDN_MMIO_DATA);
+}
+
+/* Linux's radeon_ttm_vram_read() and _write() do the same for the debugfs file "radeon_vram". */
+int rdn_vram_put(struct rdn_card *card, uint32_t offset, const void *src, uint32_t bytes)
+{
+	const uint8_t *p = (const uint8_t *)src;
+	uint32_t end = offset + bytes, at;
+
+	if (!bytes)
+		return 0;
+	if (end < offset || end > 0x7ffffffcu)
+		return -EINVAL;
+	wr(card, MM_INDEX_HI, 0);
+	for (at = offset & ~3u; at < end; at += 4) {
+		uint32_t v = 0, i;
+
+		if (at < offset || at + 4 > end)
+			v = window_read(card, at);
+		for (i = 0; i < 4; i++) {
+			uint32_t b = at + i;
+
+			if (b >= offset && b < end)
+				v = (v & ~(0xffu << (8 * i))) | ((uint32_t)p[b - offset] << (8 * i));
+		}
+		window_write(card, at, v);
+	}
+	/* a read comes back after the writes before it */
+	(void)window_read(card, (end - 1) & ~3u);
+	return 0;
+}
+
+int rdn_vram_get(struct rdn_card *card, uint32_t offset, void *dst, uint32_t bytes)
+{
+	uint8_t *p = (uint8_t *)dst;
+	uint32_t end = offset + bytes, at;
+
+	if (!bytes)
+		return 0;
+	if (end < offset || end > 0x7ffffffcu)
+		return -EINVAL;
+	wr(card, MM_INDEX_HI, 0);
+	for (at = offset & ~3u; at < end; at += 4) {
+		uint32_t v = window_read(card, at), i;
+
+		for (i = 0; i < 4; i++) {
+			uint32_t b = at + i;
+
+			if (b >= offset && b < end)
+				p[b - offset] = (uint8_t)(v >> (8 * i));
+		}
+	}
+	return 0;
+}
+
 /* ---- the ring ---------------------------------------------------------- */
 
 static void ring_put(struct rdn_uvd *uvd, uint32_t value)
@@ -313,11 +387,32 @@ static int ring_begin(struct rdn_uvd *uvd, uint32_t words)
 		uint32_t rptr = rd(card, UVD_RBC_RB_RPTR) & (uvd->ring_words - 1);
 		uint32_t used = (uvd->wptr - rptr) & (uvd->ring_words - 1);
 
-		if (uvd->ring_words - 1 - used >= words)
+		if (uvd->ring_words - 1 - used >= words) {
+			uvd->ring_mark = uvd->wptr;
 			return 0;
+		}
 		card->os->delay_us(card->os->cookie, 1);
 	}
 	return -EBUSY;
+}
+
+/* A ring with no CPU view of its memory (windowed): the words written since ring_begin() go to video memory. */
+static void ring_push(struct rdn_uvd *uvd)
+{
+	struct rdn_card *card = uvd->accel->card;
+	uint32_t from = uvd->ring_mark, to = uvd->wptr;
+
+	if (!uvd->windowed || from == to)
+		return;
+	if (to > from) {
+		rdn_vram_put(card, uvd->ring_offset + from * 4, (const uint8_t *)uvd->ring_cpu + from * 4, (to - from) * 4);
+	} else {
+		rdn_vram_put(card, uvd->ring_offset + from * 4, (const uint8_t *)uvd->ring_cpu + from * 4,
+			     (uvd->ring_words - from) * 4);
+		if (to)
+			rdn_vram_put(card, uvd->ring_offset, (const uint8_t *)uvd->ring_cpu, to * 4);
+	}
+	uvd->ring_mark = to;
 }
 
 static void ring_commit(struct rdn_uvd *uvd)
@@ -327,6 +422,7 @@ static void ring_commit(struct rdn_uvd *uvd)
 	/* radeon pads a submission to 16 dwords with no-ops (ring->align_mask); the controller fetches in such blocks */
 	while (uvd->wptr & 15)
 		ring_put(uvd, RDN_UVD_PACKET0(UVD_NO_OP, 0));
+	ring_push(uvd);
 	rdn_hdp_flush(uvd->accel);
 	wr(card, UVD_RBC_RB_WPTR, uvd->wptr);
 	(void)rd(card, UVD_RBC_RB_WPTR);
@@ -729,11 +825,17 @@ int rdn_uvd_idle(struct rdn_uvd *uvd)
 	return rdn_uvd_set_clocks(uvd->accel->card, uvd->ref_freq, 0, 0);
 }
 
-int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
-		     uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
-		     uint32_t handles, volatile uint8_t *vcpu_cpu, uint64_t vcpu_gpu,
-		     volatile uint8_t *ring_cpu, uint64_t ring_gpu,
-		     uint32_t ring_bytes, uint32_t flags)
+/*
+ * `window`: the two regions are in video memory the CPU has no view of; vcpu_cpu and ring_cpu are then copies in system
+ * memory and the bytes that change go to video memory through the register window. `vcpu_off` and `ring_off` are
+ * their offsets in video memory (the aperture's, or beyond it).
+ */
+static int init_common(struct rdn_uvd *uvd, struct rdn_accel *accel,
+		       uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
+		       uint32_t handles, volatile uint8_t *vcpu_cpu, uint64_t vcpu_gpu,
+		       volatile uint8_t *ring_cpu, uint64_t ring_gpu,
+		       uint32_t ring_bytes, uint32_t flags, bool window,
+		       uint32_t vcpu_off, uint32_t ring_off)
 {
 	struct rdn_card *card = accel->card;
 	uint32_t vcpu_bytes = rdn_uvd_vcpu_bytes(fw_size, handles);
@@ -747,8 +849,20 @@ int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 	/* the ring and the VCPU region must share the upper address bits */
 	if ((vcpu_gpu >> 32) != (ring_gpu >> 32))
 		return -EINVAL;
+	/* and, for the decoder's own addressing, the 256 MB segment (bits 28 to 31) */
+	if (((vcpu_gpu + vcpu_bytes - 1) >> 28) != (vcpu_gpu >> 28) || (vcpu_gpu >> 28) != (ring_gpu >> 28) ||
+	    ((ring_gpu + ring_bytes + RDN_UVD_RING_EXTRA - 1) >> 28) != (ring_gpu >> 28))
+		return -EINVAL;
 
 	memset(uvd, 0, sizeof(*uvd));
+	uvd->windowed = window;
+	if (window) {
+		uvd->in_vram = true;
+		uvd->vcpu_offset = vcpu_off;
+		uvd->ring_offset = ring_off;
+		/* the segment must be written to the address extension registers */
+		flags |= RDN_UVD_F_EXT;
+	}
 	uvd->accel = accel;
 	uvd->ref_freq = ref_freq;
 	uvd->handles = handles;
@@ -773,17 +887,43 @@ int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 		for (i = 0; i < ring_bytes + RDN_UVD_RING_EXTRA; i++)
 			ring_cpu[i] = 0;
 	}
+	if (window && !(reset_level & RDN_UVD_RESET_NO_REWRITE)) {
+		r = rdn_vram_put(card, vcpu_off, (const void *)vcpu_cpu, vcpu_bytes);
+		if (!r)
+			r = rdn_vram_put(card, ring_off, (const void *)ring_cpu, ring_bytes + RDN_UVD_RING_EXTRA);
+		if (r)
+			return r;
+	}
 	rdn_hdp_flush(accel);
 	{
 		/* read the firmware back from where the VCPU will fetch it */
 		uint32_t bad = 0, first = 0;
 
-		for (i = 0; i < fw_size; i++)
-			if (vcpu_cpu[i ^ ((flags & RDN_UVD_F_SWAP4) ? 3 : (flags & RDN_UVD_F_SWAP2) ? 2 : 0)] != fw[i]) {
-				if (!bad)
-					first = i;
-				bad++;
+		if (window) {
+			uint8_t chunk[256];
+			uint32_t at, n;
+
+			for (at = 0; at < fw_size; at += n) {
+				n = fw_size - at < sizeof(chunk) ? fw_size - at : (uint32_t)sizeof(chunk);
+				if (rdn_vram_get(card, vcpu_off + at, chunk, n)) {
+					bad = fw_size;
+					break;
+				}
+				for (i = 0; i < n; i++)
+					if (chunk[i] != fw[at + i]) {
+						if (!bad)
+							first = at + i;
+						bad++;
+					}
 			}
+		} else {
+			for (i = 0; i < fw_size; i++)
+				if (vcpu_cpu[i ^ ((flags & RDN_UVD_F_SWAP4) ? 3 : (flags & RDN_UVD_F_SWAP2) ? 2 : 0)] != fw[i]) {
+					if (!bad)
+						first = i;
+					bad++;
+				}
+		}
 		rdn_log(card->os, RDN_LOG_INFO, "uvd: firmware readback: %u of %u bytes differ (first at %u)",
 			(unsigned)bad, (unsigned)fw_size, (unsigned)first);
 	}
@@ -851,6 +991,27 @@ done:
 	if (!(flags & RDN_UVD_F_MINIMAL) && !(r && (flags & RDN_UVD_F_KEEP_CLOCKS)))
 		(void)rdn_uvd_idle(uvd);
 	return r;
+}
+
+int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
+		     uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
+		     uint32_t handles, volatile uint8_t *vcpu_cpu, uint64_t vcpu_gpu,
+		     volatile uint8_t *ring_cpu, uint64_t ring_gpu,
+		     uint32_t ring_bytes, uint32_t flags)
+{
+	return init_common(uvd, accel, ref_freq, fw, fw_size, handles, vcpu_cpu, vcpu_gpu, ring_cpu, ring_gpu,
+			   ring_bytes, flags, false, 0, 0);
+}
+
+int rdn_uvd_init_window(struct rdn_uvd *uvd, struct rdn_accel *accel,
+			uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
+			uint32_t handles, volatile uint8_t *vcpu_shadow, uint32_t vcpu_offset,
+			volatile uint8_t *ring_shadow, uint32_t ring_offset,
+			uint32_t ring_bytes, uint32_t flags)
+{
+	return init_common(uvd, accel, ref_freq, fw, fw_size, handles, vcpu_shadow, accel->vram_base + vcpu_offset,
+			   ring_shadow, accel->vram_base + ring_offset, ring_bytes, flags, true, vcpu_offset,
+			   ring_offset);
 }
 
 int rdn_uvd_init(struct rdn_uvd *uvd, struct rdn_accel *accel,
@@ -938,12 +1099,22 @@ void rdn_uvd_set_fence_base(struct rdn_uvd *uvd, uint32_t base)
 {
 	uvd->fence_emitted = base;
 	put_le32(uvd->ring_cpu + uvd->ring_words * 4, base);
+	if (uvd->windowed)
+		rdn_vram_put(uvd->accel->card, uvd->ring_offset + uvd->ring_words * 4,
+			     (const uint8_t *)uvd->ring_cpu + uvd->ring_words * 4, 4);
 	rdn_hdp_flush(uvd->accel);
 }
 
 bool rdn_uvd_fence_done(struct rdn_uvd *uvd, uint32_t seq)
 {
 	rdn_hdp_flush(uvd->accel);
+	if (uvd->windowed) {
+		uint8_t word[4];
+
+		if (rdn_vram_get(uvd->accel->card, uvd->ring_offset + uvd->ring_words * 4, word, 4))
+			return false;
+		return (int32_t)(get_le32(word) - seq) >= 0;
+	}
 	return (int32_t)(get_le32(uvd->ring_cpu + uvd->ring_words * 4) - seq) >= 0;
 }
 
