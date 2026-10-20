@@ -686,6 +686,27 @@ static bool dev_surface_region(struct rdn_device *dev, uint32_t id,
 	return true;
 }
 
+static bool dev_surface_backing(struct rdn_device *dev, uint32_t id,
+                                void **address, uint32_t *stride,
+                                uint32_t *width, uint32_t *height)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	struct rdn_user_backing b;
+	IOByteCount size = sizeof(b);
+	if (IOConnectMethodScalarIStructureO(d->conn, RDN_UC_SURFACE_BACKING, 1,
+	                                    &size, (int)id, &b) || size != sizeof(b))
+		return false;
+	uint64_t ptr = ((uint64_t)b.address_hi << 32) | b.address_lo;
+	if (!ptr || ptr > UINTPTR_MAX || !b.width || !b.height ||
+	    b.width > 16384 || b.height > 16384 || b.row_bytes < b.width * 4)
+		return false;
+	*address = (void *)(uintptr_t)ptr;
+	*stride = b.row_bytes;
+	*width = b.width;
+	*height = b.height;
+	return true;
+}
+
 static bool dev_surface_buffer(struct rdn_device *dev, uint32_t id,
 			       uint64_t offset, uint32_t row_bytes,
 			       uint32_t width, uint32_t height)
@@ -697,17 +718,17 @@ static bool dev_surface_buffer(struct rdn_device *dev, uint32_t id,
 					     (int)width, (int)height) == 0;
 }
 
-static uint32_t dev_surface_list(struct rdn_device *dev, struct rdn_surface *list,
+static int dev_surface_list(struct rdn_device *dev, struct rdn_surface *list,
 				 uint32_t max)
 {
 	struct darwin_device *d = (struct darwin_device *)dev;
-	static struct rdn_user_surfaces s;
+	struct rdn_user_surfaces s;
 	IOByteCount size = sizeof(s);
 	uint32_t i;
 
 	if (IOConnectMethodScalarIStructureO(d->conn, RDN_UC_SURFACE_LIST, 0,
 					     &size, &s))
-		return 0;
+		return -1;
 	for (i = 0; i < s.count && i < max && i < RDN_USER_SURFACES; i++) {
 		list[i].id = s.surface[i].id;
 		list[i].offset = s.surface[i].offset;
@@ -716,6 +737,43 @@ static uint32_t dev_surface_list(struct rdn_device *dev, struct rdn_surface *lis
 		list[i].height = s.surface[i].height;
 	}
 	return i;
+}
+
+static bool dev_surface_query(struct rdn_device *dev, uint32_t id,
+                              struct rdn_surface *surface, bool *found)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	struct rdn_user_surface_info info;
+	IOByteCount size = sizeof(info);
+	kern_return_t ret;
+
+	*found = false;
+	memset(surface, 0, sizeof(*surface));
+	ret = IOConnectMethodScalarIStructureO(d->conn, RDN_UC_SURFACE_QUERY, 1,
+	                                      &size, (int)id, &info);
+	if (ret == kIOReturnUnsupported) {
+		/* Older kernels have only the original 32-slot registry. */
+		struct rdn_surface list[RDN_USER_SURFACES];
+		int n = dev_surface_list(dev, list, RDN_USER_SURFACES);
+		if (n < 0) return false;
+		for (int i = 0; i < n; ++i) {
+			if (list[i].id == id) {
+				*surface = list[i];
+				*found = true;
+				break;
+			}
+		}
+		return true;
+	}
+	if (ret || size != sizeof(info) || (info.id && info.id != id))
+		return false;
+	surface->id = info.id;
+	surface->offset = info.offset;
+	surface->row_bytes = info.row_bytes;
+	surface->width = info.width;
+	surface->height = info.height;
+	*found = info.id != 0;
+	return true;
 }
 
 static uint32_t dev_surface_locked(struct rdn_device *dev)
@@ -864,9 +922,11 @@ struct rdn_device *rdn_device_open(void)
 		}
 	}
 	d->base.surface_region = dev_surface_region;
+	d->base.surface_backing = dev_surface_backing;
 	d->base.screen_refresh = dev_screen_refresh;
 	d->base.surface_buffer = dev_surface_buffer;
 	d->base.surface_list = dev_surface_list;
+	d->base.surface_query = dev_surface_query;
 	d->base.surface_locked = dev_surface_locked;
 	return &d->base;
 

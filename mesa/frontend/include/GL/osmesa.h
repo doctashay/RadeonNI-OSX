@@ -411,6 +411,9 @@ OSMesaMakeCurrentStore( OSMesaContext ctx, GLuint handle, GLsizei stride,
                         GLuint offset, GLsizei width, GLsizei height,
                         GLuint flags );
 
+/* Publish completed store rendering to a caller-owned CPU backing. */
+GLAPI GLboolean GLAPIENTRY
+OSMesaStoreBacking( OSMesaContext ctx, void *backing, GLsizei stride );
 
 /*
  * osx-gpu: OSMesaTexStore for a store that is not a window's. `target` is

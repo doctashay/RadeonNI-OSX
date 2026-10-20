@@ -73,6 +73,10 @@ struct rdn_device {
       uint32_t width, height, pitch_pixels;
    } screen;
 
+   /* Imported resources retain locally owned drawable storage. */
+   void *(*retain_external)(struct rdn_device *dev, uint64_t offset);
+   void (*release_external)(struct rdn_device *dev, void *reference);
+
    /* Video memory. Offsets are byte offsets into the aperture. */
    int (*alloc)(struct rdn_device *dev, uint64_t size, uint64_t align,
                 uint64_t *offset);
@@ -185,13 +189,20 @@ struct rdn_device {
 
    /*
     * Optional: the surfaces that have such a buffer, at most `max`;
-    * returns how many.
+    * returns how many, or -1 if the query failed.
     */
-   uint32_t (*surface_list)(struct rdn_device *dev, struct rdn_surface *list,
-                            uint32_t max);
+   int (*surface_list)(struct rdn_device *dev, struct rdn_surface *list,
+                       uint32_t max);
+
+   /* Query success is separate from existence, including unbuffered reservations. */
+   bool (*surface_query)(struct rdn_device *dev, uint32_t id,
+                         struct rdn_surface *surface, bool *found);
 
    /* Optional: the surface that is locked for reading right now, or 0. */
    uint32_t (*surface_locked)(struct rdn_device *dev);
+
+   bool (*surface_backing)(struct rdn_device *dev, uint32_t id,
+                           void **address, uint32_t *stride, uint32_t *width, uint32_t *height);
 
    void (*destroy)(struct rdn_device *dev);
 };
