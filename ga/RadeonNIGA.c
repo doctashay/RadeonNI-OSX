@@ -8,13 +8,9 @@
  * compositing with OpenGL on a display that has them
  * (docs/QUARTZ-EXTREME.md).
  *
- * The routines work on the screen's surface in video memory, which the
- * kext's accelerator user client maps (hw/rdn_user.h), with the CPU. That
- * is no faster than what the system does without a plug-in; it is here
- * because it has to exist. With a file /tmp/rdnga.gpu there when the
- * window server starts, fills and copies on a 32-bit screen are the GPU's
- * instead (RDN_UC_SCREEN_FILL, RDN_UC_SCREEN_COPY), and the CPU's again
- * for good after the first call that fails.
+ * The GPU fills and copies 32-bit scanout surfaces. Other depths use the
+ * mapped aperture. Submission failures are returned to the caller; they
+ * never trigger an unsynchronized CPU retry.
  *
  * The shape of a CFPlugIn for this interface was learned from VMsvga2's
  * (MIT, Zenith432); the code is this project's.
@@ -50,14 +46,10 @@ struct ga {
 	/* The screen now; read again on Reset, which follows a mode change. */
 	struct rdn_user_info info;
 	int usable;
-	/*
-	 * Fill and copy with the GPU (a file /tmp/rdnga.gpu, looked for at
-	 * Start and Reset, on a 32-bit screen), until a call fails; and the
-	 * fence of the last one, to wait for before the CPU touches the
-	 * screen.
-	 */
+	/* Last queued screen operation, retained until completion. */
 	int gpu;
 	int gpu_pending;
+	IOReturn gpu_error;
 	UInt32 gpu_fence;
 };
 
@@ -78,63 +70,67 @@ static void ga_read_screen(struct ga *ga)
 		     (ga->info.fb_bits_per_pixel == 8 ||
 		      ga->info.fb_bits_per_pixel == 16 ||
 		      ga->info.fb_bits_per_pixel == 32);
-	ga->gpu = ga->usable && ga->info.fb_bits_per_pixel == 32 &&
-		  access("/tmp/rdnga.gpu", F_OK) == 0;
+	ga->gpu = ga->usable && ga->info.fb_bits_per_pixel == 32;
 }
 
 /*
  * The GPU's fills and copies are queued, not waited for. Before the CPU
  * reads or writes the screen, and when the system asks, wait for the last.
  */
-static void ga_gpu_wait(struct ga *ga)
+static IOReturn ga_gpu_wait(struct ga *ga)
 {
 	UInt32 reached = 0;
-	int tries;
+	IOReturn ret;
+	IOReturn error = ga->gpu_error;
 
 	if (!ga->gpu_pending)
-		return;
-	for (tries = 0; tries < 20 && !reached; tries++)
-		if (IOConnectMethodScalarIScalarO(ga->conn, RDN_UC_FENCE_WAIT, 2, 1,
-						  ga->gpu_fence, 100, &reached))
-			break;
+		return error;
+	ret = IOConnectMethodScalarIScalarO(ga->conn, RDN_UC_FENCE_WAIT, 2, 1,
+					 ga->gpu_fence, 2000, &reached);
+	if (ret)
+		return ret;
+	if (!reached)
+		return kIOReturnTimeout;
 	ga->gpu_pending = 0;
+	return error;
 }
 
-/* True if the GPU took the fill; otherwise it is the CPU's from now on. */
-static int ga_gpu_fill(struct ga *ga, SInt32 x, SInt32 y, SInt32 w, SInt32 h,
-		       UInt32 color)
+static IOReturn ga_gpu_fill(struct ga *ga, SInt32 x, SInt32 y, SInt32 w, SInt32 h,
+			   UInt32 color)
 {
 	UInt32 fence = 0;
+	IOReturn ret;
+	if (ga->gpu_error) return ga->gpu_error;
+	ret = IOConnectMethodScalarIScalarO(ga->conn, RDN_UC_SCREEN_FILL,
+		5, 1, x, y, w, h, color, &fence);
 
-	if (!ga->gpu)
-		return 0;
-	if (IOConnectMethodScalarIScalarO(ga->conn, RDN_UC_SCREEN_FILL, 5, 1,
-					  x, y, w, h, color, &fence)) {
-		ga->gpu = 0;
-		return 0;
+	if (ret) {
+		ga->gpu_error = ret;
+		return ret;
 	}
 	ga->gpu_fence = fence;
 	ga->gpu_pending = 1;
-	return 1;
+	return kIOReturnSuccess;
 }
 
-static int ga_gpu_copy(struct ga *ga, SInt32 sx, SInt32 sy, SInt32 dx, SInt32 dy,
-		       SInt32 w, SInt32 h)
+static IOReturn ga_gpu_copy(struct ga *ga, SInt32 sx, SInt32 sy, SInt32 dx,
+			   SInt32 dy, SInt32 w, SInt32 h)
 {
 	UInt32 fence = 0;
+	IOReturn ret;
 
-	/* Width and height share an argument, 16 bits each. */
-	if (!ga->gpu || w < 0 || h < 0 || w > 0xffff || h > 0xffff)
-		return 0;
-	if (IOConnectMethodScalarIScalarO(ga->conn, RDN_UC_SCREEN_COPY, 5, 1,
-					  sx, sy, dx, dy,
-					  ((UInt32)h << 16) | (UInt32)w, &fence)) {
-		ga->gpu = 0;
-		return 0;
+	if (ga->gpu_error) return ga->gpu_error;
+	if (w < 0 || h < 0 || w > 0xffff || h > 0xffff)
+		return kIOReturnBadArgument;
+	ret = IOConnectMethodScalarIScalarO(ga->conn, RDN_UC_SCREEN_COPY, 5, 1,
+		sx, sy, dx, dy, ((UInt32)h << 16) | (UInt32)w, &fence);
+	if (ret) {
+		ga->gpu_error = ret;
+		return ret;
 	}
 	ga->gpu_fence = fence;
 	ga->gpu_pending = 1;
-	return 1;
+	return kIOReturnSuccess;
 }
 
 /* Address of a pixel of the screen. */
@@ -158,16 +154,18 @@ static int ga_clip(struct ga *ga, SInt32 *x, SInt32 *y, SInt32 *w, SInt32 *h)
 	return *w > 0 && *h > 0;
 }
 
-static void ga_fill(struct ga *ga, SInt32 x, SInt32 y, SInt32 w, SInt32 h,
+static IOReturn ga_fill(struct ga *ga, SInt32 x, SInt32 y, SInt32 w, SInt32 h,
 		    UInt32 color)
 {
 	SInt32 row, col;
 
 	if (!ga_clip(ga, &x, &y, &w, &h))
-		return;
-	if (ga_gpu_fill(ga, x, y, w, h, color))
-		return;
-	ga_gpu_wait(ga);
+		return kIOReturnSuccess;
+	if (ga->gpu)
+		return ga_gpu_fill(ga, x, y, w, h, color);
+	IOReturn ret = ga_gpu_wait(ga);
+	if (ret)
+		return ret;
 	for (row = 0; row < h; row++) {
 		uint8_t *p = ga_pixel(ga, x, y + row);
 
@@ -185,10 +183,11 @@ static void ga_fill(struct ga *ga, SInt32 x, SInt32 y, SInt32 w, SInt32 h,
 			break;
 		}
 	}
+	return kIOReturnSuccess;
 }
 
 /* Screen to screen, overlapping or not. */
-static void ga_copy(struct ga *ga, SInt32 sx, SInt32 sy, SInt32 dx, SInt32 dy,
+static IOReturn ga_copy(struct ga *ga, SInt32 sx, SInt32 sy, SInt32 dx, SInt32 dy,
 		    SInt32 w, SInt32 h)
 {
 	UInt32 bytes = ga->info.fb_bits_per_pixel / 8;
@@ -197,16 +196,18 @@ static void ga_copy(struct ga *ga, SInt32 sx, SInt32 sy, SInt32 dx, SInt32 dy,
 	/* Clip the destination, carry the source along, then the source. */
 	cx = dx; cy = dy; cw = w; ch = h;
 	if (!ga_clip(ga, &cx, &cy, &cw, &ch))
-		return;
+		return kIOReturnSuccess;
 	sx += cx - dx; sy += cy - dy; dx = cx; dy = cy; w = cw; h = ch;
 	cx = sx; cy = sy; cw = w; ch = h;
 	if (!ga_clip(ga, &cx, &cy, &cw, &ch))
-		return;
+		return kIOReturnSuccess;
 	dx += cx - sx; dy += cy - sy; sx = cx; sy = cy; w = cw; h = ch;
 
-	if (ga_gpu_copy(ga, sx, sy, dx, dy, w, h))
-		return;
-	ga_gpu_wait(ga);
+	if (ga->gpu)
+		return ga_gpu_copy(ga, sx, sy, dx, dy, w, h);
+	IOReturn ret = ga_gpu_wait(ga);
+	if (ret)
+		return ret;
 
 	if (dy < sy) {
 		for (row = 0; row < h; row++)
@@ -217,6 +218,7 @@ static void ga_copy(struct ga *ga, SInt32 sx, SInt32 sy, SInt32 dx, SInt32 dy,
 			memmove(ga_pixel(ga, dx, dy + row), ga_pixel(ga, sx, sy + row),
 				(size_t)w * bytes);
 	}
+	return kIOReturnSuccess;
 }
 
 /*
@@ -332,10 +334,12 @@ static IOReturn blit_fill(void *self, IOOptionBits options, IOBlitType type,
 	}
 	if (!ga || !ga->usable || !rects)
 		return kIOReturnNotReady;
-	for (i = 0; i < rects->count; i++)
-		ga_fill(ga, rects->rects[i].x, rects->rects[i].y,
+	for (i = 0; i < rects->count; i++) {
+		IOReturn ret = ga_fill(ga, rects->rects[i].x, rects->rects[i].y,
 			rects->rects[i].width, rects->rects[i].height,
 			rects->operation.color0);
+		if (ret) return ret;
+	}
 	return kIOReturnSuccess;
 }
 
@@ -357,10 +361,12 @@ static IOReturn blit_copy(void *self, IOOptionBits options, IOBlitType type,
 	}
 	if (!ga || !ga->usable || !rects)
 		return kIOReturnNotReady;
-	for (i = 0; i < rects->count; i++)
-		ga_copy(ga, rects->rects[i].sourceX, rects->rects[i].sourceY,
+	for (i = 0; i < rects->count; i++) {
+		IOReturn ret = ga_copy(ga, rects->rects[i].sourceX, rects->rects[i].sourceY,
 			rects->rects[i].x, rects->rects[i].y,
 			rects->rects[i].width, rects->rects[i].height);
+		if (ret) return ret;
+	}
 	return kIOReturnSuccess;
 }
 
@@ -397,9 +403,8 @@ static IOReturn blit_copy_region(void *self, IOOptionBits options,
 	dy = copy->deltaY - rgn->bounds.y;
 	n = rgn->num_rects;
 	if (!n) {
-		ga_copy(ga, rgn->bounds.x, rgn->bounds.y, rgn->bounds.x + dx,
+		return ga_copy(ga, rgn->bounds.x, rgn->bounds.y, rgn->bounds.x + dx,
 			rgn->bounds.y + dy, rgn->bounds.w, rgn->bounds.h);
-		return kIOReturnSuccess;
 	}
 	/*
 	 * Rectangles of a region come top to bottom, left to right. Going
@@ -409,7 +414,8 @@ static IOReturn blit_copy_region(void *self, IOOptionBits options,
 	for (i = 0; i < n; i++) {
 		IOAccelBounds *r = &rgn->rect[(dy > 0 || (dy == 0 && dx > 0)) ? n - 1 - i : i];
 
-		ga_copy(ga, r->x, r->y, r->x + dx, r->y + dy, r->w, r->h);
+		IOReturn ret = ga_copy(ga, r->x, r->y, r->x + dx, r->y + dy, r->w, r->h);
+		if (ret) return ret;
 	}
 	return kIOReturnSuccess;
 }
@@ -499,21 +505,29 @@ static IOReturn ga_start(void *self, CFDictionaryRef properties,
 static IOReturn ga_stop(void *self)
 {
 	struct ga *ga = self;
+	IOReturn ret = ga_gpu_wait(ga);
 
 	if (ga->conn) {
+		if (ga->aperture)
+			IOConnectUnmapMemory(ga->conn, RDN_UC_MEMORY_APERTURE,
+				mach_task_self(), (vm_address_t)ga->aperture);
 		IOServiceClose(ga->conn);
 		ga->conn = 0;
 	}
 	ga->aperture = NULL;
-	ga->usable = 0;
-	return kIOReturnSuccess;
+	ga->usable = ga->gpu_pending = 0;
+	ga->gpu_error = kIOReturnSuccess;
+	return ret;
 }
 
 static IOReturn ga_reset(void *self, IOOptionBits options)
 {
+	struct ga *ga = self;
+	IOReturn ret = ga_gpu_wait(ga);
+	if (ret) return ret;
 	ga_stats_switch();
-	ga_read_screen(self);
-	return kIOReturnSuccess;
+	ga_read_screen(ga);
+	return ga->usable ? kIOReturnSuccess : kIOReturnNotReady;
 }
 
 static IOReturn ga_copy_capabilities(void *self, FourCharCode select,
@@ -524,15 +538,13 @@ static IOReturn ga_copy_capabilities(void *self, FourCharCode select,
 
 static IOReturn ga_flush(void *self, IOOptionBits options)
 {
-	ga_gpu_wait(self);
-	return kIOReturnSuccess;
+	return ga_gpu_wait(self);
 }
 
 static IOReturn ga_synchronize(void *self, UInt32 options, UInt32 x, UInt32 y,
 			       UInt32 w, UInt32 h)
 {
-	ga_gpu_wait(self);
-	return kIOReturnSuccess;
+	return ga_gpu_wait(self);
 }
 
 static IOReturn ga_get_beam_position(void *self, IOOptionBits options,
@@ -606,8 +618,7 @@ static IOReturn ga_get_blitter(void *self, IOOptionBits options, IOBlitType type
 
 static IOReturn ga_wait_complete(void *self, IOOptionBits options)
 {
-	ga_gpu_wait(self);
-	return kIOReturnSuccess;
+	return ga_gpu_wait(self);
 }
 
 static void build_interface(void)
