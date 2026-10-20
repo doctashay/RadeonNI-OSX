@@ -5,6 +5,7 @@
  * allocates in the same few milliseconds may see its allocation fail, so do not run it while a clip is playing.
  *
  *   vramfree                 largest block, total free, and the pieces
+ *   vramfree -h              the same for the video memory beyond the aperture (RDN_UC_ALLOC_HIDDEN), which only the GPU reaches
  *   vramfree dpb image bitstream   also the decoder's room check as rdnvd's room_for() makes it: `dpb` bytes, then four buffers of
  *                            `bitstream` bytes, eight of `image` bytes and one of 1 MB, all held at once (1080p: 23827456 3133440 4177920)
  *
@@ -18,18 +19,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <mach/mach.h>
 #include <IOKit/IOKitLib.h>
 
 #include "rdn_user.h"
 
 static io_connect_t conn;
+static int hidden;
 
 static int vram_alloc(uint32_t bytes, uint32_t *offset)
 {
 	int off = 0;
 
-	if (IOConnectMethodScalarIScalarO(conn, RDN_UC_ALLOC, 2, 1, (int)bytes, 4096, &off))
+	if (IOConnectMethodScalarIScalarO(conn, hidden ? RDN_UC_ALLOC_HIDDEN : RDN_UC_ALLOC, 2, 1, (int)bytes, 4096, &off))
 		return -1;
 	*offset = (uint32_t)off;
 	return 0;
@@ -75,7 +78,19 @@ int main(int argc, char **argv)
 		fprintf(stderr, "no info\n");
 		return 1;
 	}
-	printf("heap %u KB (from %u KB)\n", info.heap_size / 1024, info.heap_offset / 1024);
+	if (argc >= 2 && !strcmp(argv[1], "-h")) {
+		int hoff = 0, hsize = 0;
+
+		if (IOConnectMethodScalarIScalarO(conn, RDN_UC_HIDDEN_INFO, 0, 2, &hoff, &hsize) || !hsize) {
+			fprintf(stderr, "no hidden memory\n");
+			return 1;
+		}
+		hidden = 1;
+		info.heap_size = (uint32_t)hsize;
+		info.heap_offset = (uint32_t)hoff;
+		argc = 1;
+	}
+	printf("%s heap %u KB (from %u KB)\n", hidden ? "hidden" : "visible", info.heap_size / 1024, info.heap_offset / 1024);
 	printf("largest block: %u KB\n", largest(info.heap_size) / 1024);
 	/* the pieces: take the largest block, again and again, then give them all back */
 	for (;;) {

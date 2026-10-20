@@ -7505,3 +7505,19 @@ used its own decoder for the new session. So the earlier statement here that App
   1:1 (frame 146) and scaled (frame 620) equal the reference pictures. In the resize QuickTime kept the old session, re-preflighted it and used the two new instances only as probes. After closing a movie
   the free memory is back to 100 MB (in pieces); after quitting Player one block of 100 MB.
 - Not done: speed (the serial decode, read-out and conversion), still about 33 pictures a second at best at 1080p.
+
+## 2026-10-20 (night): what holds the visible heap, and whether the aperture can be widened (question, one measurement)
+
+The user asked why the window server and Quartz Extreme take 124 MB of the visible heap, whether they could live in the video memory beyond the 256 MB aperture, and whether the aperture can be opened to the whole 1 GB.
+- `vramfree -h` (new option: the same bisection on `RDN_UC_ALLOC_HIDDEN`) on the G5 with only the login session running: visible heap 227328 KB with one free block of 100264 KB, so 127064 KB in use; hidden region
+  786432 KB, one free block of 786428 KB, so nothing is in it. The window server and Quartz Extreme use no hidden memory at all. Of the 127 MB the kext's own part is about 3 to 4 MB by arithmetic (GART table 2 MB,
+  UVD firmware window, heap, stack and sessions about 1 MB, rings); the rest belongs to the two `RadeonNIUserClient` connections in `ioreg`. Not attributed further: the winsys sends a buffer to the hidden region only when Mesa
+  marks it `RADEON_FLAG_NO_CPU_ACCESS` (tiled textures, render targets); why the window server's surfaces do not carry it is not known (candidates: linear or client-storage textures Apple's layer fills with the CPU, buffers
+  the winsys cache holds for reuse, up to 32 MB for the aperture). Needs per-client numbers (kext accounting shown in `ioreg`, or `RDN_STATS=1` in the window server's environment, which means restarting it).
+- Aperture to 1 GB, from the code and notes (nothing run): the BAR is 256 MB in hardware and was assigned by the firmware; whether this card has the Resizable BAR capability was not read (no saved config-space dump; the card is
+  in the G5), and a card of this generation probably has none (inference). `HDP_NONSURFACE_BASE` (0x2c04, written by `rdn_mc_relocate`) sets which video memory address the aperture's offset 0 shows, so the 256 MB window could in
+  principle slide, but every CPU mapping would change with it at once (the window server draws the screen through the aperture), so it is not usable while anything else maps it. Not tried.
+- The decoder's limit is not the aperture: its addresses are masked to one 256 MB segment chosen by `UVD_LMI_ADDR_EXT` / `UVD_LMI_EXT40_ADDR` (`hw/rdn_uvd.c` writes `((at >> 28) & 0xF) << 12 | ((at >> 28) & 0xF)`), and the
+  firmware window, ring, messages, bitstream, DPB and pictures must all be in it. The earlier "hidden memory does not work" test moved the picture buffer alone into another segment. Pointing the whole decoder at the
+  second 256 MB (hidden, empty) was never tried; the CPU could not write the bitstream and messages there, so they would go through the GART or the aperture and a GPU copy (`hw/rdn_blit.c`), and read-out could be a GPU copy
+  to system memory instead of CPU reads through the aperture. Idea only; a wrong segment setting has wedged the block before.
