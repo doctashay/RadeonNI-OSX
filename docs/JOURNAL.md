@@ -7763,3 +7763,26 @@ conclusion about the required client buffer representation.
 CS:GO PID 330 rendered the Dust loading screen, then crashed at 10:47:53
 in _mesa_bind_framebuffers+212 on render thread 19, during ToGL presentation.
 Report saved as ../csgo-modern-104753.crash. No game-stability pass.
+
+## 2026-10-20: the friend's `leopard-fixes` (18 commits) rebased onto main, installed and tested on the G5 under 10.4.11 and 10.5.9
+
+Branch `leopard-fixes-rebased` (authorship kept). Six conflict files; the ones that needed a decision: client cleanup in
+`RadeonNIAccel.cpp` (their `releaseClientMemory()` around our UVD teardown), the winsys allocator (their retry loop, our segment
+branch, GART overflow only for buffers that are neither shareable nor GPU-only), buffer busy marking (`last_uvd` in their
+`rdn_cs_mark_busy()`), `rdn_mesa_expect_surface` (our same-surface early return, then their `reserve_surface()`). The first
+Mesa build found one real merge error (`rdn_number_wait` gained a `uvd` argument; fixed in `780ff51`). The patch series applies
+to pristine Mesa; their patches are 0018 to 0021 now.
+
+Built on arch-server in a worktree with its own Mesa source copy. `gld-relink.py` takes its Mesa tree from the checkout that
+`firmware/` points to: a worktree needs a real `firmware/` or it links the main tree's objects.
+
+G5, Leopard then Tiger, each with the old install saved as a tarball (`leopard-installed-BEFORE-lf.tar`,
+`tiger-installed-BEFORE-lf.tar`) and the startup volume restored to `first-boot/@0:5,\\:tbxi` at the end. Both load the new kext,
+3D engine and GART up, desktop correct by readback. Passing on both: entry points, `uc64test`, `clientclosetest`,
+`surfaceregtest`, `gl64test`, `buffercopytest`, `drawoverlaptest`, `viewporttest`; Quartz Extreme in use on Tiger. 64-bit
+programs cannot start on this 10.5.9 (no ppc64 `libsqlite3`) except `uc64test`, which passes. `depthstresstest` fails at any
+size and sample count (incomplete FBO) with the old bundle too, so not a regression; `cpdmatest` was not run (raw CP DMA).
+
+**Changed default, not decided by the user:** on Leopard (kernel 9.8.x) programs now see GL 2.1 / GLSL 1.20 and no
+`GL_ARB_framebuffer_object` unless they create a modern context (`leopard_gl_compat()` in `gld/gen_dispatch.py`); the old
+bundle said 4.6 compatibility. Tiger still says 4.6. Open question for the user.
