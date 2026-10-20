@@ -110,6 +110,9 @@ public:
 	/* Start the block again: the sessions programs left in the firmware (they end without destroying them) go. */
 	void uvdRestart(UInt32 level);
 	IOReturn uvdInfo(UInt32 *up, UInt32 *vcpuOffset, UInt32 *ringOffset);
+	/* Debugging (RDN_UC_IBLOG): kind '3' a command buffer, 'U' a decoder stream, 'F' 'C' a screen fill or copy, 'M' a mark. */
+	void ibRecord(UInt32 kind, void *client, UInt32 offset, UInt32 words);
+	IOReturn ibLogControl(UInt32 op, UInt32 *ms);
 	IOMemoryDescriptor *apertureMemory(void);
 	UInt32 apertureBytes(void);
 	/* The shapes of the window server's surfaces, by surface ID. */
@@ -164,6 +167,16 @@ private:
 	UInt32 fUvdFlags;
 	uint32_t fUvdRef;
 	bool fUvdDirty;
+	/* The command buffer recorder: a ring of what was submitted and the text of what the scan found. */
+	struct IbEntry { UInt32 ms, client, pid, offset, words, kind, found; };
+	bool fIbOn;
+	IbEntry *fIbEntries;
+	UInt32 fIbTotal;
+	char *fIbText;
+	UInt32 fIbTextLen, fIbFound;
+	UInt32 ibScan(UInt32 ms, UInt32 pid, UInt32 client, UInt32 offset, UInt32 words);
+	void ibNote(const char *fmt, ...);
+	bool ibInUvd(UInt32 address);
 	/* A page of video memory for messages of the kext's own. */
 	UInt32 fUvdScratch;
 	/* The session messages in a stream of commands: type (0 create, 2 destroy) and handle of each. */
@@ -271,6 +284,7 @@ public:
 	IOReturn methodUvdInfo(UInt32 *up, UInt32 *vcpuOffset, UInt32 *ringOffset);
 	IOReturn methodUvdReset(UInt32 *epoch);
 	IOReturn methodUvdEpoch(UInt32 *epoch);
+	IOReturn methodIbLog(UInt32 op, UInt32 *ms);
 	IOReturn methodAllocHidden(UInt32 size, UInt32 align, UInt32 *offset);
 	IOReturn methodHiddenInfo(UInt32 *offset, UInt32 *size);
 	IOReturn methodGartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages);

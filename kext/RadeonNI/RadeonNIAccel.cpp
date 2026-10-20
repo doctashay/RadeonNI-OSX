@@ -7,6 +7,10 @@
  */
 
 #include <IOKit/IOLib.h>
+#include <kern/clock.h>
+#include <libkern/libkern.h>
+#include <stdarg.h>
+#include <sys/proc.h>
 #include <IOKit/graphics/IOGraphicsInterfaceTypes.h>
 
 #include "RadeonNI.h"
@@ -1045,6 +1049,254 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 }
 
 /*
+ * The command buffer recorder (RDN_UC_IBLOG). Off unless a program turns it on; then each command buffer submitted is listed (time, client, process,
+ * size) and read once through the aperture and walked packet by packet. What is noted: packets of type 0 (register writes the 3D
+ * engine's drivers do not make), SET_CONFIG_REG and SET_CONTEXT_REG outside their ranges, WRITE_DATA and COPY_DATA into registers, and any address
+ * that points into the decoder's own memory (its firmware window, ring and scratch page) in a memory write, a render target or depth base,
+ * or a resource descriptor.
+ */
+static const UInt32 kIbEntries = 512;
+static const UInt32 kIbTextBytes = 24 * 1024;
+
+static UInt32 kernelMs(void)
+{
+	uint64_t abstime, nanos;
+
+	clock_get_uptime(&abstime);
+	absolutetime_to_nanoseconds(abstime, &nanos);
+	return (UInt32)(nanos / 1000000ULL);
+}
+
+void RadeonNIAccel::ibNote(const char *fmt, ...)
+{
+	va_list ap;
+	char line[160];
+	UInt32 n;
+
+	if (!fIbText || fIbTextLen + 2 >= kIbTextBytes)
+		return;
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	for (n = 0; line[n] && fIbTextLen + 2 < kIbTextBytes; n++)
+		fIbText[fIbTextLen++] = line[n];
+	fIbText[fIbTextLen++] = '\n';
+	fIbText[fIbTextLen] = 0;
+}
+
+/* Is this offset in the aperture one of the decoder's own pages? */
+bool RadeonNIAccel::ibInUvd(UInt32 address)
+{
+	if (!fUvdUp)
+		return false;
+	if (address >= fUvd.vcpu_offset && address < fUvd.vcpu_offset + fUvd.vcpu_bytes)
+		return true;
+	if (address >= fUvd.ring_offset && address < fUvd.ring_offset + 4096 + RDN_UVD_RING_EXTRA)
+		return true;
+	if (fUvdScratch && address >= fUvdScratch && address < fUvdScratch + 4096)
+		return true;
+	return false;
+}
+
+UInt32 RadeonNIAccel::ibScan(UInt32 ms, UInt32 pid, UInt32 client, UInt32 offset, UInt32 words)
+{
+	volatile UInt32 *w = (volatile UInt32 *)((UInt8 *)fAccel.aperture + offset);
+	UInt32 i = 0, found = 0;
+	char who[64];
+
+	snprintf(who, sizeof(who), "t=%lu pid=%lu cl=%08lx ib=0x%lx+%lu", (unsigned long)ms, (unsigned long)pid,
+		 (unsigned long)client, (unsigned long)offset, (unsigned long)words);
+	while (i < words) {
+		UInt32 h = w[i], type = h >> 30, count, op, k, start;
+
+		if (type == 2) {
+			i++;
+			continue;
+		}
+		if (type == 0) {
+			count = ((h >> 16) & 0x3fff) + 1;
+			ibNote("%s: type 0 packet, register 0x%lx, %lu dwords, at word %lu", who, (unsigned long)((h & 0x1fff) << 2),
+			       (unsigned long)count, (unsigned long)i);
+			found++;
+			i += 1 + count;
+			continue;
+		}
+		if (type != 3) {
+			ibNote("%s: header 0x%08lx is no packet, at word %lu", who, (unsigned long)h, (unsigned long)i);
+			found++;
+			break;
+		}
+		op = (h >> 8) & 0xff;
+		count = ((h >> 16) & 0x3fff) + 1;
+		if (i + 1 + count > words) {
+			ibNote("%s: packet 0x%02lx of %lu dwords runs past the buffer, at word %lu", who, (unsigned long)op,
+			       (unsigned long)count, (unsigned long)i);
+			found++;
+			break;
+		}
+		{
+			volatile UInt32 *d = w + i + 1;
+
+			switch (op) {
+			case 0x68:	/* SET_CONFIG_REG */
+				start = 0x8000 + (d[0] << 2);
+				if (start < 0x8000 || start + (count - 1) * 4 > 0xb000) {
+					ibNote("%s: SET_CONFIG_REG 0x%lx, %lu regs, outside its range, at word %lu", who,
+					       (unsigned long)start, (unsigned long)(count - 1), (unsigned long)i);
+					found++;
+				}
+				break;
+			case 0x69:	/* SET_CONTEXT_REG */
+				start = 0x28000 + (d[0] << 2);
+				if (start < 0x28000 || start + (count - 1) * 4 > 0x29000) {
+					ibNote("%s: SET_CONTEXT_REG 0x%lx, %lu regs, outside its range, at word %lu", who,
+					       (unsigned long)start, (unsigned long)(count - 1), (unsigned long)i);
+					found++;
+				}
+				for (k = 1; k < count; k++)
+					if (ibInUvd(d[k] << 8)) {
+						ibNote("%s: SET_CONTEXT_REG 0x%lx = 0x%lx points into the decoder's memory (at 0x%lx), at word %lu",
+						       who, (unsigned long)(start + (k - 1) * 4), (unsigned long)d[k],
+						       (unsigned long)(d[k] << 8), (unsigned long)i);
+						found++;
+					}
+				break;
+			case 0x6d:	/* SET_RESOURCE */
+				for (k = 1; k < count; k++)
+					if (ibInUvd(d[k]) || ibInUvd(d[k] << 8)) {
+						ibNote("%s: SET_RESOURCE dword %lu = 0x%lx points into the decoder's memory, at word %lu", who,
+						       (unsigned long)k, (unsigned long)d[k], (unsigned long)i);
+						found++;
+					}
+				break;
+			case 0x37:	/* WRITE_DATA */
+				if (count >= 3) {
+					UInt32 dst = (d[0] >> 8) & 0xf;
+
+					if (dst == 0) {
+						ibNote("%s: WRITE_DATA into register 0x%lx, %lu dwords, at word %lu", who,
+						       (unsigned long)(d[1] << 2), (unsigned long)(count - 3), (unsigned long)i);
+						found++;
+					} else if (ibInUvd(d[1] & ~(UInt32)3)) {
+						ibNote("%s: WRITE_DATA to 0x%lx in the decoder's memory, at word %lu", who,
+						       (unsigned long)d[1], (unsigned long)i);
+						found++;
+					}
+				}
+				break;
+			case 0x40:	/* COPY_DATA */
+				if (count >= 5) {
+					UInt32 dst = (d[0] >> 8) & 0xf;
+
+					if (dst == 0) {
+						ibNote("%s: COPY_DATA into register 0x%lx, at word %lu", who, (unsigned long)(d[3] << 2),
+						       (unsigned long)i);
+						found++;
+					} else if (ibInUvd(d[3] & ~(UInt32)3)) {
+						ibNote("%s: COPY_DATA to 0x%lx in the decoder's memory, at word %lu", who,
+						       (unsigned long)d[3], (unsigned long)i);
+						found++;
+					}
+				}
+				break;
+			case 0x47:	/* EVENT_WRITE_EOP */
+				if (count >= 5 && ibInUvd(d[1] & ~(UInt32)3)) {
+					ibNote("%s: EVENT_WRITE_EOP to 0x%lx in the decoder's memory, at word %lu", who,
+					       (unsigned long)d[1], (unsigned long)i);
+					found++;
+				}
+				break;
+			case 0x3d:	/* MEM_WRITE */
+				if (count >= 3 && ibInUvd(d[0] & ~(UInt32)3)) {
+					ibNote("%s: MEM_WRITE to 0x%lx in the decoder's memory, at word %lu", who,
+					       (unsigned long)d[0], (unsigned long)i);
+					found++;
+				}
+				break;
+			default:
+				break;
+			}
+		}
+		i += 1 + count;
+	}
+	return found;
+}
+
+void RadeonNIAccel::ibRecord(UInt32 kind, void *client, UInt32 offset, UInt32 words)
+{
+	UInt32 ms, pid, found = 0;
+	IbEntry *e;
+
+	if (!fIbOn)
+		return;
+	ms = kernelMs();
+	pid = (UInt32)proc_selfpid();
+	if (kind == '3' && offset >= HEAP_OFFSET && words && words <= (fAccel.aperture_size - offset) / 4 && !(offset & 3))
+		found = ibScan(ms, pid, (UInt32)(unsigned long)client, offset, words);
+	fIbFound += found;
+	e = &fIbEntries[fIbTotal % kIbEntries];
+	e->ms = ms;
+	e->client = (UInt32)(unsigned long)client;
+	e->pid = pid;
+	e->offset = offset;
+	e->words = words;
+	e->kind = kind;
+	e->found = found;
+	fIbTotal++;
+}
+
+IOReturn RadeonNIAccel::ibLogControl(UInt32 op, UInt32 *ms)
+{
+	*ms = kernelMs();
+	if (op == 0) {
+		fIbOn = false;
+		return kIOReturnSuccess;
+	}
+	if (op == 1) {
+		if (!fIbEntries)
+			fIbEntries = (IbEntry *)IOMalloc(kIbEntries * sizeof(IbEntry));
+		if (!fIbText)
+			fIbText = (char *)IOMalloc(kIbTextBytes);
+		if (!fIbEntries || !fIbText)
+			return kIOReturnNoMemory;
+		bzero(fIbEntries, kIbEntries * sizeof(IbEntry));
+		fIbText[0] = 0;
+		fIbTextLen = 0;
+		fIbTotal = 0;
+		fIbFound = 0;
+		fIbOn = true;
+		return kIOReturnSuccess;
+	}
+	if (!fIbEntries || !fIbText)
+		return kIOReturnNotReady;
+	if (op == 3) {
+		ibRecord('M', 0, 0, 0);
+		return kIOReturnSuccess;
+	}
+	if (op == 2) {
+		/* the findings, then the last entries (oldest first) */
+		static char text[32 * 1024];
+		UInt32 len = 0, first, n;
+
+		len += snprintf(text + len, sizeof(text) - len, "on=%d entries=%lu findings=%lu now=%lu\n", fIbOn ? 1 : 0,
+				(unsigned long)fIbTotal, (unsigned long)fIbFound, (unsigned long)*ms);
+		len += snprintf(text + len, sizeof(text) - len, "-- findings --\n%s", fIbText);
+		len += snprintf(text + len, sizeof(text) - len, "-- last entries: time kind client pid ib words findings --\n");
+		first = fIbTotal > 160 ? fIbTotal - 160 : 0;
+		for (n = first; n < fIbTotal && len + 80 < sizeof(text); n++) {
+			IbEntry *e = &fIbEntries[n % kIbEntries];
+
+			len += snprintf(text + len, sizeof(text) - len, "%lu %c %08lx %lu 0x%lx %lu %lu\n", (unsigned long)e->ms,
+					(char)e->kind, (unsigned long)e->client, (unsigned long)e->pid, (unsigned long)e->offset,
+					(unsigned long)e->words, (unsigned long)e->found);
+		}
+		setProperty("IBLog", text);
+		return kIOReturnSuccess;
+	}
+	return kIOReturnBadArgument;
+}
+
+/*
  * A program's decoder stopped answering: start the firmware again now. Waits (a little) for what is running, then does
  * it whatever else is going on; the other programs' sessions are gone, and they find out by the epoch.
  */
@@ -1853,6 +2105,8 @@ IOExternalMethod *RadeonNIUserClient::getTargetAndMethodForIndex(
 		  kIOUCScalarIScalarO, 0, 1 },
 		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdEpoch,
 		  kIOUCScalarIScalarO, 0, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodIbLog,
+		  kIOUCScalarIScalarO, 1, 1 },
 	};
 
 	if (index >= RDN_UC_METHOD_COUNT)
@@ -1947,6 +2201,7 @@ IOReturn RadeonNIUserClient::methodScreenFill(UInt32 x, UInt32 y, UInt32 width,
 					      UInt32 *fence)
 {
 	*fence = 0;
+	fAccel->ibRecord('F', this, x, width);
 	return fAccel->screenFill((SInt32)x, (SInt32)y, (SInt32)width,
 				  (SInt32)height, colour, fence);
 }
@@ -1957,6 +2212,7 @@ IOReturn RadeonNIUserClient::methodScreenCopy(UInt32 sx, UInt32 sy, UInt32 dx,
 					      UInt32 *fence)
 {
 	*fence = 0;
+	fAccel->ibRecord('C', this, sx, size);
 	return fAccel->screenCopy((SInt32)sx, (SInt32)sy, (SInt32)dx, (SInt32)dy,
 				  (SInt32)(size & 0xffff), (SInt32)(size >> 16),
 				  fence);
@@ -1979,6 +2235,7 @@ IOReturn RadeonNIUserClient::methodFree(UInt32 offset)
 IOReturn RadeonNIUserClient::methodSubmit(UInt32 offset, UInt32 words,
 					  UInt32 *fence)
 {
+	fAccel->ibRecord('3', this, offset, words);
 	return fAccel->submit(offset, words, fence);
 }
 
@@ -2004,6 +2261,7 @@ IOReturn RadeonNIUserClient::methodUvdInit(UInt32 flags, UInt32 *status)
 IOReturn RadeonNIUserClient::methodUvdSubmit(UInt32 offset, UInt32 words,
 					     UInt32 *fence)
 {
+	fAccel->ibRecord('U', this, offset, words);
 	IOReturn ret = fAccel->uvdSubmit(offset, words, fence, fUvdHandles, &fUvdHandleCount, &fUvdHandleEpoch);
 
 	if (ret == kIOReturnSuccess && !fUvdUser) {
@@ -2023,6 +2281,11 @@ IOReturn RadeonNIUserClient::methodUvdReset(UInt32 *epoch)
 		fUvdHandleEpoch = *epoch;
 	}
 	return ret;
+}
+
+IOReturn RadeonNIUserClient::methodIbLog(UInt32 op, UInt32 *ms)
+{
+	return fAccel->ibLogControl(op, ms);
 }
 
 IOReturn RadeonNIUserClient::methodUvdEpoch(UInt32 *epoch)

@@ -151,6 +151,13 @@ enum {
 	 * starts with no other decoder running, or by RDN_UC_UVD_RESET). Sessions made in an older epoch are gone.
 	 */
 	RDN_UC_UVD_EPOCH,
+	/*
+	 * Debugging: the command buffers programs submit (RDN_UC_SUBMIT) are listed and scanned for packets that write registers outside the 3D
+	 * engine's ranges or memory the video decoder owns. Scalar in: 0 off, 1 on (the lists are cleared), 2 put the lists into the registry
+	 * property "IBLog" of the accelerator (`ioreg -c RadeonNIAccel -l -w0`), 3 note a moment (an entry with the kext's time). Out: the kext's
+	 * time in milliseconds.
+	 */
+	RDN_UC_IBLOG,
 	RDN_UC_METHOD_COUNT
 };
 
