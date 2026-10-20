@@ -56,6 +56,7 @@
 #define RDN_UVD_F_SEGMENT	(1 << 18)	/* (kext) the block in a 256 MB segment beyond the aperture (docs/UVD.md); alone it means the default start with it */
 #define RDN_UVD_F_SEGMENT_AT	20		/* (kext) with SEGMENT: bits 20 to 22 name the segment to use, 1 to 6 (hidden) or 7 (the aperture's own, through the register window: to test the plumbing); 0 picks */
 #define RDN_UVD_F_NO_DMA		(1u << 29)	/* (kext, tests) with SEGMENT: big regions go through the register window, not the command processor's DMA */
+#define RDN_UVD_F_NO_FLUSH	(1u << 30)	/* (kext, tests) with SEGMENT: no dummy write and HDP flush before the VCPU is released */
 #define RDN_UVD_F_PUSH_APERTURE	(1u << 28)	/* (kext, tests) with SEGMENT: the regions that lie in the aperture are written through it */
 #define RDN_UVD_F_APERTURE	(1 << 19)	/* (kext) a started block that idles is started again in the aperture (tests: to compare the two) */
 #define RDN_UVD_F_GART		(1 << 9)	/* (kext) the VCPU region and ring in GART memory: addresses with bits 32-39 zero */
@@ -170,6 +171,9 @@ int rdn_vram_get(struct rdn_card *card, uint32_t offset, void *dst, uint32_t byt
  * (a restart of a block whose firmware window was rewritten through the register window hangs it; docs/UVD.md).
  */
 void rdn_uvd_set_put_hook(int (*hook)(void *cookie, uint32_t offset, const void *src, uint32_t bytes), void *cookie);
+
+/* Test (rdn_uvd.c): before the VCPU is released, write 4 KB of zeros at this aperture offset and flush the HDP. */
+void rdn_uvd_set_coherency_page(bool on, uint32_t aperture_offset);
 
 /* Test: write the windowed regions through the aperture's mapping where they lie in it (rdn_uvd.c). */
 void rdn_uvd_set_push_via_aperture(bool on);

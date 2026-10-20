@@ -217,6 +217,8 @@ private:
 	 * Staging in the GART for the command processor's DMA into video memory the CPU cannot map: the register window's writes do
 	 * not reach the decoder the way DMA does (docs/UVD.md). dmaPut() is called with fLock held.
 	 */
+	UInt32 fUvdFlushPage;
+	bool fUvdNoFlush;
 	IOBufferMemoryDescriptor *fDmaMem;
 	UInt8 *fDmaCpu;
 	uint64_t fDmaGpu;

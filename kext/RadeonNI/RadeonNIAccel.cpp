@@ -699,7 +699,9 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	rdn_uvd_set_ext_nibbles(nibbles ? nibbles : 0xf);
 	rdn_uvd_set_push_via_aperture((flags & RDN_UVD_F_PUSH_APERTURE) != 0);
 	bool noDma = (flags & RDN_UVD_F_NO_DMA) != 0;
-	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24) | RDN_UVD_F_PUSH_APERTURE | RDN_UVD_F_NO_DMA);
+
+	fUvdNoFlush = (flags & RDN_UVD_F_NO_FLUSH) != 0;
+	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24) | RDN_UVD_F_PUSH_APERTURE | RDN_UVD_F_NO_DMA | RDN_UVD_F_NO_FLUSH);
 	if (!flags)
 		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI | RDN_UVD_F_PLL | RDN_UVD_F_WINDOWS;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;
@@ -1227,6 +1229,13 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, UInt32 force, const void *
 	IOLog("RadeonNI: UVD: firmware %lu bytes, in segment %lu of video memory (0x%lx), VCPU region at 0x%lx, ring at 0x%lx, reference clock %lu0 kHz; starting\n",
 	      (unsigned long)fwSize, (unsigned long)seg, (unsigned long)fUvdSegLo, (unsigned long)fUvdOwn[0].offset,
 	      (unsigned long)fUvdOwn[1].offset, (unsigned long)ref);
+	if (!fUvdFlushPage) {
+		uint64_t page = 0;
+
+		if (!rdn_mem_alloc(&fMem, 4096, 4096, &page))
+			fUvdFlushPage = (UInt32)page;
+	}
+	rdn_uvd_set_coherency_page(fUvdFlushPage != 0 && !fUvdNoFlush, fUvdFlushPage);
 	rdn_uvd_set_reset_level(fUvdStartLevel);
 	r = rdn_uvd_init_window(&fUvd, &fAccel, ref, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
 				fUvdVcpuShadow, fUvdOwn[0].offset, fUvdRingShadow, fUvdOwn[1].offset, 4096, flags);

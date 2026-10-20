@@ -372,6 +372,35 @@ int rdn_vram_get(struct rdn_card *card, uint32_t offset, void *dst, uint32_t byt
  */
 static bool push_via_aperture;
 
+/*
+ * Experiment: a restart whose firmware window was written by anything but the CPU through the aperture never runs the firmware (the window
+ * stays as the file has it, no 40 bytes patched, though the ring works). A write through the aperture followed by the HDP flush may make the
+ * decoder drop what it has cached: the kext gives a page of the aperture to write zeros to before the VCPU is released.
+ */
+static uint32_t coherency_page;
+static bool coherency_on;
+
+void rdn_uvd_set_coherency_page(bool on, uint32_t aperture_offset)
+{
+	coherency_on = on;
+	coherency_page = aperture_offset;
+}
+
+static void coherency_touch(struct rdn_uvd *uvd)
+{
+	struct rdn_accel *accel = uvd->accel;
+	volatile uint8_t *p;
+	uint32_t i;
+
+	if (!coherency_on || !accel->aperture || (uint64_t)coherency_page + 4096 > accel->aperture_size)
+		return;
+	p = (volatile uint8_t *)accel->aperture + coherency_page;
+	for (i = 0; i < 4096; i++)
+		p[i] = 0;
+	rdn_hdp_flush(accel);
+	(void)p[0];
+}
+
 /* A better way to write big regions of video memory than the register window, if the caller has one (the kext: the command processor's DMA). */
 static int (*put_hook)(void *cookie, uint32_t offset, const void *src, uint32_t bytes);
 static void *put_hook_cookie;
@@ -719,6 +748,7 @@ static int vcpu_start(struct rdn_uvd *uvd)
 			}
 		}
 		program_ext(uvd);
+		coherency_touch(uvd);
 		/* clock gating off, VCPU clock on, VCPU out of reset */
 		wr(card, UVD_CGC_GATE, 0);
 		wr(card, UVD_VCPU_CNTL, 1 << 9);
@@ -1077,6 +1107,8 @@ static int init_common(struct rdn_uvd *uvd, struct rdn_accel *accel,
 		}
 	}
 
+	if (window)
+		coherency_touch(uvd);
 	if (!(reset_level & RDN_UVD_RESET_NO_PROGRAM))
 		program_tiling(uvd);
 	if (flags & (RDN_UVD_F_PM_GLOBAL | RDN_UVD_F_PM_SCLK)) {
