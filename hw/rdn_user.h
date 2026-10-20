@@ -188,6 +188,8 @@ enum {
 	 * out: fence. As RDN_UC_UVD_SUBMIT, with the indirect buffer given by value (the kext keeps it in its own slot of the segment).
 	 */
 	RDN_UC_UVD_SUBMIT_WORDS,
+	/* scalars in: address low/high words, byte length; out: GART offset. */
+	RDN_UC_GART_BIND64,
 	RDN_UC_METHOD_COUNT
 };
 

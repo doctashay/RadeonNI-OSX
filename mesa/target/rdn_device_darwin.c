@@ -13,7 +13,7 @@
 #include <sys/time.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
-#include <IOKit/IOKitLib.h>
+#include "rdn_iokit.h"
 
 #include "rdn_device.h"
 #include "hw/rdn_user.h"
@@ -92,6 +92,18 @@ static void mem_os_free(void *cookie, void *ptr)
 	free(ptr);
 }
 
+static int bind_address(struct darwin_device *d, uintptr_t address,
+                        uint32_t bytes, int *offset)
+{
+#ifdef __LP64__
+	return IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_BIND64, 3, 1,
+		(uint32_t)address, (uint32_t)(address >> 32), bytes, offset);
+#else
+	return IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_BIND, 2, 1,
+		(uint32_t)address, bytes, offset);
+#endif
+}
+
 /* A new chunk of at least `size` bytes in a free slot; NULL if there is none. */
 static struct gart_chunk *gart_new_chunk(struct darwin_device *d, uint64_t size,
 					 uint64_t align)
@@ -128,8 +140,7 @@ static struct gart_chunk *gart_new_chunk(struct darwin_device *d, uint64_t size,
 		return NULL;
 	}
 	{
-		int br = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_BIND, 2, 1,
-						       (int)addr, (int)bytes, &offset);
+		int br = bind_address(d, addr, bytes, &offset);
 
 		if (br || rdn_mem_init(&c->mem, &d->mem_os, (uint32_t)offset, bytes)) {
 			if (getenv("RDN_STATS"))
@@ -281,8 +292,7 @@ static int dev_gart_bind_user(struct rdn_device *dev, void *address, uint64_t si
 
 	if (((uintptr_t)address & 4095) || (size & 4095) || !size ||
 	    size > GART_MOST_BYTES - d->gart_bytes ||
-	    IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_BIND, 2, 1,
-					  (int)(uintptr_t)address, (int)size, &at))
+	    bind_address(d, (uintptr_t)address, (uint32_t)size, &at))
 		return -1;
 	d->gart_bytes += (uint32_t)size;
 	*offset = (uint32_t)at;
@@ -704,8 +714,13 @@ struct rdn_device *rdn_device_open(void)
 	struct rdn_user_info info;
 	IOByteCount size = sizeof(info);
 	io_service_t service;
+#ifdef __LP64__
+	mach_vm_address_t addr = 0;
+	mach_vm_size_t len = 0;
+#else
 	vm_address_t addr = 0;
 	vm_size_t len = 0;
+#endif
 	kern_return_t kr;
 
 	if (!d)

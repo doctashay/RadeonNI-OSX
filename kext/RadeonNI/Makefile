@@ -30,6 +30,7 @@ HW_OBJS  = $(addprefix $(BUILD)/hw/,$(HW_SRCS:.c=.o))
 OBJS     = $(BUILD)/RadeonNI.o $(BUILD)/RadeonNIAccel.o $(BUILD)/RadeonNISurface.o $(BUILD)/kmod_info.o $(HW_OBJS)
 ifeq ($(LEOPARD),1)
 OBJS    += $(BUILD)/leopard.o
+CPPFLAGS += -DRDN_LEOPARD
 endif
 
 all: $(BUNDLE)
@@ -56,6 +57,9 @@ $(BUNDLE): $(OBJS) Info.plist
 	g++ -arch ppc -static -nostdlib -r $(OBJS) -lkmodc++ -lkmod -lcc_kext \
 		-o $(BUNDLE)/Contents/MacOS/$(KEXT)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
+ifeq ($(LEOPARD),1)
+	perl -0777 -pi -e 's/com\.apple\.kernel\.(iokit|libkern|mach)/com.apple.kpi.$$1/g; s/<string>6\.0<\/string>/<string>9.0.0<\/string>/g; s{(<key>OSBundleLibraries</key>\s*<dict>)}{$$1\n\t\t<key>com.apple.kpi.unsupported</key>\n\t\t<string>9.0.0</string>}' $(BUNDLE)/Contents/Info.plist
+endif
 
 clean:
 	rm -rf $(BUILD)

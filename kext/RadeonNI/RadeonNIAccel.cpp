@@ -378,7 +378,7 @@ void RadeonNIAccel::gartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages)
  * The memory stays the program's: no kernel address space is spent on it,
  * which on this 32-bit kernel would not reach far.
  */
-IOReturn RadeonNIAccel::gartBind(task_t task, UInt32 address, UInt32 size,
+IOReturn RadeonNIAccel::gartBind(task_t task, UInt64 address, UInt32 size,
 				 void *owner, UInt32 *offset)
 {
 	IOMemoryDescriptor *memory;
@@ -390,8 +390,14 @@ IOReturn RadeonNIAccel::gartBind(task_t task, UInt32 address, UInt32 size,
 	if (!size || (address & (RDN_GART_PAGE_SIZE - 1)) ||
 	    (size & (RDN_GART_PAGE_SIZE - 1)))
 		return kIOReturnBadArgument;
+#ifdef RDN_LEOPARD
+	memory = IOMemoryDescriptor::withAddressRange(address, size, kIODirectionOutIn, task);
+#else
+	if (address > 0xffffffffULL)
+		return kIOReturnUnsupported;
 	memory = IOMemoryDescriptor::withAddress((vm_address_t)address, size,
-						 kIODirectionOutIn, task);
+	                                       kIODirectionOutIn, task);
+#endif
 	if (!memory)
 		return kIOReturnNoMemory;
 	if (memory->prepare() != kIOReturnSuccess) {
@@ -411,9 +417,10 @@ IOReturn RadeonNIAccel::gartBind(task_t task, UInt32 address, UInt32 size,
 	}
 	for (done = 0; done < size; done += RDN_GART_PAGE_SIZE) {
 		IOByteCount length = 0;
+		/* The G5 PCI bus needs IOMapper addresses, not raw physical pages. */
 		IOPhysicalAddress bus = memory->getPhysicalSegment(done, &length);
 
-		if (!bus)
+		if (!bus || length < RDN_GART_PAGE_SIZE)
 			break;
 		rdn_gart_set_page(&fGart, (UInt32)((at + done) / RDN_GART_PAGE_SIZE), bus);
 	}
@@ -2841,6 +2848,8 @@ IOExternalMethod *RadeonNIUserClient::getTargetAndMethodForIndex(
 		  kIOUCScalarIScalarO, 3, 0 },
 		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdSubmitWords,
 		  kIOUCScalarIScalarO, 2, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodGartBind64,
+		  kIOUCScalarIScalarO, 3, 1 },
 	};
 
 	if (index >= RDN_UC_METHOD_COUNT)
@@ -2959,6 +2968,12 @@ IOReturn RadeonNIUserClient::methodGartBind(UInt32 address, UInt32 size,
 					    UInt32 *offset)
 {
 	return fAccel->gartBind(fTask, address, size, this, offset);
+}
+
+IOReturn RadeonNIUserClient::methodGartBind64(UInt32 low, UInt32 high,
+                                                UInt32 size, UInt32 *offset)
+{
+	return fAccel->gartBind(fTask, ((UInt64)high << 32) | low, size, this, offset);
 }
 
 IOReturn RadeonNIUserClient::methodGartUnbind(UInt32 offset)

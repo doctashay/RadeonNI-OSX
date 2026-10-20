@@ -81,7 +81,7 @@ public:
 	void hiddenInfo(UInt32 *offset, UInt32 *size);
 	/* A program's memory in the GART (rdn_user.h). */
 	void gartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages);
-	IOReturn gartBind(task_t task, UInt32 address, UInt32 size, void *owner,
+	IOReturn gartBind(task_t task, UInt64 address, UInt32 size, void *owner,
 			  UInt32 *offset);
 	IOReturn gartUnbind(UInt32 offset, void *owner);
 	void gartUnbindAll(void *owner);
@@ -345,6 +345,7 @@ public:
 	IOReturn methodGartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages);
 	IOReturn methodGartBind(UInt32 address, UInt32 size, UInt32 *offset);
 	IOReturn methodGartUnbind(UInt32 offset);
+	IOReturn methodGartBind64(UInt32 low, UInt32 high, UInt32 size, UInt32 *offset);
 	IOReturn methodPower(UInt32 state, UInt32 what, UInt32 *sclk,
 			     UInt32 *mclk, UInt32 *temperature);
 	IOReturn methodScreenFill(UInt32 x, UInt32 y, UInt32 width, UInt32 height,
