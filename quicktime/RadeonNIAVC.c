@@ -310,7 +310,7 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 		const char *who;
 
 		if (software_only(&who)) {
-			say("declined: %s shows previews with QuickTime's own decoder", who);
+			say("declined: %s is on the software-decode list, QuickTime's own decoder takes its streams", who);
 			return codecUnimpErr;
 		}
 	}

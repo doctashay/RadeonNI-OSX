@@ -7469,3 +7469,21 @@ identical to the reference, no stall), and the user saw the colorbars and a B-py
 - A first try to put the decoder's reference buffer in the hidden video memory (patch 0016, `RDN_UVD_DPB_HIDDEN`, `RDN_HIDDEN_FILL_MB`) did not even place it there (the buffer showed up in the visible window); abandoned for the dynamic size, which solves the
   same problem. Patch 0016 stays in the tree off by default. `vramdiff -c` spins at 100 % CPU (a bug in the mode added for it; not found; terminated).
 - A `rdn_uvdtest17` run logged "a decode was not answered after 250 ms" once at 20:26:33 (the recovery ran; the run passed): a single stall seen since the fix, not looked into.
+
+## 2026-10-20 (evening): the motion 1080p clip on the card is exact; Apple's decoder renders the same clip broken
+
+The user said `demo-motion-1080p.mp4` "looks a bit corrupted" (the cs2 clip looked correct). The clip is a synthetic stress pattern I generated (High@4.1, 1920x1080, 24 fps, 720 frames: colour bars,
+a rainbow line, dotted curves with a ghost trail, a grey cross, a noisy checkerboard). Checks on the card path (QuickTime Player, component installed):
+- Player with `/tmp/rdnavc.debug`: 57 of 57 drawn pictures bit-exact against the ffmpeg reference (`scripts/uvd-picsums.py --timescale 1000 --fps 24`), display times strictly increasing.
+- Frame 144 dumped by the component (`/tmp/rdnavc.dump`) minus the reference frame: an all-black difference image.
+- Three instant snapshots in normal playback (`open -g -a ~/shot.app`, frames 203, 248, 298) show the reference frames; the only differences are the Dock and the scaling at the edges.
+- A/B with Apple's own decoder: a temporary `/Library/Application Support/RadeonNI/software-decode` with the line `QuickTime Player` made the component decline in Player. Snapshots at frames 195, 243
+  and 291 are heavily broken (red wash over everything, flat colour regions, blocky edges that do not exist in the file). So the broken look is Apple's software decoder on this clip, not ours.
+  Why (too slow on the G5 and dropping reference pictures, or a feature of this stream it mishandles) was not looked into. The temporary file was removed afterwards (kept on the G5 as
+  `/tmp/software-decode.ab-test`).
+- Not explained: what the user saw. Candidates: the pattern itself (the dotted ghost trail and the noisy checkerboard are in the file), motion judder from dropped pictures, a grab or a
+  moment when Finder or another decoder had the card. Asked the user to describe it.
+- cs2 slowness: a profile of Player (`~/prof.sh`) shows about 53 % of the decode thread waiting in `ruvd_fence_wait` (kext `uvdFenceWait`) and the rest in `DrawBand` (read-out
+  `rdnvd_frame_read_2vuy`, `frame_stage_dma`, memcpy). The pipeline is serial (decode about 25 ms, DMA read-out about 12 ms, CPU conversion), so 33 pictures a second at best, about 16 in practice
+  for 1080p60. Next: submit in DecodeBand and wait in DrawBand, overlap the next decode with the last read-out, and convert on the card.
+- The decline message in the component now says the program is on the software-decode list (it said "previews", which was wrong for names added by hand).

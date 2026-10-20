@@ -175,26 +175,24 @@ and `mbaff` fail either way), streams with 1, 2, 3 (P only) and 1, 2, 4, 8, 16 (
 Speed: 1080p decodes in about 25 ms and reads out in 12 ms, one picture at a time (decode, wait for the fence, read back, convert on the CPU): about 33 pictures a second, so a 60 fps 1080p clip plays at about half speed. The firmware
 could do far more; pipelining the decode of the next picture with the read-out of the last, and converting on the card, is the way, not done.
 
-### The decoder wedges when the frontmost application changes (open issue, 2026-10-19)
+### The decoder wedged when the frontmost application changed (resolved 2026-10-20)
 
-**Newest lead (2026-10-19 night, not yet run on the card):** the minimal start never programmed the VCPU's cache windows 1 and 2 (heap, stack and sessions; Linux's `uvd_v2_2_resume()` does), so the firmware's
-heap and stack were at video memory address 0, the top rows of the framebuffer, which the window server redraws at a change of the menu-bar owner. `RDN_UVD_F_WINDOWS` (default on) writes them. See the journal.
+**Cause and fix:** the minimal start programmed only the VCPU's cache window 0 (firmware) and the chip id. Windows 1 (heap) and 2 (stack and sessions) stayed 0, so the firmware's heap and
+stack sat at video memory address 0, the top rows of the framebuffer (the menu bar), which the window server redraws when the menu-bar owner changes: that overwrote the firmware's live state.
+`RDN_UVD_F_WINDOWS` (bit 17, in the kext's default start flags) writes `UVD_VCPU_CACHE_OFFSET1/SIZE1` and `OFFSET2/SIZE2` as Linux `uvd_v2_2_resume()` does. After it: open sessions
+survive foreground changes, restarts overlapping an activation are harmless, quitting an application is harmless. `rdnuvd init 0x10c00` right after boot gives the old start (to compare). The
+whole hunt (restart bits, the kext's command-buffer recorder, vramdiff, winprobe) is in the journal of 2026-10-18 to 2026-10-20.
 
-Not a QuickTime problem: on the G5 any change of the frontmost application (launching Calculator, TextEdit, QuickTime Player or `tools/guest/winprobe.m` the normal way, an AppleScript
-`activate`, a switch back to Finder) stops the decoder: commands and fences run, decodes get no feedback block and no picture, for every program, and neither the kext's
-restarts (VCPU, all sub-blocks) nor a library recovery bring it back; only a restart of the G5 does. A stall right at a launch has been repaired by the library's
-restart and replay; the one at the next switch or exit was not. Windows, GL windows, programs started from the shell, background launches (`open -g`) and Dock-less
-bundles do not trigger it. The registers `rdnuvd regs` reads are the same wedged and healthy; the firmware image is intact. What differs is `SRBM_STATUS` (0xE50), healthy 0x200000c0 and wedged 0x20000ac0: MCB_BUSY and MCC_BUSY, the
-memory controller's busy flags, stay set with nothing decoding, so the memory controller is hung on requests that never finish. At the switch the kext sees no command buffer, 2D operation or framebuffer call from
-the window server (the kext's recorder, `tools/guest/iblog.c`). Reproduce: `~/wpswitch.sh` style (a paced
-`rdn_uvdtest -A -P 400` session, then `open -g -a winprobe.app`, then `osascript -e 'tell application "..." to activate'`), see the journal of 2026-10-19.
-What is built and works on the card: the kext restarts the block when a session starts with no other alive (every restart resets all sub-blocks, `rdn_uvd_set_reset_level(1)`) and
-on `RDN_UC_UVD_RESET` (epoch counter, fence numbers go on); `rdn_winsys_uvd_answered()` checks the feedback block (`feedback[1] == message[3]`); `rdnvd` waits up to
-250 ms for it (`RDNVD_LATE_MS`: the first decodes after a restart are answered about 8 ms after their fence), and on a stall resets, makes a new decoder and replays the access
-units since the last IDR (three tries, then the decoder is given up for 2 s, 4 s, up to 30 s and data fails at once; `RDNVD_FAKE_STALL=n` tries it: 60 of 60 right).
-Do not start the block with PM_GLOBAL/PM_SCLK (`rdnuvd init 0x10d80`): the 3D engine's fences stopped completing. A level that also resets the whole block (SOFT_RESET_UVD)
-leaves the VCPU dead (Linux has no such reset at run time on this family). A decoder that fails every picture instantly makes QuickTime ask for the next one at once (100 % of a core): the component should not be installed
-until the wedge is understood.
+Not caused by QuickTime: any change of the frontmost application (Calculator, TextEdit, QuickTime Player, `tools/guest/winprobe.m`, an AppleScript `activate`) stopped the decoder for every
+program, and only a restart of the G5 brought it back. The `SRBM_STATUS` busy bits seen then were display traffic, not a stuck memory controller.
+
+What stays in place as safety nets (they work on the card): the kext restarts the block when a session starts with no other alive (every restart resets all sub-blocks,
+`rdn_uvd_set_reset_level(1)`) and on `RDN_UC_UVD_RESET` (epoch counter, fence numbers go on); `rdn_winsys_uvd_answered()` checks the feedback block (`feedback[1] == message[3]`); `rdnvd` waits
+up to 250 ms for it (`RDNVD_LATE_MS`: the first decodes after a restart are answered about 8 ms after their fence), and on a stall resets, makes a new decoder and replays the access units since
+the last IDR (three tries, then the decoder is given up for 2 s, 4 s, up to 30 s and data fails at once; `RDNVD_FAKE_STALL=n` tries it: 60 of 60 right). A decoder that fails every picture
+instantly makes QuickTime ask for the next one at once (100 % of a core), which is why the back-off exists.
+Do not start the block with PM_GLOBAL/PM_SCLK (`rdnuvd init 0x10d80`): the 3D engine's fences stopped completing. Do not use restart bits 16 and 32 (`RDN_UC_DEBUG`, no rewrite / no register
+programming): they hung the G5. A level that resets the whole block (SOFT_RESET_UVD) leaves the VCPU dead (Linux has no such reset at run time on this family).
 
 ## Why
 
