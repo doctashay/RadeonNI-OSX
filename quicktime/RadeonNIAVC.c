@@ -15,6 +15,7 @@
  */
 
 #include <CoreServices/CoreServices.h>
+#include <crt_externs.h>
 #include <QuickTime/QuickTime.h>
 #include <QuickTime/ImageCodec.h>
 #include <CoreServices/Components.k.h>
@@ -242,6 +243,50 @@ static struct rdnvd *device(void)
 	return gDevice;
 }
 
+/*
+ * Programs that decode one picture of a movie for a thumbnail and then keep the movie open (Finder's icon preview, Quick Look,
+ * Spotlight's importer) get QuickTime's own decoder: a decoder on the card would sit in video memory, and in a firmware session slot,
+ * for as long as the preview is shown. The names, by the program's file name, are these and those of the file
+ * /Library/Application Support/RadeonNI/software-decode (one per line; a line "-name" takes a name off the list).
+ */
+static int software_only(const char **name)
+{
+	static int known = -1;
+	static char base[128];
+	static const char *const builtin[] = { "Finder", "quicklookd", "QuickLookSatellite", "mdworker", "mdimport", NULL };
+
+	if (known < 0) {
+		char **argv = *_NSGetArgv();
+		const char *path = argv && argv[0] ? argv[0] : "";
+		const char *slash = strrchr(path, '/');
+		FILE *f;
+		char line[160];
+		int i;
+
+		snprintf(base, sizeof(base), "%s", slash ? slash + 1 : path);
+		known = 0;
+		for (i = 0; builtin[i]; i++)
+			if (!strcmp(base, builtin[i]))
+				known = 1;
+		f = fopen("/Library/Application Support/RadeonNI/software-decode", "r");
+		if (f) {
+			while (fgets(line, sizeof(line), f)) {
+				size_t n = strlen(line);
+
+				while (n && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' '))
+					line[--n] = 0;
+				if (line[0] == '-' && !strcmp(line + 1, base))
+					known = 0;
+				else if (line[0] && line[0] != '#' && !strcmp(line, base))
+					known = 1;
+			}
+			fclose(f);
+		}
+	}
+	*name = base;
+	return known;
+}
+
 pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressParams *p)
 {
 	CodecCapabilities *cap = p->capabilities;
@@ -261,6 +306,14 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 
 	if ((**desc).cType != 'avc1')
 		return codecUnimpErr;
+	{
+		const char *who;
+
+		if (software_only(&who)) {
+			say("declined: %s shows previews with QuickTime's own decoder", who);
+			return codecUnimpErr;
+		}
+	}
 	err = GetImageDescriptionExtension(desc, &avcc, 'avcC', 1);
 	if (err || !avcc) {
 		say("declined: no avcC in the image description (%d)", (int)err);
