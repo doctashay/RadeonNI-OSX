@@ -595,6 +595,21 @@ static void program_memory(struct rdn_uvd *uvd)
 	}
 }
 
+/*
+ * The segment, again. After a restart the sub-blocks are held in reset when program_memory() writes the address extension
+ * and come out of it later (vcpu_start): a value written to a block in reset may be lost. In the aperture that does not show (segment 0 is
+ * the reset value); beyond it the decoder's own reads and writes went to segment 0 and a decode never finished.
+ */
+static void program_ext(struct rdn_uvd *uvd)
+{
+	struct rdn_card *card = uvd->accel->card;
+
+	if (reset_level & RDN_UVD_RESET_NO_PROGRAM)
+		return;
+	if (uvd->flags & RDN_UVD_F_MINIMAL)
+		wr(card, UVD_LMI_ADDR_EXT, ext_value((uint32_t)(uvd_addr(uvd, uvd->vcpu_gpu) >> 28)));
+}
+
 /* uvd_v1_0_start() */
 static int vcpu_start(struct rdn_uvd *uvd)
 {
@@ -632,6 +647,7 @@ static int vcpu_start(struct rdn_uvd *uvd)
 			wr(card, UVD_SOFT_RESET, VCPU_SOFT_RESET);
 			mdelay(card, 5);
 		}
+		program_ext(uvd);
 		/* clock gating off, VCPU clock on, VCPU out of reset */
 		wr(card, UVD_CGC_GATE, 0);
 		wr(card, UVD_VCPU_CNTL, 1 << 9);
@@ -647,6 +663,7 @@ static int vcpu_start(struct rdn_uvd *uvd)
 			rdn_log(card->os, RDN_LOG_ERROR, "uvd not responding (status 0x%08x)", (unsigned)status);
 			return -EIO;
 		}
+		program_ext(uvd);
 		goto ring;
 	}
 
