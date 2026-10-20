@@ -17,6 +17,7 @@ class DisplayPowerTest(unittest.TestCase):
 using IOReturn = int;
 enum { kIOReturnSuccess = 0, kIOReturnNotReady = -1, kIOReturnIOError = -2 };
 #define IOLog(...) ((void)0)
+#define IBNOTE(id, value) ((void)0)
 static int locks, disables, enables, disable_error, enable_error;
 void IOLockLock(void *) { assert(locks++ == 0); }
 void IOLockUnlock(void *) { assert(--locks == 0); }

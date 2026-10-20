@@ -15,16 +15,20 @@ HARNESS = r'''
 #define FREE free
 #define MAX2(a,b) ((a) > (b) ? (a) : (b))
 enum radeon_bo_domain { RADEON_DOMAIN_GTT = 2, RADEON_DOMAIN_VRAM = 4 };
-enum radeon_bo_flag { RADEON_FLAG_NO_CPU_ACCESS = 1 };
-enum rdn_place { RDN_VISIBLE, RDN_HIDDEN, RDN_GART };
+enum radeon_bo_flag { RADEON_FLAG_NO_CPU_ACCESS = 1, RADEON_FLAG_NO_INTERPROCESS_SHARING = 2 };
+enum rdn_place { RDN_VISIBLE, RDN_HIDDEN, RDN_GART, RDN_SEGMENT };
 struct pb_buffer_lean { int reference, alignment_log2, usage; uint64_t size; };
 struct rdn_bo { struct pb_buffer_lean base; unsigned diagnostic_id; uint64_t offset;
                enum rdn_place region; unsigned domain, flags; };
 struct rdn_device { int (*alloc)(struct rdn_device *,uint64_t,unsigned,uint64_t *);
                     int (*alloc_hidden)(struct rdn_device *,uint64_t,unsigned,uint64_t *);
-                    int (*gart_alloc)(struct rdn_device *,uint64_t,unsigned,uint64_t *); };
+                    int (*gart_alloc)(struct rdn_device *,uint64_t,unsigned,uint64_t *);
+                    /* the video decoder's segment and the debug filler: never reached with ws.video clear */
+                    void *uvd_start; int (*uvd_alloc)(struct rdn_device *,uint64_t,unsigned,uint64_t *);
+                    void (*free)(struct rdn_device *,uint64_t); };
 struct radeon_winsys { int unused; };
 struct radeon_drm_winsys { int lock; struct rdn_device *dev; uint64_t allocated_bytes;
+                         bool video, uvd_seg, uvd_split;
                          struct { unsigned creates, cache_hits, overflowed; } mem_stats; };
 static struct radeon_drm_winsys ws;
 static unsigned calls[3], trims, scenario;
@@ -36,6 +40,7 @@ static unsigned util_logbase2(unsigned n) { unsigned v=0;while(n>1){n/=2;v++;}re
 static struct radeon_drm_winsys *rdn_winsys(struct radeon_winsys *p) { return &ws; }
 static void simple_mtx_lock(int *p) { assert(!*p);*p=1; }
 static void simple_mtx_unlock(int *p) { assert(*p);*p=0; }
+static bool rdn_uvd_prepare(struct radeon_drm_winsys *w) { return false; }
 static bool rdn_cache_get(struct radeon_drm_winsys *w,uint64_t s,unsigned a,
                           enum rdn_place p,uint64_t *o) { return false; }
 static void rdn_cache_trim(struct radeon_drm_winsys *w,bool all) { assert(all);trims++; }
@@ -69,13 +74,13 @@ int main(void) {
       free(b);
    }
    scenario=3;calls[0]=calls[1]=calls[2]=trims=0;
-   struct pb_buffer_lean *b=rdn_buffer_create(NULL,65536,4096,RADEON_DOMAIN_GTT,0);
+   struct pb_buffer_lean *b=rdn_buffer_create(NULL,65536,4096,RADEON_DOMAIN_GTT,RADEON_FLAG_NO_INTERPROCESS_SHARING);
    assert(b && ((struct rdn_bo *)b)->region==RDN_GART && calls[RDN_GART]==1 && !trims);
    free(b);
-   b=rdn_buffer_create(NULL,65536,4096,RADEON_DOMAIN_VRAM|RADEON_DOMAIN_GTT,0);
+   b=rdn_buffer_create(NULL,65536,4096,RADEON_DOMAIN_VRAM|RADEON_DOMAIN_GTT,RADEON_FLAG_NO_INTERPROCESS_SHARING);
    assert(b && ((struct rdn_bo *)b)->region==RDN_GART);
    free(b);
-   b=rdn_buffer_create(NULL,65536,4096,RADEON_DOMAIN_VRAM,0);
+   b=rdn_buffer_create(NULL,65536,4096,RADEON_DOMAIN_VRAM,RADEON_FLAG_NO_INTERPROCESS_SHARING);
    assert(b && ((struct rdn_bo *)b)->region==RDN_GART);
    free(b);
    puts("PASS tiled placement, heap reclamation, visible fallback and CPU-mappable GTT fallback");
