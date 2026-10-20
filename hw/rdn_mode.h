@@ -10,8 +10,8 @@
 
 #include "rdn_card.h"
 
-/* The highest pixel clock of a mode we offer: one TMDS link, and what DisplayPort at 4 lanes of 1.62 Gbit/s carries. */
-#define RDN_MODE_MAX_CLOCK	165000
+/* Parsing ceiling; the selected output must also support the timing. */
+#define RDN_MODE_MAX_CLOCK	330000
 
 #define RDN_MODE_NHSYNC		(1 << 0)	/* horizontal sync active low */
 #define RDN_MODE_NVSYNC		(1 << 1)	/* vertical sync active low */
@@ -76,6 +76,11 @@ const struct rdn_output *rdn_output(int index);
 
 /* The output rdn_modeset() drives from now on. */
 void rdn_output_select(struct rdn_card *card, const struct rdn_output *out);
+
+/* TMDS links required by the selected connector and timing. */
+bool rdn_output_is_duallink(struct rdn_card *card, const struct rdn_mode *mode);
+bool rdn_output_mode_supported(struct rdn_card *card, const struct rdn_mode *mode,
+			       bool hdmi);
 
 /*
  * Find the display: try each output in turn for an EDID and select the

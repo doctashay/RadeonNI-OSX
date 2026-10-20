@@ -12,6 +12,7 @@
 #include <pexpert/pexpert.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/pwr_mgt/IOPM.h>
 #include <UserNotification/KUNCUserNotifications.h>
 
 #include "RadeonNI.h"
@@ -28,6 +29,17 @@ OSDefineMetaClassAndStructors(RadeonNI, IOFramebuffer)
 /* Aperture: 64-bit memory BAR at 0x10. Registers: 64-bit memory BAR at 0x18. */
 #define FB_BAR			kIOPCIConfigBaseAddress0
 #define REG_BAR			kIOPCIConfigBaseAddress2
+
+enum { kRdnPowerSleep, kRdnPowerIdle, kRdnPowerOn, kRdnPowerCount };
+
+static const char *cardModel(UInt16 device)
+{
+	switch (device) {
+	case 0x675d: return "ATI Radeon HD 7570";
+	case 0x6758: return "ATI Radeon HD 6670";
+	default: return "ATI Radeon Turks";
+	}
+}
 
 /* DDC line of the DVI-I connector (AtomBIOS i2c id). */
 /*
@@ -422,7 +434,16 @@ bool RadeonNI::bringUp()
 		int pref = 0;
 
 		fModeCount = (UInt32)rdn_edid_modes(fEdid, fEdidLen, fModes, kMaxModes, &pref);
-		fPreferred = (UInt32)pref + 1;
+		UInt32 count = fModeCount, keep = 0;
+		fPreferred = 1;
+		for (UInt32 mode = 0; mode < count; mode++) {
+			if (!rdn_output_mode_supported(&fCard, &fModes[mode], useHDMI()))
+				continue;
+			if ((int)mode == pref)
+				fPreferred = keep + 1;
+			fModes[keep++] = fModes[mode];
+		}
+		fModeCount = keep;
 	}
 	for (i = 0; i < fModeCount; i++)
 		IOLog("RadeonNI: mode %lu: %ux%u at %lu kHz\n", (unsigned long)i + 1,
@@ -551,22 +572,27 @@ IOReturn RadeonNI::programMode(IODisplayModeID id, IOIndex depth)
 IOReturn RadeonNI::programModeLocked(IODisplayModeID id, IOIndex depth)
 {
 	const struct rdn_mode *mode = modeForID(id);
+	struct rdn_fb next;
 	int r;
 
 	if (!mode || depth < 0 || depth >= kDepthCount)
 		return kIOReturnUnsupportedMode;
 
-	describeFb(mode, depth, &fFb);
-	r = rdn_modeset(&fCard, mode, &fFb, useHDMI());
+	describeFb(mode, depth, &next);
+	/* Keep requested geometry while asleep; program it when the output wakes. */
+	r = fOutputRequested ? rdn_modeset(&fCard, mode, &next, useHDMI()) : 0;
 	IOLog("RadeonNI: mode %ld depth %ld (%ux%u, %lu bpp): %d\n", (long)id,
 	      (long)depth, mode->hdisplay, mode->vdisplay,
-	      (unsigned long)fFb.bpp, r);
+	      (unsigned long)next.bpp, r);
 	if (r)
 		return kIOReturnIOError;
+	fFb = next;
 	fCurrentMode = id;
 	fCurrentDepth = depth;
 	fModeSet = true;
-	fOutputOn = true;
+	fOutputOn = fOutputRequested;
+	if (!fOutputOn)
+		return kIOReturnSuccess;
 	/* The mode set leaves the cursor's registers to us. */
 	if (fHWCursor && fCursorLoaded)
 		rdn_cursor_set(&fCard, CURSOR_OFFSET, fCursorX, fCursorY,
@@ -583,14 +609,23 @@ void RadeonNI::loadColors()
 
 bool RadeonNI::start(IOService *provider)
 {
+	const char *model;
+	UInt32 memoryMB, memoryBytes;
+
 	fDevice = OSDynamicCast(IOPCIDevice, provider);
 	if (!fDevice)
 		return false;
+	model = cardModel(fDevice->configRead16(kIOPCIConfigDeviceID));
 
 	fLock = IOLockAlloc();
+	if (!fLock)
+		return false;
 	fOutputOn = true;
+	fOutputRequested = true;
+	fDisplayRequested = true;
+	fFramebufferRequested = true;
 	fConnected = true;
-	fPowerMax = 0;
+	fPowerState = kRdnPowerOn;
 
 	IOLog("RadeonNI: device %04x:%04x, command %04x\n",
 	      fDevice->configRead16(kIOPCIConfigVendorID),
@@ -631,12 +666,20 @@ bool RadeonNI::start(IOService *provider)
 		cleanUp();
 		return false;
 	}
+	fDevice->setProperty("model", (void *)model, strlen(model) + 1);
+	memoryMB = readReg(0x5428);
+	if (memoryMB && memoryMB < 4096) {
+		memoryBytes = memoryMB << 20;
+		fDevice->setProperty("VRAM,totalsize", &memoryBytes, sizeof(memoryBytes));
+		fDevice->setProperty("ATY,memsize", &memoryBytes, sizeof(memoryBytes));
+	}
 
 	if (!super::start(provider)) {
 		IOLog("RadeonNI: IOFramebuffer::start failed\n");
 		cleanUp();
 		return false;
 	}
+	setName(model);
 	IOLog("RadeonNI: framebuffer started\n");
 
 	{
@@ -659,6 +702,21 @@ bool RadeonNI::start(IOService *provider)
 		fAccel = RadeonNIAccel::withFramebuffer(this, provider);
 	checkFirmwareHook();
 	return true;
+}
+
+unsigned long RadeonNI::maxCapabilityForDomainState(IOPMPowerFlags state)
+{
+	return (state & IOPMPowerOn) ? kRdnPowerOn : kRdnPowerSleep;
+}
+
+unsigned long RadeonNI::initialPowerStateForDomainState(IOPMPowerFlags state)
+{
+	return maxCapabilityForDomainState(state);
+}
+
+unsigned long RadeonNI::powerStateForDomainState(IOPMPowerFlags state)
+{
+	return maxCapabilityForDomainState(state);
 }
 
 #define NOTICE_DELAY_MS 60000
@@ -898,7 +956,25 @@ bool RadeonNI::selftestTarget(struct rdn_accel *accel,
 
 IOReturn RadeonNI::enableController(void)
 {
-	return fModeSet ? kIOReturnSuccess : programMode(fPreferred, kDepth32);
+	IOReturn result = fModeSet ? kIOReturnSuccess : programMode(fPreferred, kDepth32);
+
+	if (result != kIOReturnSuccess || fPowerRegistered)
+		return result;
+	/* PCI power loss needs GPU/VRAM restoration, which is not implemented yet. */
+	IOPMPowerState states[kRdnPowerCount] = {
+		{ 1, kIOPMPreventSystemSleep, 0, 0, 0,0,0,0,0,0,0,0 },
+		{ 1, kIOPMPreventSystemSleep, 0, IOPMPowerOn, 0,0,0,0,0,0,0,0 },
+		{ 1, kIOPMPreventSystemSleep | IOPMDeviceUsable, IOPMPowerOn,
+		  IOPMPowerOn, 0,0,0,0,0,0,0,0 }
+	};
+	result = registerPowerDriver(this, states, kRdnPowerCount);
+	if (result != kIOReturnSuccess)
+		return result;
+	fPowerRegistered = true;
+	temporaryPowerClampOn();
+	changePowerStateTo(kRdnPowerIdle);
+	setProperty("SystemSleepSupported", false);
+	return kIOReturnSuccess;
 }
 
 /*
@@ -1163,7 +1239,7 @@ IOReturn RadeonNI::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 		0 : kIOSyncPositivePolarity;
 	t->verticalSyncConfig = (mode->flags & RDN_MODE_NVSYNC) ?
 		0 : kIOSyncPositivePolarity;
-	t->numLinks = 1;
+	t->numLinks = rdn_output_is_duallink(&fCard, mode) ? 2 : 1;
 	return kIOReturnSuccess;
 }
 
@@ -1181,22 +1257,26 @@ IOItemCount RadeonNI::getConnectionCount(void)
 IOReturn RadeonNI::setAttributeForConnection(IOIndex connectIndex,
 	IOSelect attribute, UInt32 value)
 {
+	if (connectIndex != 0)
+		return kIOReturnBadArgument;
 	switch (attribute) {
 	case kConnectionSyncEnable:
 		IOLog("RadeonNI: connection syncs 0x%lx\n", (unsigned long)value);
 		/* The bits name the syncs that are off. */
 		if (fDpms)
-			setOutputPower(!(value & (kIOHSyncDisable | kIOVSyncDisable)));
+			return setOutputPower(!(value & (kIOHSyncDisable | kIOVSyncDisable)));
 		return kIOReturnSuccess;
 	case kConnectionPower:
 		IOLog("RadeonNI: connection power %lu\n", (unsigned long)value);
 		if (fDpms)
-			setOutputPower(value != 0);
+			return setOutputPower((value & kFBDisplayUsablePowerState) != 0);
 		return kIOReturnSuccess;
 	case kConnectionPostWake:
 		/* The system woke: the monitor may have changed. */
 		IOLog("RadeonNI: connection post-wake\n");
+		IOLockLock(fLock);
 		fSenseSteady = 0;
+		IOLockUnlock(fLock);
 		return kIOReturnSuccess;
 	default:
 		return super::setAttributeForConnection(connectIndex, attribute, value);
@@ -1208,23 +1288,24 @@ IOReturn RadeonNI::setAttribute(IOSelect attribute, UInt32 value)
 	IBNOTE(attribute, value);
 	switch (attribute) {
 	case kIOPowerAttribute:
-		/*
-		 * IOFramebuffer's power states: the highest is "on", every other
-		 * is a display that is not used. The value of "on" is learned as
-		 * the largest seen, so that a first request is never taken for off.
-		 */
-		if (value > fPowerMax)
-			fPowerMax = value;
-		IOLog("RadeonNI: power attribute %lu (on is %lu)\n", (unsigned long)value,
-		      (unsigned long)fPowerMax);
-		if (!fDpms)
-			return super::setAttribute(attribute, value);
-		if (value >= fPowerMax) {
-			setOutputPower(true);
-			handleEvent(kIOFBNotifyDidPowerOn);
-		} else {
-			handleEvent(kIOFBNotifyWillPowerOff);
-			setOutputPower(false);
+		{
+			IOReturn result;
+			bool on = value == kRdnPowerOn;
+
+			if (value >= kRdnPowerCount)
+				return kIOReturnBadArgument;
+			if (value == fPowerState)
+				return kIOReturnSuccess;
+			bool wasOn = fPowerState == kRdnPowerOn;
+			if (on != wasOn)
+				handleEvent(on ? kIOFBNotifyWillPowerOn : kIOFBNotifyWillPowerOff);
+			result = fDpms ? setOutputPower(on, true) : kIOReturnSuccess;
+			if (result != kIOReturnSuccess)
+				return result;
+			fPowerState = value;
+			if (on != wasOn)
+				handleEvent(on ? kIOFBNotifyDidPowerOn : kIOFBNotifyDidPowerOff);
+			IOLog("RadeonNI: framebuffer power state %lu\n", (unsigned long)value);
 		}
 		return kIOReturnSuccess;
 	case kIOCapturedAttribute:
@@ -1238,11 +1319,15 @@ IOReturn RadeonNI::setAttribute(IOSelect attribute, UInt32 value)
 IOReturn RadeonNI::getAttributeForConnection(IOIndex connectIndex,
 	IOSelect attribute, UInt32 *value)
 {
+	if (connectIndex != 0)
+		return kIOReturnBadArgument;
 	switch (attribute) {
+	case kConnectionSupportsHLDDCSense:
+		/* IODisplay probes this capability with a null value pointer. */
+		return kIOReturnSuccess;
 	case kConnectionEnable:
-		/* The display answered over DDC when we started. */
 		if (value)
-			*value = 1;
+			*value = fConnected ? 1 : 0;
 		return kIOReturnSuccess;
 	case kConnectionFlags:
 		if (value)
@@ -1257,6 +1342,8 @@ IOReturn RadeonNI::getAttributeForConnection(IOIndex connectIndex,
 IOReturn RadeonNI::connectFlags(IOIndex connectIndex,
 	IODisplayModeID displayMode, IOOptionBits *flags)
 {
+	if (connectIndex != 0 || !flags)
+		return kIOReturnBadArgument;
 	if (!modeForID(displayMode))
 		return kIOReturnUnsupportedMode;
 	*flags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
@@ -1265,7 +1352,14 @@ IOReturn RadeonNI::connectFlags(IOIndex connectIndex,
 
 bool RadeonNI::hasDDCConnect(IOIndex connectIndex)
 {
-	return fConnected && fEdidLen > 0;
+	bool available;
+
+	if (connectIndex != 0 || !fLock)
+		return false;
+	IOLockLock(fLock);
+	available = fConnected && fEdidLen > 0;
+	IOLockUnlock(fLock);
+	return available;
 }
 
 /* Blocks are numbered from 1. The EDID was read when the driver started. */
@@ -1277,14 +1371,21 @@ IOReturn RadeonNI::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber,
 	UInt32 offset;
 	IOByteCount n;
 
-	if (blockType != kIODDCBlockTypeEDID || blockNumber < 1)
+	if (connectIndex != 0 || !data || !length)
+		return kIOReturnBadArgument;
+	if (!fLock)
+		return kIOReturnNotReady;
+	IOLockLock(fLock);
+	if (!fConnected || blockType != kIODDCBlockTypeEDID || blockNumber < 1 ||
+	    fEdidLen <= 0 || blockNumber > (UInt32)fEdidLen / RDN_EDID_BLOCK_SIZE) {
+		IOLockUnlock(fLock);
 		return kIOReturnUnsupported;
+	}
 	offset = (blockNumber - 1) * RDN_EDID_BLOCK_SIZE;
-	if (fEdidLen <= 0 || offset + RDN_EDID_BLOCK_SIZE > (UInt32)fEdidLen)
-		return kIOReturnUnsupported;
 	n = *length < RDN_EDID_BLOCK_SIZE ? *length : RDN_EDID_BLOCK_SIZE;
 	bcopy(fEdid + offset, data, n);
 	*length = n;
+	IOLockUnlock(fLock);
 	return kIOReturnSuccess;
 }
 
@@ -1294,25 +1395,37 @@ IOReturn RadeonNI::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber,
  */
 
 /* The picture and the signal off, or back (a mode set, with link training). */
-void RadeonNI::setOutputPower(bool on)
+IOReturn RadeonNI::setOutputPower(bool on, bool framebuffer)
 {
+	IOReturn result = kIOReturnSuccess;
+
 	IBNOTE(9, on ? 1 : 0);
 	if (!fLock)
-		return;
+		return kIOReturnNotReady;
 	IOLockLock(fLock);
+	if (framebuffer)
+		fFramebufferRequested = on;
+	else
+		fDisplayRequested = on;
+	on = fFramebufferRequested && fDisplayRequested;
+	fOutputRequested = on;
 	if (fModeSet && on != fOutputOn) {
 		if (on) {
-			IOReturn r = programModeLocked(fCurrentMode, fCurrentDepth);
+			result = programModeLocked(fCurrentMode, fCurrentDepth);
 
-			IOLog("RadeonNI: output back on: %d\n", (int)r);
+			IOLog("RadeonNI: output back on: %d\n", (int)result);
 		} else {
 			int r = rdn_output_disable(&fCard, modeForID(fCurrentMode), useHDMI());
 
-			fOutputOn = false;
+			/* Disable stops the CRTC even if the transmitter call fails. */
+			fOutputOn = fCard.crtc_on;
+			if (r)
+				result = kIOReturnIOError;
 			IOLog("RadeonNI: output off: %d\n", r);
 		}
 	}
 	IOLockUnlock(fLock);
+	return result;
 }
 
 void RadeonNI::pollTimerFired(OSObject *owner, IOTimerEventSource *sender)
@@ -1385,10 +1498,16 @@ void RadeonNI::pollHotplug()
 {
 	IBNOTE(8, 0);
 	int sense;
+	bool changed = false;
 
 	if (!fLock || !fModeSet)
 		return;
 	IOLockLock(fLock);
+	if (!fOutputRequested) {
+		fSenseSteady = 0;
+		IOLockUnlock(fLock);
+		return;
+	}
 	sense = rdn_output_connected(&fCard) ? 1 : 0;
 	if (sense != fSenseLast) {
 		fSenseLast = sense;
@@ -1397,14 +1516,38 @@ void RadeonNI::pollHotplug()
 		fSenseSteady = 0;
 		if (sense) {
 			monitorReturned();
+			changed = fConnected;
 		} else {
 			fConnected = false;
 			IOLog("RadeonNI: %s: the monitor was unplugged\n", fCard.output->name);
-			if (fConnectProc && fConnectOn && !fCaptured)
-				(*fConnectProc)(fConnectTarget, fConnectRef);
+			changed = true;
 		}
 	}
 	IOLockUnlock(fLock);
+	if (changed)
+		notifyConnectionChange();
+}
+
+void RadeonNI::notifyConnectionChange()
+{
+	IOFBInterruptProc proc = 0;
+	OSObject *target = 0;
+	void *ref = 0;
+
+	IOLockLock(fLock);
+	if (fConnectOn && !fCaptured) {
+		proc = fConnectProc;
+		target = fConnectTarget;
+		ref = fConnectRef;
+		if (target)
+			target->retain();
+	}
+	IOLockUnlock(fLock);
+	/* IOGraphics may re-enter the framebuffer from its callback. */
+	if (proc)
+		(*proc)(target, ref);
+	if (target)
+		target->release();
 }
 
 /*
@@ -1417,7 +1560,9 @@ void RadeonNI::monitorReturned()
 {
 	UInt8 edid[RDN_EDID_MAX_SIZE];
 	struct rdn_mode modes[kMaxModes];
+	struct rdn_mode oldModes[kMaxModes];
 	UInt32 count, i, bytes, keep = 0, id = 1, pref_id = 1;
+	UInt32 oldCount = fModeCount;
 	int pref = 0;
 	int len;
 	bool changed;
@@ -1433,6 +1578,8 @@ void RadeonNI::monitorReturned()
 		count = (UInt32)rdn_edid_modes(edid, len, modes, kMaxModes, &pref);
 		for (i = 0; i < count; i++) {
 			struct rdn_fb fb;
+			if (!rdn_output_mode_supported(&fCard, &modes[i], useHDMI()))
+				continue;
 
 			/* The window server maps the surface once, at its size. */
 			describeFb(&modes[i], kDepth32, &fb);
@@ -1455,34 +1602,45 @@ void RadeonNI::monitorReturned()
 				id = i + 1;
 				break;
 			}
-		bcopy(edid, fEdid, len);
-		fEdidLen = len;
+		bcopy(fModes, oldModes, sizeof(oldModes));
 		bcopy(modes, fModes, keep * sizeof(modes[0]));
 		fModeCount = keep;
-		fPreferred = pref_id;
-		setProperty("EDID", fEdid, fEdidLen);
-		setProperty("Output", fCard.output->name);
-		IOLog("RadeonNI: another monitor: %lu modes, %s\n", (unsigned long)keep,
-		      fCard.output->name);
 	} else {
 		id = fCurrentMode;
 	}
-	fConnected = true;
-	if (programModeLocked(id, fCurrentDepth) != kIOReturnSuccess)
+	if (programModeLocked(id, fCurrentDepth) != kIOReturnSuccess) {
+		if (changed) {
+			bcopy(oldModes, fModes, sizeof(oldModes));
+			fModeCount = oldCount;
+		}
 		IOLog("RadeonNI: the mode set after the monitor came back failed\n");
-	if (fConnectProc && fConnectOn && !fCaptured)
-		(*fConnectProc)(fConnectTarget, fConnectRef);
+		return;
+	}
+	if (changed) {
+		bcopy(edid, fEdid, len);
+		fEdidLen = len;
+		fPreferred = pref_id;
+		setProperty("EDID", fEdid, fEdidLen);
+		IOLog("RadeonNI: another monitor: %lu modes, %s\n", (unsigned long)keep,
+		      fCard.output->name);
+	}
+	setProperty("Output", fCard.output->name);
+	fConnected = true;
 }
 
 IOReturn RadeonNI::registerForInterruptType(IOSelect interruptType,
 	IOFBInterruptProc proc, OSObject *target, void *ref, void **interruptRef)
 {
 	if (interruptType == kIOFBConnectInterruptType) {
+		if (!proc || !interruptRef)
+			return kIOReturnBadArgument;
+		IOLockLock(fLock);
 		fConnectProc = proc;
 		fConnectTarget = target;
 		fConnectRef = ref;
 		fConnectOn = true;
 		*interruptRef = (void *)&fConnectProc;
+		IOLockUnlock(fLock);
 		IOLog("RadeonNI: the OS wants connection changes\n");
 		return kIOReturnSuccess;
 	}
@@ -1493,8 +1651,12 @@ IOReturn RadeonNI::registerForInterruptType(IOSelect interruptType,
 IOReturn RadeonNI::unregisterInterrupt(void *interruptRef)
 {
 	if (interruptRef == (void *)&fConnectProc) {
+		IOLockLock(fLock);
 		fConnectProc = 0;
 		fConnectOn = false;
+		fConnectTarget = 0;
+		fConnectRef = 0;
+		IOLockUnlock(fLock);
 		return kIOReturnSuccess;
 	}
 	return super::unregisterInterrupt(interruptRef);
@@ -1503,7 +1665,9 @@ IOReturn RadeonNI::unregisterInterrupt(void *interruptRef)
 IOReturn RadeonNI::setInterruptState(void *interruptRef, UInt32 state)
 {
 	if (interruptRef == (void *)&fConnectProc) {
+		IOLockLock(fLock);
 		fConnectOn = state == kEnabledInterruptState;
+		IOLockUnlock(fLock);
 		return kIOReturnSuccess;
 	}
 	return super::setInterruptState(interruptRef, state);

@@ -30,6 +30,7 @@
 #include "../hw/rdn_mode.h"
 #include "../hw/rdn_i2c.h"
 #include "../hw/atom/atombios.h"
+#include "../hw/atom/ObjectID.h"
 
 #define MMIO_WORDS	(0x20000 / 4)
 
@@ -295,6 +296,37 @@ int main(int argc, char **argv)
 	size_t len;
 	FILE *f;
 	int i, r, dvi = 0, dp = 0;
+	struct rdn_mode link_mode = { 0 };
+	struct rdn_output link_output = { 0 };
+
+	card.output = &link_output;
+	link_output.connector_id = CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_I;
+	link_mode.clock = 165000;
+	if (rdn_output_is_duallink(&card, &link_mode) ||
+	    !rdn_output_mode_supported(&card, &link_mode, false))
+		return 1;
+	link_mode.clock = 268000;
+	if (!rdn_output_is_duallink(&card, &link_mode))
+		return 1;
+	if (!rdn_output_mode_supported(&card, &link_mode, false) ||
+	    rdn_output_mode_supported(&card, &link_mode, true))
+		return 1;
+	link_mode.clock = 340000;
+	if (rdn_output_mode_supported(&card, &link_mode, false))
+		return 1;
+	link_mode.clock = 268000;
+	link_output.displayport = true;
+	if (rdn_output_is_duallink(&card, &link_mode))
+		return 1;
+	link_output.displayport = false;
+	link_output.connector_id = CONNECTOR_OBJECT_ID_SINGLE_LINK_DVI_D;
+	if (rdn_output_is_duallink(&card, &link_mode))
+		return 1;
+	memset(&card, 0, sizeof(card));
+	if (argc == 2 && !strcmp(argv[1], "--links-only")) {
+		printf("PASS: DVI link count follows connector type and pixel clock\n");
+		return 0;
+	}
 
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
