@@ -1031,6 +1031,8 @@ static int init_common(struct rdn_uvd *uvd, struct rdn_accel *accel,
 			}
 			rdn_log(card->os, RDN_LOG_INFO, "uvd: the whole region read back: %u bytes differ (first at %u)", (unsigned)wrong,
 				(unsigned)where);
+			/* experiment: do the bytes pushed through the window need time to reach the memory the decoder reads? */
+			mdelay(card, 500);
 		}
 	}
 
