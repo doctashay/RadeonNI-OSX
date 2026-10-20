@@ -1497,9 +1497,9 @@ IOReturn RadeonNIAccel::uvdSubmitWords(task_t task, UInt32 address, UInt32 words
 
 		if (said < 24) {
 			said++;
-			IOLog("RadeonNI: UVD: stream of %lu words, %lu session message(s)%s, live %lu, dirty %d, epoch %lu, clocks %s\n",
+			IOLog("RadeonNI: UVD: stream of %lu words, %lu session message(s)%s, live %lu, dirty %d, epoch %lu, clocks %s, UVD_STATUS 0x%08lx\n",
 			      (unsigned long)words, (unsigned long)n, n && msgs[0].type == 0 ? " (create)" : "", (unsigned long)fUvdLive,
-			      fUvdDirty, (unsigned long)fUvdEpoch, fUvdClocksUp ? "up" : "down");
+			      fUvdDirty, (unsigned long)fUvdEpoch, fUvdClocksUp ? "up" : "down", (unsigned long)rdn_rreg(fAccel.card, 0xf6bc));
 		}
 	}
 	/* the slot's last stream must have run before it is written over */
