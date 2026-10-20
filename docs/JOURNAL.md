@@ -7402,3 +7402,20 @@ GL windows, a shell-started program with a window, a background launch, a UIElem
   would be one way to write the decoder's registers. A second line: the memory controller's and RLC's state around the switch (their registers are not in the safe list).
 - State left on the G5: the QuickTime component is NOT installed (`scripts/qt-component.sh install` puts it back); kext with level-1 restarts, UVD sync, register-write
   sync; `~/winprobe.app`, `~/winprobe-ui.app` (source `tools/guest/winprobe.m`), probe scripts in the G5's home.
+
+## 2026-10-19 (night, later): the window server sends the card nothing at the switch; the memory controller stays busy in the wedge
+
+The command buffer recorder (kext `RDN_UC_IBLOG`, `tools/guest/iblog.c`; `ibRecord()` in `RadeonNIAccel.cpp`; the framebuffer's entry points note themselves too) ran through the
+reproduction (paced decode session, `open -g winprobe.app`, `osascript ... activate`), twice:
+- Between the two marks around the `activate` the kext saw no command buffer from any other client, no 2D fill or copy, and no call of the framebuffer kext except its
+  500 ms hot-plug poll: no cursor, gamma, colour table, attribute or DDC call. The only submitters were the decode program's own streams. The scan found nothing
+  in the 3D buffers (no type-0 packets, no register writes outside the ranges, nothing pointing into the decoder's memory). So the switch does not break the decoder
+  through anything that passes through the kext; the window server draws without our accelerator at that moment (software into the framebuffer, or not at all).
+- The standard status registers (GRBM, CP, DMA, VM L2, RLC, power management) are the same healthy and wedged except **SRBM_STATUS (0xE50): healthy 0x200000c0, wedged 0x20000ac0** (the decode session had
+  ended in both): bits 9 and 11, MCB_BUSY and MCC_BUSY, the memory controller's busy flags, stay set. The memory controller holds requests that never finish; that is why neither a
+  VCPU restart nor a sub-block reset helps, and why only a restart of the G5 does (the card is posted again).
+- A first recorder build failed to load on the G5 (`_proc_selfpid`: the kext's libraries do not include the BSD interface); the G5 ran without the kext until the previous binary was
+  put back. `scripts/leopard.sh check` now fails for BSD-only symbols.
+- Next: find which memory client's requests hang (the display engine's reads, the HDP, UVD's own ports) by stopping them one at a time in the wedge and watching SRBM_STATUS: blank the
+  display (`rdn_display_hold`), flush the HDP, read the MC's own status registers (Linux `evergreen_mc_wait_for_idle`, `evergreen_print_gpu_status_regs`), and try `SRBM_SOFT_RESET` of the
+  memory controller blocks in the wedge instead of a start of the decoder. Also what the software drawing into the framebuffer does at the switch (the window server maps the framebuffer's aperture).

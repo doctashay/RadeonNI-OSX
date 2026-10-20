@@ -165,7 +165,9 @@ Not a QuickTime problem: on the G5 any change of the frontmost application (laun
 `activate`, a switch back to Finder) stops the decoder: commands and fences run, decodes get no feedback block and no picture, for every program, and neither the kext's
 restarts (VCPU, all sub-blocks) nor a library recovery bring it back; only a restart of the G5 does. A stall right at a launch has been repaired by the library's
 restart and replay; the one at the next switch or exit was not. Windows, GL windows, programs started from the shell, background launches (`open -g`) and Dock-less
-bundles do not trigger it. The registers `rdnuvd regs` reads are the same wedged and healthy; the firmware image is intact. Reproduce: `~/wpswitch.sh` style (a paced
+bundles do not trigger it. The registers `rdnuvd regs` reads are the same wedged and healthy; the firmware image is intact. What differs is `SRBM_STATUS` (0xE50), healthy 0x200000c0 and wedged 0x20000ac0: MCB_BUSY and MCC_BUSY, the
+memory controller's busy flags, stay set with nothing decoding, so the memory controller is hung on requests that never finish. At the switch the kext sees no command buffer, 2D operation or framebuffer call from
+the window server (the kext's recorder, `tools/guest/iblog.c`). Reproduce: `~/wpswitch.sh` style (a paced
 `rdn_uvdtest -A -P 400` session, then `open -g -a winprobe.app`, then `osascript -e 'tell application "..." to activate'`), see the journal of 2026-10-19.
 What is built and works on the card: the kext restarts the block when a session starts with no other alive (every restart resets all sub-blocks, `rdn_uvd_set_reset_level(1)`) and
 on `RDN_UC_UVD_RESET` (epoch counter, fence numbers go on); `rdn_winsys_uvd_answered()` checks the feedback block (`feedback[1] == message[3]`); `rdnvd` waits up to
