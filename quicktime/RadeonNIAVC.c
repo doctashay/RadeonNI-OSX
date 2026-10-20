@@ -347,7 +347,7 @@ pascal ComponentResult RDNAVC_Preflight(RDNAVCGlobals *storage, CodecDecompressP
 	}
 	/* another decoder (this program's or another's) may have the card's video memory the decoder reaches */
 	pthread_mutex_lock(&gLock);
-	room = rdnvd_h264_room(gDevice, (unsigned)(**desc).width, (unsigned)(**desc).height);
+	room = rdnvd_h264_room_for(storage->session);
 	pthread_mutex_unlock(&gLock);
 	if (!room) {
 		say("declined: no video memory for a %ldx%ld decoder now (another decoder has it)", (long)(**desc).width,

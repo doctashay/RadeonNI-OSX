@@ -73,6 +73,8 @@ struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_t *avcc, size
  * 720p, all of it in the 256 MB the decoder reaches: one 1080p decoder at a time). Looks, takes nothing.
  */
 int rdnvd_h264_room(struct rdnvd *d, unsigned width, unsigned height);
+/* The same for the stream a session was opened with: the decoder is sized for it (the level and its reference frames), as Mesa's decoder is. */
+int rdnvd_h264_room_for(struct rdnvd_session *s);
 /*
  * Makes the decoder (and takes its video memory) now, for a session opened with an avcC record; otherwise it is made
  * when the first picture comes. 0, or an error: another decoder may have the card's memory.

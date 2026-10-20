@@ -583,12 +583,38 @@ RDNVD_PUBLIC struct rdnvd_session *rdnvd_h264_open(struct rdnvd *d, const uint8_
 extern bool rdn_target_vram_alloc(uint32_t bytes, uint32_t *offset);
 extern void rdn_target_vram_free(uint32_t offset);
 
-RDNVD_PUBLIC int rdnvd_h264_room(struct rdnvd *d, unsigned width, unsigned height)
+/*
+ * How many pictures Mesa's decoder (patch 0017) keeps in its buffer: what the level allows plus the picture being decoded, at most 17,
+ * or the stream's own reference frames plus one if that is more; 17 with RDN_UVD_FULL_DPB set.
+ */
+static unsigned dpb_slots(unsigned level, unsigned width_mbs, unsigned height_mbs, unsigned refs)
+{
+	unsigned mbs = width_mbs * ((height_mbs + 1) & ~1u), limit, lean;
+
+	if (getenv("RDN_UVD_FULL_DPB"))
+		return 17;
+	switch (level) {
+	case 30: limit = 8100; break;
+	case 31: limit = 18000; break;
+	case 32: limit = 20480; break;
+	case 40:
+	case 41: limit = 32768; break;
+	case 42: limit = 34816; break;
+	case 50: limit = 110400; break;
+	default: limit = 184320; break;
+	}
+	lean = limit / (mbs ? mbs : 1) + 1;
+	if (lean > 17)
+		lean = 17;
+	return lean > refs + 1 ? lean : refs + 1;
+}
+
+static int room_for(unsigned width, unsigned height, unsigned slots)
 {
 	unsigned w = (width + 15) & ~15u, h = (height + 15) & ~15u, mbs = w / 16 * (h / 16);
 	uint64_t image = (((uint64_t)((w + 31) & ~31u) * h * 3 / 2) + 1023) & ~1023ull;
-	/* Mesa's decoder: 17 pictures and their contexts in one buffer, the pictures it hands out, four bitstream buffers */
-	uint64_t dpb = image * 17 + (uint64_t)mbs * 192 * 17 + (uint64_t)mbs * 32 + 65536;
+	/* Mesa's decoder: the pictures and their contexts in one buffer, the pictures it hands out, four bitstream buffers */
+	uint64_t dpb = image * slots + (uint64_t)mbs * 192 * slots + (uint64_t)mbs * 32 + 65536;
 	uint64_t rest = image * 8 + 4ull * w * h * 2 + (1 << 20);
 	uint32_t a, b;
 	int ok = 0;
@@ -603,6 +629,23 @@ RDNVD_PUBLIC int rdnvd_h264_room(struct rdnvd *d, unsigned width, unsigned heigh
 		rdn_target_vram_free(a);
 	}
 	return ok;
+}
+
+/* Room for the decoder of this session's stream (it is read from the configuration the session was opened with). */
+RDNVD_PUBLIC int rdnvd_h264_room_for(struct rdnvd_session *s)
+{
+	const struct rdnvd_h264_sps *sps = s ? rdnvd_h264_parser_first_sps(s->parser) : NULL;
+
+	if (!sps)
+		return 0;
+	return room_for(sps->width_mbs * 16, sps->height_mbs * 16,
+			dpb_slots(sps->level_idc, sps->width_mbs, sps->height_mbs, sps->max_num_ref_frames ? sps->max_num_ref_frames : 1));
+}
+
+RDNVD_PUBLIC int rdnvd_h264_room(struct rdnvd *d, unsigned width, unsigned height)
+{
+	/* no stream to ask: the old size, 17 pictures */
+	return room_for(width, height, 17);
 }
 
 RDNVD_PUBLIC int rdnvd_h264_prepare(struct rdnvd_session *s)
