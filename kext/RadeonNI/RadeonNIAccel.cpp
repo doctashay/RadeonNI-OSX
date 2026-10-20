@@ -10,7 +10,6 @@
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <stdarg.h>
-#include <sys/proc.h>
 #include <IOKit/graphics/IOGraphicsInterfaceTypes.h>
 
 #include "RadeonNI.h"
@@ -1104,7 +1103,7 @@ UInt32 RadeonNIAccel::ibScan(UInt32 ms, UInt32 pid, UInt32 client, UInt32 offset
 	UInt32 i = 0, found = 0;
 	char who[64];
 
-	snprintf(who, sizeof(who), "t=%lu pid=%lu cl=%08lx ib=0x%lx+%lu", (unsigned long)ms, (unsigned long)pid,
+	snprintf(who, sizeof(who), "t=%lu task=%08lx cl=%08lx ib=0x%lx+%lu", (unsigned long)ms, (unsigned long)pid,
 		 (unsigned long)client, (unsigned long)offset, (unsigned long)words);
 	while (i < words) {
 		UInt32 h = w[i], type = h >> 30, count, op, k, start;
@@ -1230,7 +1229,7 @@ void RadeonNIAccel::ibRecord(UInt32 kind, void *client, UInt32 offset, UInt32 wo
 	if (!fIbOn)
 		return;
 	ms = kernelMs();
-	pid = (UInt32)proc_selfpid();
+	pid = (UInt32)(unsigned long)current_task();	/* the task's address stands for the process (no BSD interface in this kext) */
 	if (kind == '3' && offset >= HEAP_OFFSET && words && words <= (fAccel.aperture_size - offset) / 4 && !(offset & 3))
 		found = ibScan(ms, pid, (UInt32)(unsigned long)client, offset, words);
 	fIbFound += found;
@@ -1281,7 +1280,7 @@ IOReturn RadeonNIAccel::ibLogControl(UInt32 op, UInt32 *ms)
 		len += snprintf(text + len, sizeof(text) - len, "on=%d entries=%lu findings=%lu now=%lu\n", fIbOn ? 1 : 0,
 				(unsigned long)fIbTotal, (unsigned long)fIbFound, (unsigned long)*ms);
 		len += snprintf(text + len, sizeof(text) - len, "-- findings --\n%s", fIbText);
-		len += snprintf(text + len, sizeof(text) - len, "-- last entries: time kind client pid ib words findings --\n");
+		len += snprintf(text + len, sizeof(text) - len, "-- last entries: time kind client task ib words findings --\n");
 		first = fIbTotal > 160 ? fIbTotal - 160 : 0;
 		for (n = first; n < fIbTotal && len + 80 < sizeof(text); n++) {
 			IbEntry *e = &fIbEntries[n % kIbEntries];
