@@ -1484,6 +1484,16 @@ IOReturn RadeonNIAccel::uvdSubmitWords(task_t task, UInt32 address, UInt32 words
 		return kIOReturnNotReady;
 	}
 	n = uvdFind(stream, words, msgs);
+	{
+		static UInt32 said;
+
+		if (said < 24) {
+			said++;
+			IOLog("RadeonNI: UVD: stream of %lu words, %lu session message(s)%s, live %lu, dirty %d, epoch %lu, clocks %s\n",
+			      (unsigned long)words, (unsigned long)n, n && msgs[0].type == 0 ? " (create)" : "", (unsigned long)fUvdLive,
+			      fUvdDirty, (unsigned long)fUvdEpoch, fUvdClocksUp ? "up" : "down");
+		}
+	}
 	/* the slot's last stream must have run before it is written over */
 	slot = fUvdIbNext;
 	if (fUvdIbFence[slot] && !rdn_uvd_fence_done(&fUvd, fUvdIbFence[slot]) &&

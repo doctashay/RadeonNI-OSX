@@ -547,10 +547,13 @@ static void program_memory(struct rdn_uvd *uvd)
 			wr(card, UVD_VCPU_CACHE_OFFSET2, off);
 			wr(card, UVD_VCPU_CACHE_SIZE2, size);
 		}
-		if (uvd->flags & RDN_UVD_F_EXT) {
-			wr(card, UVD_LMI_ADDR_EXT, ext_value((uint32_t)(at >> 28)));
+		/*
+		 * The segment is always written: a block started again in the aperture after it ran in a segment would keep the
+		 * segment's value (the registers survive a restart) and fetch its firmware from the wrong place.
+		 */
+		wr(card, UVD_LMI_ADDR_EXT, ext_value((uint32_t)(at >> 28)));
+		if (uvd->flags & RDN_UVD_F_EXT)
 			wr(card, UVD_LMI_EXT40_ADDR, (uint32_t)((at >> 32) & 0xFF) | (0x9 << 16) | (0x1u << 31));
-		}
 		return;
 	}
 	uint64_t gpu = uvd_addr(uvd, uvd->vcpu_gpu);
