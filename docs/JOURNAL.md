@@ -7456,3 +7456,16 @@ afterwards, so it could not be halted over ssh (a loop gave up after 6 minutes).
 - To do when the G5 is on again, in this order: (1) health check, read only; (2) the A/B before the fix: after a boot, `rdnuvd init 0x10c00`, then `vramdiff -c '<one decode session>' 0 1400`, and look at the
   top rows of a screen grab: pages changing in the first 1.3 MB mean the firmware writes into the screen; (3) install the new kext, reboot, the same diff (expect no changes), then the paced session with
   `activate`, and the restart loop around the activation. Further ideas from the same comparison if this is not it: hold the display and wait for the memory controller to be idle around a restart, word-sized stores for the firmware rewrite (the byte loops are about a million single-byte stores), release the sub-blocks with the clock gate cleared first.
+
+## 2026-10-20: the heap and stack windows fix the wedge; the decoder's memory is sized for the stream; previews go to software
+
+With the kext that programs the VCPU's heap and stack/session windows (`RDN_UVD_F_WINDOWS`, installed 19:51 on the G5 after the user reseated the card, which had slightly disconnected: probably behind some of the hangs):
+a decode session open across four foreground changes stayed bit-exact (60 of 60), a fresh process after the app quit decoded, 26 forced restarts overlapping an activation left the decoder healthy, Player played the colorbars clip (51 pictures drawn, all
+identical to the reference, no stall), and the user saw the colorbars and a B-pyramid clip play correctly. The aliasing explanation held: the firmware's heap and stack had been at video memory address 0, the top of the screen.
+- Regression check at the same time: the QuickTime path (`qtdecode`) showed `b720` and `b1080` with many pictures wrong and 1080p scheduled playback too, while the headless suite passed and Player showed a B-pyramid clip right; not
+  chased (the likely reason is the `qtdecode` build of that day, or its display-time check; to look at when time allows).
+- The user's 1080x1920 60 fps clip played slowly because the component declined it ("no video memory for a 1080x1920 decoder now"): Finder's icon preview held the one 125 MB 1080p decoder. Fixes: patch 0017 (decoder buffer
+  sized for the stream, about 22 MB at 1080p), `rdnvd_h264_room_for`, and previews (Finder, Quick Look, Spotlight) go to QuickTime's own decoder. `gpucheck.sh` showed the clip then taking the card: 129 decoder streams in 3.9 s (33 a second), fences advancing.
+- A first try to put the decoder's reference buffer in the hidden video memory (patch 0016, `RDN_UVD_DPB_HIDDEN`, `RDN_HIDDEN_FILL_MB`) did not even place it there (the buffer showed up in the visible window); abandoned for the dynamic size, which solves the
+  same problem. Patch 0016 stays in the tree off by default. `vramdiff -c` spins at 100 % CPU (a bug in the mode added for it; not found; terminated).
+- A `rdn_uvdtest17` run logged "a decode was not answered after 250 ms" once at 20:26:33 (the recovery ran; the run passed): a single stall seen since the fix, not looked into.

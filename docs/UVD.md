@@ -162,10 +162,18 @@ The user's first look at the installed component (1080p clip): corrupt pictures,
 ### Did a clip run on the card? (2026-10-20)
 
 `tools/guest/gpucheck.sh clip.mp4` plays a clip in Player and prints the kext's count of video decoder streams (kind U in the recorder), the decoder's fence counter before and during, and Player's CPU use;
-`grep RadeonNIAVC /var/log/system.log` says "declined: no video memory for a WxH decoder now (another decoder has it)" when the component refused a clip and QuickTime used its own software decoder. The
-decoder's memory (about 125 MB at 1080p, Mesa's legacy sizing: the firmware assumes 17 reference pictures, `NUM_H264_REFS`) must fit the kext's 222 MB heap, so one 1080p decoder fits at a time, and
-Finder's icon preview or Quick Look of a 1080p clip takes it and keeps it while the file's preview is shown (seen with `~/Downloads/cs2_facu.mp4`, 1080x1920 at 60 fps, High 4.2, 11 Mbit/s: Player was declined and played it in software).
-Even on the card the pipeline decodes a 1080p picture in about 24 ms and reads it out in 11 ms (synchronously), roughly 30 pictures a second at best: 1080p60 is beyond it today.
+`grep RadeonNIAVC /var/log/system.log` says "declined: ..." when the component refused a clip and QuickTime used its own software decoder (no video memory for a decoder of that size, a stream the card does not
+decode, or a preview). On 2026-10-20 `~/Downloads/cs2_facu.mp4` (1080x1920 at 60 fps, High 4.2, 11 Mbit/s, B pictures) was declined for lack of video memory and played in software.
+
+**The decoder's memory** was sized by Mesa's legacy rule (at least 17 pictures and their contexts, `NUM_H264_REFS`: "the firmware seems to always assume a minimum of ref frames"): 125 MB at 1080p, so one decoder at a time fitted the
+kext's 222 MB heap (256 MB window minus the 34 MB at the bottom: screen, cursor, GART table), and Finder's icon preview of a 1080p clip took the slot and kept it. Patch 0017 sizes it as radeonsi does for this firmware: the larger
+of what the level allows (plus the picture being decoded, at most 17) and the stream's reference frames plus one; `RDN_UVD_FULL_DPB=1` gives the 17 back. 1080p: about 22 MB. Checked bit-exact against ffmpeg: the vector suite (13 of 15; `i`
+and `mbaff` fail either way), streams with 1, 2, 3 (P only) and 1, 2, 4, 8, 16 (B pyramid) reference frames, and the first 60 pictures of the cs2 clip (reference decoded from the same truncated stream). The library's room check
+(`rdnvd_h264_room_for`) sizes it the same way. The component also declines in Finder, quicklookd, QuickLookSatellite, mdworker and mdimport (previews go to QuickTime's decoder; names can be added or removed in
+`/Library/Application Support/RadeonNI/software-decode`, a line `-name` removes one); a running Finder keeps whatever it had until it closes the movie.
+
+Speed: 1080p decodes in about 25 ms and reads out in 12 ms, one picture at a time (decode, wait for the fence, read back, convert on the CPU): about 33 pictures a second, so a 60 fps 1080p clip plays at about half speed. The firmware
+could do far more; pipelining the decode of the next picture with the read-out of the last, and converting on the card, is the way, not done.
 
 ### The decoder wedges when the frontmost application changes (open issue, 2026-10-19)
 
