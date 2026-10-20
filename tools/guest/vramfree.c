@@ -5,7 +5,8 @@
  * allocates in the same few milliseconds may see its allocation fail, so do not run it while a clip is playing.
  *
  *   vramfree                 largest block, total free, and the pieces
- *   vramfree dpb rest        also the decoder's room check as rdnvd's room_for() makes it: `dpb` bytes, then `rest` bytes while the first is held
+ *   vramfree dpb image bitstream   also the decoder's room check as rdnvd's room_for() makes it: `dpb` bytes, then four buffers of
+ *                            `bitstream` bytes, eight of `image` bytes and one of 1 MB, all held at once (1080p: 23827456 3133440 4177920)
  *
  * Builds on the G5 (IOKit only), with hw/rdn_user.h next to it:
  *   gcc-4.0 -arch ppc -isysroot /Developer/SDKs/MacOSX10.4u.sdk -mmacosx-version-min=10.4 -I. -o vramfree vramfree.c -framework IOKit -framework CoreFoundation
@@ -88,18 +89,20 @@ int main(int argc, char **argv)
 	for (i = 0; i < nheld; i++)
 		vram_free(held[i]);
 	printf("free in pieces of 64 KB or more: %u KB\n", total / 1024);
-	if (argc >= 3) {
-		uint32_t dpb = (uint32_t)strtoul(argv[1], NULL, 0), rest = (uint32_t)strtoul(argv[2], NULL, 0), a, b;
+	if (argc >= 4) {
+		uint32_t dpb = (uint32_t)strtoul(argv[1], NULL, 0), image = (uint32_t)strtoul(argv[2], NULL, 0);
+		uint32_t bs = (uint32_t)strtoul(argv[3], NULL, 0), a, pieces[16], n = 0, want = 13;
 		int ok = 0;
 
 		if (!vram_alloc(dpb, &a)) {
-			if (!vram_alloc(rest, &b)) {
-				vram_free(b);
-				ok = 1;
-			}
+			while (n < want && !vram_alloc(n < 4 ? bs : n < 12 ? image : (1u << 20), &pieces[n]))
+				n++;
+			ok = n == want;
+			while (n)
+				vram_free(pieces[--n]);
 			vram_free(a);
 		}
-		printf("room check (%u KB then %u KB): %s\n", dpb / 1024, rest / 1024, ok ? "room" : "NO ROOM");
+		printf("room check (%u KB, then 4 x %u KB, 8 x %u KB, 1 MB): %s\n", dpb / 1024, bs / 1024, image / 1024, ok ? "room" : "NO ROOM");
 	}
 	IOServiceClose(conn);
 	return 0;

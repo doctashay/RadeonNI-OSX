@@ -630,22 +630,30 @@ static int room_for(struct rdnvd *d, unsigned width, unsigned height, unsigned s
 {
 	unsigned w = (width + 15) & ~15u, h = (height + 15) & ~15u, mbs = w / 16 * (h / 16);
 	uint64_t image = (((uint64_t)((w + 31) & ~31u) * h * 3 / 2) + 1023) & ~1023ull;
-	/* Mesa's decoder: the pictures and their contexts in one buffer, the pictures it hands out, four bitstream buffers */
+	/* Mesa's decoder: the pictures and their contexts in one buffer; then the pictures it hands out and four bitstream buffers, each one of its own */
 	uint64_t dpb = image * slots + (uint64_t)mbs * 192 * slots + (uint64_t)mbs * 32 + 65536;
-	uint64_t rest = image * 8 + 4ull * w * h * 2 + (1 << 20);
-	uint32_t a, b;
+	uint64_t bitstream = (uint64_t)w * h * 2;
+	uint32_t held[16], dpb_at;
+	unsigned n = 0, i, want = 0;
+	uint64_t size[16];
 	int ok = 0;
 
-	if (dpb > 0x7fffffff || rest > 0x7fffffff)
+	if (dpb > 0x7fffffff || bitstream > 0x7fffffff || image > 0x7fffffff)
 		return 0;
+	for (i = 0; i < 4; i++)
+		size[want++] = bitstream;
+	for (i = 0; i < 8; i++)
+		size[want++] = image;
+	size[want++] = 1 << 20;
 	/* what this program's winsys keeps of buffers it let go of is memory the decoder can have */
 	trim_cache(d);
-	if (rdn_target_vram_alloc((uint32_t)dpb, &a)) {
-		if (rdn_target_vram_alloc((uint32_t)rest, &b)) {
-			rdn_target_vram_free(b);
-			ok = 1;
-		}
-		rdn_target_vram_free(a);
+	if (rdn_target_vram_alloc((uint32_t)dpb, &dpb_at)) {
+		while (n < want && rdn_target_vram_alloc((uint32_t)size[n], &held[n]))
+			n++;
+		ok = n == want;
+		while (n)
+			rdn_target_vram_free(held[--n]);
+		rdn_target_vram_free(dpb_at);
 	}
 	return ok;
 }
