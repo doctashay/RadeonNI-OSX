@@ -43,5 +43,7 @@
 *.d
 *.kext/
 *.dSYM/
+__pycache__/
+*.pyc
 .DS_Store
 /of/build/
