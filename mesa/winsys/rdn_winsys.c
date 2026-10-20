@@ -1683,6 +1683,22 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    return r;
 }
 
+static unsigned rdn_complete_packet_words(const uint32_t *words, unsigned count)
+{
+   unsigned pos = 0;
+
+   while (pos < count) {
+      unsigned type = words[pos] >> 30;
+      unsigned length = type == 2 ? 1 : type == 1 ? 2 :
+                        ((words[pos] >> 16) & 0x3fff) + 2;
+
+      if (length > count - pos)
+         break;
+      pos += length;
+   }
+   return pos;
+}
+
 static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
                         struct pipe_fence_handle **pfence)
 {
@@ -1700,6 +1716,15 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    /* Pad to 8 words, as the command processor fetches (radeon_drm_cs.c). */
    while (rcs->current.cdw & 7)
       rcs->current.buf[rcs->current.cdw++] = 0x80000000; /* type2 nop packet */
+
+   unsigned complete = rdn_complete_packet_words(rcs->current.buf, rcs->current.cdw);
+   if (complete != rcs->current.cdw) {
+      fprintf(stderr, "rdn: incomplete command packet at %u of %u words\n",
+              complete, rcs->current.cdw);
+      for (unsigned i = complete; i < rcs->current.cdw; ++i)
+         rcs->current.buf[i] = 0x80000000;
+   }
+
 
    fence = cs->next_fence;
    cs->next_fence = NULL;
