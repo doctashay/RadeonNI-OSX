@@ -687,7 +687,7 @@ static void rdn_buffer_destroy(struct radeon_winsys *rws, struct pb_buffer_lean 
 
    if (bo->external_store) {
       if (bo->last_use.used &&
-          !rdn_number_wait(ws, bo->last_use.number, OS_TIMEOUT_INFINITE))
+          !rdn_number_wait(ws, bo->last_use.number, false, OS_TIMEOUT_INFINITE))
          return; /* Keep the allocation pinned if completion is unknown. */
       ws->dev->release_external(ws->dev, bo->external_store);
    }
