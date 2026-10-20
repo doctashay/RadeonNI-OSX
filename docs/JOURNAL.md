@@ -7487,3 +7487,21 @@ a rainbow line, dotted curves with a ghost trail, a grey cross, a noisy checkerb
   `rdnvd_frame_read_2vuy`, `frame_stage_dma`, memcpy). The pipeline is serial (decode about 25 ms, DMA read-out about 12 ms, CPU conversion), so 33 pictures a second at best, about 16 in practice
   for 1080p60. Next: submit in DecodeBand and wait in DrawBand, overlap the next decode with the last read-out, and convert on the card.
 - The decline message in the component now says the program is on the software-decode list (it said "previews", which was wrong for names added by hand).
+
+## 2026-10-20 (night): the "corrupted" video was QuickTime's own decoder: the card's decoder was declined at Fit to Screen and for a second movie
+
+The user: the motion clip looks wrong when QuickTime Player's "fit to screen" is used; if the window is never resized it looks right (but slow). Reproduced on the G5 (`~/shot.app` snapshots): at the size the
+clip opens with (1:1, window 1920x1209) frame 100 is right; after View > Fit to Screen (cmd-3 through System Events, window 1530 wide) the picture has the red wash and flat colour regions of the earlier
+Apple-decoder A/B. The log shows why: at the resize QuickTime makes two new instances before it closes the old one, and the component declined them ("no video memory for a 1920x1080 decoder now"), so QuickTime
+used its own decoder for the new session. So the earlier statement here that Apple's decoder renders this clip broken stands (the red wash is its output), and what the user saw was that decoder, not ours.
+- Measured with a new tool, `tools/guest/vramfree.c`: the free heap with nothing playing is one block of 98 MB (the window server and Quartz Extreme hold the rest of the 222 MB); a 1080p decoder takes 66 MB, so
+  there is no room for a second one. With Apple's decoder the free memory is the same at 1:1 and scaled (scaling does not use video memory).
+- After the old decoder closed, its 66 MB stayed out of reach until the program quit: the winsys cache (`RDN_CACHE_BYTES`, 128 MB for the aperture) kept the freed buffers, invisible to the room check and to
+  every other program. That also means a second 1080p movie opened in the same Player was declined and played with QuickTime's decoder: probably what the user saw first with the motion clip after the cs2 one.
+- Fixes (commits `cbe3e51` .. later): `rdn_winsys_trim` (cache back to the kext) when a decoder is destroyed, after the pooled and the orphaned pictures of a closed session are gone, and before the room
+  check; the component keeps a list of its instances and takes a new session of the same size while a sibling holds a decoder, and waits up to 2 s at the first picture for that memory (`sibling_holds`);
+  the room check allocates the decoder's buffers one by one (after a close the free memory was in two pieces of 60 and 40 MB and the single 42 MB block it asked for did not fit).
+- Result on the G5 (component installed, the three previous ones kept as `/tmp/RadeonNIAVC.component.before-<stamp>` there): cs2 then the motion clip in one Player, then Fit to Screen: no "declined", snapshots at
+  1:1 (frame 146) and scaled (frame 620) equal the reference pictures. In the resize QuickTime kept the old session, re-preflighted it and used the two new instances only as probes. After closing a movie
+  the free memory is back to 100 MB (in pieces); after quitting Player one block of 100 MB.
+- Not done: speed (the serial decode, read-out and conversion), still about 33 pictures a second at best at 1080p.

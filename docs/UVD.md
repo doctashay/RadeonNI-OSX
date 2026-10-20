@@ -175,6 +175,20 @@ and `mbaff` fail either way), streams with 1, 2, 3 (P only) and 1, 2, 4, 8, 16 (
 Speed: 1080p decodes in about 25 ms and reads out in 12 ms, one picture at a time (decode, wait for the fence, read back, convert on the CPU): about 33 pictures a second, so a 60 fps 1080p clip plays at about half speed. The firmware
 could do far more; pipelining the decode of the next picture with the read-out of the last, and converting on the card, is the way, not done.
 
+### Video memory: one decoder at a time, and who else holds it
+
+The kext's heap is 222 MB (`docs/MEMORY-EVICTION.md`). With nothing playing, the window server and Quartz Extreme already hold about 124 MB of it: one free block of about 98 MB. A 1080p decoder
+takes about 66 MB (reference buffer 23 MB, eight pictures, four bitstream buffers), so two do not fit. `tools/guest/vramfree.c` shows the free blocks (it only allocates and gives back at once; do not
+run it while a clip plays). What this means in practice (found 2026-10-20 with the clip played in QuickTime Player, Fit to Screen):
+- QuickTime asks for a new decompression session before it lets the old one go (a changed window size). The component used to decline it for lack of video memory and QuickTime's own decoder took
+  the movie over, which renders the motion clip broken (red wash, flat colour regions). Now the component takes the session when another instance of the same program holds a decoder of the same
+  size, and the decoder waits (up to 2 s) at its first picture for that memory.
+- The winsys cache kept a closed decoder's buffers (all 66 MB) until the program exited, so a second 1080p movie opened in the same Player was declined and played with QuickTime's decoder, and no other
+  program could have the memory either. `rdn_winsys_trim` (the cache goes back to the kext) now runs when a decoder is destroyed, when the pictures of a closed session are released and before the
+  room check. A program that has had a decoder may still leave the free memory in two pieces (a small allocation of another client in the middle); the room check allocates the decoder's buffers one by one
+  as the decoder does, so that does not matter.
+- To see which decoder a clip really used: `grep RadeonNIAVC /var/log/system.log` ("declined" means QuickTime's own decoder), or `~/gpucheck.sh`.
+
 ### The decoder wedged when the frontmost application changed (resolved 2026-10-20)
 
 **Cause and fix:** the minimal start programmed only the VCPU's cache window 0 (firmware) and the chip id. Windows 1 (heap) and 2 (stack and sessions) stayed 0, so the firmware's heap and
