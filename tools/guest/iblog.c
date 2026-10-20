@@ -2,6 +2,7 @@
  * iblog: switch the kext's command buffer recorder on and off, mark a moment, and put its lists into the registry (RDN_UC_IBLOG in hw/rdn_user.h).
  *
  *   iblog on | off | mark | dump
+ *   iblog dbg n      (RDN_UC_DEBUG: 1 display reads off, 2 on, 3 HDP flush, 4 decoder sub-blocks reset, 5 decoder block reset; prints SRBM_STATUS)
  *
  * Each call prints the kext's clock in milliseconds, the same clock as the entries. `dump` fills the accelerator's registry property "IBLog":
  *   ioreg -c RadeonNIAccel -l -w0
@@ -28,6 +29,18 @@ int main(int argc, char **argv)
 	int op, ms = 0;
 	kern_return_t kr;
 
+	if (argc == 3 && !strcmp(argv[1], "dbg")) {
+		int st = 0;
+
+		service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(RDN_UC_SERVICE_CLASS));
+		if (!service || IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE, &conn)) {
+			fprintf(stderr, "cannot reach the accelerator\n");
+			return 1;
+		}
+		kr = IOConnectMethodScalarIScalarO(conn, RDN_UC_DEBUG, 1, 1, atoi(argv[2]), &st);
+		printf("dbg %s: 0x%x, SRBM_STATUS 0x%08x\n", argv[2], kr, (unsigned)st);
+		return kr ? 1 : 0;
+	}
 	if (argc < 2) {
 		fprintf(stderr, "usage: iblog on | off | mark | dump\n");
 		return 1;

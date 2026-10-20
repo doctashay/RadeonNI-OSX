@@ -113,6 +113,7 @@ public:
 	/* Debugging (RDN_UC_IBLOG): kind '3' a command buffer, 'U' a decoder stream, 'F' 'C' a screen fill or copy, 'M' a mark. */
 	void ibRecord(UInt32 kind, void *client, UInt32 offset, UInt32 words);
 	IOReturn ibLogControl(UInt32 op, UInt32 *ms);
+	IOReturn debugOp(UInt32 op, UInt32 *srbmStatus);
 	IOMemoryDescriptor *apertureMemory(void);
 	UInt32 apertureBytes(void);
 	/* The shapes of the window server's surfaces, by surface ID. */
@@ -285,6 +286,7 @@ public:
 	IOReturn methodUvdReset(UInt32 *epoch);
 	IOReturn methodUvdEpoch(UInt32 *epoch);
 	IOReturn methodIbLog(UInt32 op, UInt32 *ms);
+	IOReturn methodDebug(UInt32 op, UInt32 *status);
 	IOReturn methodAllocHidden(UInt32 size, UInt32 align, UInt32 *offset);
 	IOReturn methodHiddenInfo(UInt32 *offset, UInt32 *size);
 	IOReturn methodGartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages);

@@ -167,4 +167,7 @@ void rdn_uvd_set_rlc_ucode(const void *fw, uint32_t size);
  */
 void rdn_uvd_set_reset_level(unsigned level);
 
+/* For debugging: 1 reset every sub-block (with the memory controller and the register bus stalled around it), 2 reset the whole block (SRBM_SOFT_RESET). */
+void rdn_uvd_debug_reset(struct rdn_uvd *uvd, unsigned what);
+
 #endif /* RDN_UVD_H */

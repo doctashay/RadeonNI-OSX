@@ -635,6 +635,28 @@ static void vcpu_stop(struct rdn_uvd *uvd)
 	wr_p(card, UVD_RB_ARB_CTRL, 0, ~(1 << 3));
 }
 
+void rdn_uvd_debug_reset(struct rdn_uvd *uvd, unsigned what)
+{
+	struct rdn_card *card = uvd->accel->card;
+
+	if (what == 1) {
+		wr_p(card, UVD_LMI_CTRL2, 1 << 8, ~(1 << 8));
+		wr_p(card, UVD_RB_ARB_CTRL, 1 << 3, ~(1 << 3));
+		mdelay(card, 1);
+		wr(card, UVD_SOFT_RESET, LMI_SOFT_RESET | VCPU_SOFT_RESET | LBSI_SOFT_RESET | RBC_SOFT_RESET |
+		   CSM_SOFT_RESET | CXW_SOFT_RESET | TAP_SOFT_RESET | LMI_UMC_SOFT_RESET);
+		mdelay(card, 5);
+		wr(card, UVD_SOFT_RESET, 0);
+		wr_p(card, UVD_LMI_CTRL2, 0, ~(1 << 8));
+		wr_p(card, UVD_RB_ARB_CTRL, 0, ~(1 << 3));
+	} else if (what == 2) {
+		wr_p(card, SRBM_SOFT_RESET_UVD_REG, SOFT_RESET_UVD, ~SOFT_RESET_UVD);
+		mdelay(card, 1);
+		wr_p(card, SRBM_SOFT_RESET_UVD_REG, 0, ~SOFT_RESET_UVD);
+	}
+	uvd->ready = false;
+}
+
 int rdn_uvd_wake(struct rdn_uvd *uvd)
 {
 	if ((uvd->flags & RDN_UVD_F_NO_PLL) ||

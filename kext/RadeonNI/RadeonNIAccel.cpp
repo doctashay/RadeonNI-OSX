@@ -16,6 +16,7 @@
 #include "RadeonNIAccel.h"
 #include "RadeonNISurface.h"
 #include "rdn_uvd_reg.h"
+#include "rdn_mc.h"
 
 /* sync: orders every earlier store, also to write-combined memory, before the next one (eieio orders only guarded I/O) */
 static inline void rdnStoreBarrier(void)
@@ -1244,6 +1245,38 @@ void RadeonNIAccel::ibRecord(UInt32 kind, void *client, UInt32 offset, UInt32 wo
 	fIbTotal++;
 }
 
+/* Diagnostics on the memory controller's busy flags (RDN_UC_DEBUG); each returns SRBM_STATUS 20 ms later. */
+IOReturn RadeonNIAccel::debugOp(UInt32 op, UInt32 *srbmStatus)
+{
+	IOReturn ret = kIOReturnSuccess;
+
+	IOLockLock(fLock);
+	switch (op) {
+	case 1:
+		rdn_display_hold(fAccel.card, true);
+		break;
+	case 2:
+		rdn_display_hold(fAccel.card, false);
+		break;
+	case 3:
+		rdn_hdp_flush(&fAccel);
+		break;
+	case 4:
+	case 5:
+		if (fUvdUp && fUvdClocksUp)
+			rdn_uvd_debug_reset(&fUvd, op - 3);
+		else
+			ret = kIOReturnNotReady;
+		break;
+	default:
+		ret = kIOReturnBadArgument;
+	}
+	IOLockUnlock(fLock);
+	IOSleep(20);
+	*srbmStatus = rdn_rreg(fAccel.card, 0xe50);
+	return ret;
+}
+
 IOReturn RadeonNIAccel::ibLogControl(UInt32 op, UInt32 *ms)
 {
 	*ms = kernelMs();
@@ -2106,6 +2139,8 @@ IOExternalMethod *RadeonNIUserClient::getTargetAndMethodForIndex(
 		  kIOUCScalarIScalarO, 0, 1 },
 		{ 0, (IOMethod)&RadeonNIUserClient::methodIbLog,
 		  kIOUCScalarIScalarO, 1, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodDebug,
+		  kIOUCScalarIScalarO, 1, 1 },
 	};
 
 	if (index >= RDN_UC_METHOD_COUNT)
@@ -2280,6 +2315,11 @@ IOReturn RadeonNIUserClient::methodUvdReset(UInt32 *epoch)
 		fUvdHandleEpoch = *epoch;
 	}
 	return ret;
+}
+
+IOReturn RadeonNIUserClient::methodDebug(UInt32 op, UInt32 *status)
+{
+	return fAccel->debugOp(op, status);
 }
 
 IOReturn RadeonNIUserClient::methodIbLog(UInt32 op, UInt32 *ms)
