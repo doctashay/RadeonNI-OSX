@@ -55,6 +55,7 @@
 #define RDN_UVD_F_WINDOWS	(1 << 17)	/* with MINIMAL: also the heap and the stack/session windows of the VCPU's memory (uvd_v2_2_resume() writes all three); without them the firmware's heap and stack are at video memory address 0 */
 #define RDN_UVD_F_SEGMENT	(1 << 18)	/* (kext) the block in a 256 MB segment beyond the aperture (docs/UVD.md); alone it means the default start with it */
 #define RDN_UVD_F_SEGMENT_AT	20		/* (kext) with SEGMENT: bits 20 to 22 name the segment to use, 1 to 6 (hidden) or 7 (the aperture's own, through the register window: to test the plumbing); 0 picks */
+#define RDN_UVD_F_PUSH_APERTURE	(1u << 28)	/* (kext, tests) with SEGMENT: the regions that lie in the aperture are written through it */
 #define RDN_UVD_F_APERTURE	(1 << 19)	/* (kext) a started block that idles is started again in the aperture (tests: to compare the two) */
 #define RDN_UVD_F_GART		(1 << 9)	/* (kext) the VCPU region and ring in GART memory: addresses with bits 32-39 zero */
 
@@ -161,6 +162,9 @@ int rdn_uvd_init_window(struct rdn_uvd *uvd, struct rdn_accel *accel,
  */
 int rdn_vram_put(struct rdn_card *card, uint32_t offset, const void *src, uint32_t bytes);
 int rdn_vram_get(struct rdn_card *card, uint32_t offset, void *dst, uint32_t bytes);
+
+/* Test: write the windowed regions through the aperture's mapping where they lie in it (rdn_uvd.c). */
+void rdn_uvd_set_push_via_aperture(bool on);
 
 /* Which nibbles of UVD_LMI_ADDR_EXT get the segment (rdn_uvd.c): bit i of `mask` for bits 4i..4i+3; the default is all four. For tests. */
 void rdn_uvd_set_ext_nibbles(unsigned mask);

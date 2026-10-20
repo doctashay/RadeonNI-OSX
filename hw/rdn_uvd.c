@@ -366,6 +366,34 @@ int rdn_vram_get(struct rdn_card *card, uint32_t offset, void *dst, uint32_t byt
 	return 0;
 }
 
+/*
+ * Experiment (docs/UVD.md): write the regions through the aperture's CPU mapping instead of the register window where they lie in it
+ * (segment 7 of the kext, a test). The first start after a boot works with the window, a restart does not, and a restart in the aperture does.
+ */
+static bool push_via_aperture;
+
+void rdn_uvd_set_push_via_aperture(bool on)
+{
+	push_via_aperture = on;
+}
+
+static int uvd_put(struct rdn_uvd *uvd, uint32_t offset, const void *src, uint32_t bytes)
+{
+	struct rdn_accel *accel = uvd->accel;
+
+	if (push_via_aperture && accel->aperture && (uint64_t)offset + bytes <= accel->aperture_size) {
+		volatile uint8_t *to = (volatile uint8_t *)accel->aperture + offset;
+		const uint8_t *from = (const uint8_t *)src;
+		uint32_t i;
+
+		for (i = 0; i < bytes; i++)
+			to[i] = from[i];
+		rdn_hdp_flush(accel);
+		return 0;
+	}
+	return rdn_vram_put(accel->card, offset, src, bytes);
+}
+
 /* ---- the ring ---------------------------------------------------------- */
 
 static void ring_put(struct rdn_uvd *uvd, uint32_t value)
@@ -404,13 +432,14 @@ static void ring_push(struct rdn_uvd *uvd)
 
 	if (!uvd->windowed || from == to)
 		return;
+	(void)card;
 	if (to > from) {
-		rdn_vram_put(card, uvd->ring_offset + from * 4, (const uint8_t *)uvd->ring_cpu + from * 4, (to - from) * 4);
+		uvd_put(uvd, uvd->ring_offset + from * 4, (const uint8_t *)uvd->ring_cpu + from * 4, (to - from) * 4);
 	} else {
-		rdn_vram_put(card, uvd->ring_offset + from * 4, (const uint8_t *)uvd->ring_cpu + from * 4,
-			     (uvd->ring_words - from) * 4);
+		uvd_put(uvd, uvd->ring_offset + from * 4, (const uint8_t *)uvd->ring_cpu + from * 4,
+			(uvd->ring_words - from) * 4);
 		if (to)
-			rdn_vram_put(card, uvd->ring_offset, (const uint8_t *)uvd->ring_cpu, to * 4);
+			uvd_put(uvd, uvd->ring_offset, (const uint8_t *)uvd->ring_cpu, to * 4);
 	}
 	uvd->ring_mark = to;
 }
@@ -961,9 +990,9 @@ static int init_common(struct rdn_uvd *uvd, struct rdn_accel *accel,
 			ring_cpu[i] = 0;
 	}
 	if (window && !(reset_level & RDN_UVD_RESET_NO_REWRITE)) {
-		r = rdn_vram_put(card, vcpu_off, (const void *)vcpu_cpu, vcpu_bytes);
+		r = uvd_put(uvd, vcpu_off, (const void *)vcpu_cpu, vcpu_bytes);
 		if (!r)
-			r = rdn_vram_put(card, ring_off, (const void *)ring_cpu, ring_bytes + RDN_UVD_RING_EXTRA);
+			r = uvd_put(uvd, ring_off, (const void *)ring_cpu, ring_bytes + RDN_UVD_RING_EXTRA);
 		if (r)
 			return r;
 	}
@@ -1202,8 +1231,7 @@ void rdn_uvd_set_fence_base(struct rdn_uvd *uvd, uint32_t base)
 	uvd->fence_emitted = base;
 	put_le32(uvd->ring_cpu + uvd->ring_words * 4, base);
 	if (uvd->windowed)
-		rdn_vram_put(uvd->accel->card, uvd->ring_offset + uvd->ring_words * 4,
-			     (const uint8_t *)uvd->ring_cpu + uvd->ring_words * 4, 4);
+		uvd_put(uvd, uvd->ring_offset + uvd->ring_words * 4, (const uint8_t *)uvd->ring_cpu + uvd->ring_words * 4, 4);
 	rdn_hdp_flush(uvd->accel);
 }
 
