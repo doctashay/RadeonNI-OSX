@@ -1,0 +1,30 @@
+--- a/src/gallium/drivers/r600/radeon_uvd.c
++++ b/src/gallium/drivers/r600/radeon_uvd.c
+@@ -319,7 +319,26 @@
+ 			}
+ 		} else {
+ 			// the firmware seems to always assume a minimum of ref frames
+-			max_references = MAX2(NUM_H264_REFS, max_references);
++			// osx-gpu: but not 17 pictures of 1080p (125 MB) for a stream that needs a quarter of that: what the level allows (and
++			// the picture being decoded), as radeonsi sizes it for this firmware, or the stream's own reference frames, whichever is
++			// more. RDN_UVD_FULL_DPB=1 gives the 17 back.
++			if (getenv("RDN_UVD_FULL_DPB")) {
++				max_references = MAX2(NUM_H264_REFS, max_references);
++			} else {
++				unsigned fs_mbs = width_in_mb * height_in_mb, level_dpb;
++
++				switch (dec->base.level) {
++				case 30: level_dpb = 8100 / fs_mbs; break;
++				case 31: level_dpb = 18000 / fs_mbs; break;
++				case 32: level_dpb = 20480 / fs_mbs; break;
++				case 40:
++				case 41: level_dpb = 32768 / fs_mbs; break;
++				case 42: level_dpb = 34816 / fs_mbs; break;
++				case 50: level_dpb = 110400 / fs_mbs; break;
++				default: level_dpb = 184320 / fs_mbs; break;
++				}
++				max_references = MAX2(MIN2(NUM_H264_REFS, level_dpb + 1), max_references);
++			}
+ 			// reference picture buffer
+ 			dpb_size = image_size * max_references;
+ 			if ((dec->stream_type != RUVD_CODEC_H264_PERF)) {
