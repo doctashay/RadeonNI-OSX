@@ -925,18 +925,21 @@ IODeviceMemory *RadeonNI::getVRAMRange(void)
 	IODeviceMemory *bar;
 
 	/*
-	 * With the accelerator, all of the aperture is video memory the
-	 * system can count on; the window server wants to see at least
-	 * 16 MB before it considers Quartz Extreme. Without it, only the
-	 * screen's surfaces are ours.
+	 * With the accelerator, more than the screen's surfaces: the window
+	 * server wants to see at least 16 MB before it considers Quartz
+	 * Extreme. Not the whole aperture, though: from CURSOR_OFFSET on the
+	 * memory is the kext's (the cursor's picture, then the accelerator's
+	 * heap with the programs' buffers and the video decoder's firmware
+	 * window, ring and pages), and what the system is told is video memory
+	 * it may use for itself. Without the accelerator, only the screen's
+	 * surfaces are ours.
 	 */
 	if (getProperty("Accelerator") != kOSBooleanTrue)
 		return getApertureRange(kIOFBSystemAperture);
 	bar = fDevice->getDeviceMemoryWithRegister(FB_BAR);
 	if (!bar)
 		return 0;
-	bar->retain();
-	return bar;
+	return IODeviceMemory::withSubRange(bar, 0, CURSOR_OFFSET);
 }
 
 const char *RadeonNI::getPixelFormats(void)
