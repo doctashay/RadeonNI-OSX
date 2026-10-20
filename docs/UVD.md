@@ -191,7 +191,12 @@ run it while a clip plays). What this means in practice (found 2026-10-20 with t
   as the decoder does, so that does not matter.
 - To see which decoder a clip really used: `grep RadeonNIAVC /var/log/system.log` ("declined" means QuickTime's own decoder), or `~/gpucheck.sh`.
 
-### The decoder and the hidden 256 MB segments (2026-10-20): split mode works, all-in-a-segment works until a restart
+### The decoder and the hidden 256 MB segments (2026-10-20): split mode works (the default), all-in-a-segment works until a restart
+
+How Linux does it (`radeon_uvd.c`, `radeon_object.c`, `uvd_v*.c`): the opposite. It writes only two nibbles of `UVD_LMI_ADDR_EXT` (the segment of the firmware, always the first 256 MB), and whenever a UVD command stream is
+validated TTM *moves* every buffer the stream names into the first 256 MB (`radeon_uvd_force_into_uvd_segment`, `lpfn` = 256 MB; buffers allowed outside VRAM also get a second placement in the next 256 MB); a message or
+feedback buffer must be in the firmware's segment and no buffer may cross a 256 MB boundary (`radeon_uvd_cs_reloc`, with a "TODO: is this still necessary on NI+"). That works because TTM can evict and move buffers
+on demand. This kext has no eviction, which is why the decoder's bulk went out to a hidden segment instead.
 
 Why: the decoder lived in the first 256 MB (the aperture's), where the window server and Quartz Extreme already hold about 124 MB of the 222 MB heap, while the 768 MB beyond the aperture are empty
 (`vramfree -h`). Nothing was known about the other segments; this section is what was found on the G5 (journal, 2026-10-20 night).
@@ -215,11 +220,11 @@ and only a CPU write through the HDP drops it; a dummy aperture write and flush 
    buffers: the CPU writes them, restarts are fine), nibbles 1 and 2 name a hidden segment, and the winsys puts the shareable video-memory buffers there (the reference buffer, the pictures, the context). The CPU never maps these. Bit-exact
    against ffmpeg for the whole vector suite, 720p and a 1080p B-pyramid stream (24.3 ms a picture, the same as in the aperture), restarts between runs included. A 1080p decoder takes 16 MB of the aperture (the bitstream buffers, the
    firmware window, messages) and 44 MB of the segment, instead of 61 MB of the aperture: two 1080p decoders at once both decode bit-exactly, and QuickTime Player takes cs2 (1080x1920 at 60 fps) and the motion clip in one
-   process and after Fit to Screen without a "declined" line, with 190 MB of the aperture heap still free (screen grab of the motion clip correct). To use it for QuickTime: `echo 2 > "/Library/Application Support/RadeonNI/uvd-segment"`
-   (as root; remove the file to go back), the component built with the new `librdnvd.dylib` (`scripts/qt-component.sh build`, `install`) and the kext of 2026-10-20. Not tried: the bitstream buffers in the segment (they would
+   process and after Fit to Screen without a "declined" line, with 190 MB of the aperture heap still free (screen grab of the motion clip correct). It needs the component built with the new `librdnvd.dylib` (`scripts/qt-component.sh build`, `install`) and the kext of 2026-10-20; it is on by default (see below), `0` in the file `/Library/Application Support/RadeonNI/uvd-segment` switches it off. Not tried: the bitstream buffers in the segment (they would
    need the same nibbles 1 and 2 if the decoder reads them through those clients, and an upload by DMA per picture), choosing another segment while the block runs (it is chosen when the block starts and moved only with
    `RDN_UVD_F_SPLIT` and a segment number in `RDN_UC_UVD_INIT`'s flags while nothing runs), the speed work.
-Both are off unless asked for (the user decides what changes by default). The kext picks the hidden segment with the most room (at least 96 MB free in one piece, the highest on a tie; hidden allocations from other programs stay out of
+Split mode is the default since 2026-10-20 (the user's decision); `RDN_UVD_SEGMENT=0` in a program's environment or `0` in the file `/Library/Application Support/RadeonNI/uvd-segment` leaves the decoder in the aperture,
+`1` is the all-in-a-segment mode (no restarts, for experiments). The kext picks the hidden segment with the most room (at least 96 MB free in one piece, the highest on a tie; hidden allocations from other programs stay out of
 it while the rest has room) when the block starts; the mode of a block that is up is the kext's, whatever a later program asks. Switches for tests are in `hw/rdn_uvd.h` (`RDN_UVD_F_*` in `RDN_UC_UVD_INIT`'s flags: force a
 segment, choose nibbles, DMA or window, flush experiments) and in `tools/guest/rdnuvd.c`'s `init`.
 

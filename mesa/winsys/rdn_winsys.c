@@ -457,9 +457,11 @@ static void rdn_mem_stats_exit(void)
 }
 
 /*
- * The decoder and a segment of the video memory beyond the aperture (docs/UVD.md). While it is being tried it is on only when
- * asked for: RDN_UVD_SEGMENT in the program's environment, or the file below, 1 for all of the decoder in the segment, 2 for "split". Whoever starts the decoder first
- * decides; after that the decoder's place is the kext's, whatever a later program asks.
+ * The decoder and the video memory beyond the aperture (docs/UVD.md). Split mode is the default: the firmware, ring and messages stay in the
+ * aperture, the decoder's reference and output buffers go to a hidden 256 MB segment. RDN_UVD_SEGMENT in the program's environment, or the first character of the
+ * file below, overrides it: 0 for the aperture only, 1 for all of the decoder in a segment (it does not survive a restart of the block), 2 for split mode.
+ * Whoever starts the decoder first decides; after that the decoder's place is the kext's, whatever a later program asks. A kext without the
+ * segment methods, or without room in any segment, leaves the decoder in the aperture.
  */
 #define RDN_UVD_SEGMENT_FILE "/Library/Application Support/RadeonNI/uvd-segment"
 
@@ -470,6 +472,7 @@ static int rdn_segment_wanted(void)
    if (mode < 0) {
       const char *e = getenv("RDN_UVD_SEGMENT");
 
+      mode = 2;
       if (e) {
          mode = atoi(e);
       } else {
@@ -478,10 +481,11 @@ static int rdn_segment_wanted(void)
 
          if (f)
             fclose(f);
-         mode = c == '1' ? 1 : c == '2' ? 2 : 0;
+         if (c == '0' || c == '1' || c == '2')
+            mode = c - '0';
       }
       if (mode < 0 || mode > 2)
-         mode = 0;
+         mode = 2;
    }
    return mode;
 }
