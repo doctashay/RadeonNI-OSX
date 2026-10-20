@@ -34,6 +34,9 @@ struct pipe_screen_config;
  */
 int rdn_winsys_uvd_answered(struct radeon_winsys *ws);
 
+/* Give the kext the memory the cache keeps (a closed decoder's buffers, for one). */
+void rdn_winsys_trim(struct radeon_winsys *ws);
+
 typedef struct pipe_screen *(*rdn_screen_create_t)(struct radeon_winsys *,
                                                    const struct pipe_screen_config *);
 
