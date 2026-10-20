@@ -7786,3 +7786,13 @@ size and sample count (incomplete FBO) with the old bundle too, so not a regress
 **Changed default, not decided by the user:** on Leopard (kernel 9.8.x) programs now see GL 2.1 / GLSL 1.20 and no
 `GL_ARB_framebuffer_object` unless they create a modern context (`leopard_gl_compat()` in `gld/gen_dispatch.py`); the old
 bundle said 4.6 compatibility. Tiger still says 4.6. Open question for the user.
+
+## 2026-10-20: games on Tiger with the merged `leopard-fixes` build
+
+Tiger 10.4.11 on the G5, new kext and bundle installed, old bundle (from `tiger-installed-BEFORE-lf.tar`) swapped in for the
+A/B and the new one put back afterwards. Quake 3 timedemo `four`, 1920x1080: new 145.1, 144.4, 145.3, 143.9 fps; old 144.4,
+144.7 (the script header's earlier figure is 148). Quake 4 `playNetTimeDemo`: 45.49 fps (2,811 frames), journal baseline on
+`main` 45.64 (44.10 to 46.15 over runs). Quake 3 in q3dm1 and TuxRacer's title screen look right in a grab by readback, and a
+grab during the fullscreen game does not disturb it. No hang, stall or panic in the log. Doom 3 was not run (no saves).
+One unexplained `Abort trap` of Quake 3 on its first launch after the reboot (benchmark script in the background, a grab 20 s
+in); not reproduced in about eight more launches, including the same sequence again.
