@@ -38,7 +38,8 @@ machine: Power Mac G5 Late 2005. Development runs Tiger under
   and full-screen/windowed GL games run on the G5.
 - Phase 3 (video decode, `docs/UVD.md`): UVD runs on the G5, the `rdnvd` library decodes H.264 bit-exactly and
   a QuickTime component (`quicktime/`, installed on the G5) uses it in QuickTime Player; 1080p60 is too slow
-  (serial pipeline, `docs/UVD.md`); PowerVLC is not built.
+  (serial pipeline, `docs/UVD.md`); PowerVLC is not built. "Split mode" (opt-in, the file `uvd-segment`) puts
+  the decoder's reference and output buffers in hidden video memory; the whole decoder there does not survive a restart.
 - The real G5 holds the card and runs the installed kext. The user plays
   games on it: never `killall` a program there, and a window server restart
   needs the user's yes.

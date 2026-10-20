@@ -175,7 +175,9 @@ and `mbaff` fail either way), streams with 1, 2, 3 (P only) and 1, 2, 4, 8, 16 (
 Speed: 1080p decodes in about 25 ms and reads out in 12 ms, one picture at a time (decode, wait for the fence, read back, convert on the CPU): about 33 pictures a second, so a 60 fps 1080p clip plays at about half speed. The firmware
 could do far more; pipelining the decode of the next picture with the read-out of the last, and converting on the card, is the way, not done.
 
-### Video memory: one decoder at a time, and who else holds it
+### Video memory: one decoder at a time (aperture mode), and who else holds it
+
+(With split mode, above, the hidden segments take most of a decoder's memory and several 1080p decoders fit; this section is about the aperture mode, the default.)
 
 The kext's heap is 222 MB (`docs/MEMORY-EVICTION.md`). With nothing playing, the window server and Quartz Extreme already hold about 124 MB of it: one free block of about 98 MB. A 1080p decoder
 takes about 66 MB (reference buffer 23 MB, eight pictures, four bitstream buffers), so two do not fit. `tools/guest/vramfree.c` shows the free blocks (it only allocates and gives back at once; do not
@@ -211,7 +213,12 @@ and only a CPU write through the HDP drops it; a dummy aperture write and flush 
    winsys keeps copies in system memory. A fresh block decodes bit-exactly (128x96 vectors); after the first restart it does not boot. It would need a restart-proof firmware window (a fresh address each time, or the aperture).
 2. *Split mode* (`RDN_UVD_F_SPLIT`, `RDN_UVD_SEGMENT=2`, the file `/Library/Application Support/RadeonNI/uvd-segment` with `2`): the block starts as ever in the aperture (firmware window, ring, messages, feedback, the bitstream
    buffers: the CPU writes them, restarts are fine), nibbles 1 and 2 name a hidden segment, and the winsys puts the shareable video-memory buffers there (the reference buffer, the pictures, the context). The CPU never maps these. Bit-exact
-   against ffmpeg for the whole vector suite and 720p, restarts between runs included; at 720p 17 MB of the 24 are in the segment. Untested: the bitstream in the segment (whether it needs nibbles 1 and 2), 1080p, QuickTime.
+   against ffmpeg for the whole vector suite, 720p and a 1080p B-pyramid stream (24.3 ms a picture, the same as in the aperture), restarts between runs included. A 1080p decoder takes 16 MB of the aperture (the bitstream buffers, the
+   firmware window, messages) and 44 MB of the segment, instead of 61 MB of the aperture: two 1080p decoders at once both decode bit-exactly, and QuickTime Player takes cs2 (1080x1920 at 60 fps) and the motion clip in one
+   process and after Fit to Screen without a "declined" line, with 190 MB of the aperture heap still free (screen grab of the motion clip correct). To use it for QuickTime: `echo 2 > "/Library/Application Support/RadeonNI/uvd-segment"`
+   (as root; remove the file to go back), the component built with the new `librdnvd.dylib` (`scripts/qt-component.sh build`, `install`) and the kext of 2026-10-20. Not tried: the bitstream buffers in the segment (they would
+   need the same nibbles 1 and 2 if the decoder reads them through those clients, and an upload by DMA per picture), choosing another segment while the block runs (it is chosen when the block starts and moved only with
+   `RDN_UVD_F_SPLIT` and a segment number in `RDN_UC_UVD_INIT`'s flags while nothing runs), the speed work.
 Both are off unless asked for (the user decides what changes by default). The kext picks the hidden segment with the most room (at least 96 MB free in one piece, the highest on a tie; hidden allocations from other programs stay out of
 it while the rest has room) when the block starts; the mode of a block that is up is the kext's, whatever a later program asks. Switches for tests are in `hw/rdn_uvd.h` (`RDN_UVD_F_*` in `RDN_UC_UVD_INIT`'s flags: force a
 segment, choose nibbles, DMA or window, flush experiments) and in `tools/guest/rdnuvd.c`'s `init`.
