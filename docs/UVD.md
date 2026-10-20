@@ -161,6 +161,9 @@ The user's first look at the installed component (1080p clip): corrupt pictures,
 
 ### The decoder wedges when the frontmost application changes (open issue, 2026-10-19)
 
+**Newest lead (2026-10-19 night, not yet run on the card):** the minimal start never programmed the VCPU's cache windows 1 and 2 (heap, stack and sessions; Linux's `uvd_v2_2_resume()` does), so the firmware's
+heap and stack were at video memory address 0, the top rows of the framebuffer, which the window server redraws at a change of the menu-bar owner. `RDN_UVD_F_WINDOWS` (default on) writes them. See the journal.
+
 Not a QuickTime problem: on the G5 any change of the frontmost application (launching Calculator, TextEdit, QuickTime Player or `tools/guest/winprobe.m` the normal way, an AppleScript
 `activate`, a switch back to Finder) stops the decoder: commands and fences run, decodes get no feedback block and no picture, for every program, and neither the kext's
 restarts (VCPU, all sub-blocks) nor a library recovery bring it back; only a restart of the G5 does. A stall right at a launch has been repaired by the library's
@@ -174,7 +177,7 @@ on `RDN_UC_UVD_RESET` (epoch counter, fence numbers go on); `rdn_winsys_uvd_answ
 250 ms for it (`RDNVD_LATE_MS`: the first decodes after a restart are answered about 8 ms after their fence), and on a stall resets, makes a new decoder and replays the access
 units since the last IDR (three tries, then the decoder is given up for 2 s, 4 s, up to 30 s and data fails at once; `RDNVD_FAKE_STALL=n` tries it: 60 of 60 right).
 Do not start the block with PM_GLOBAL/PM_SCLK (`rdnuvd init 0x10d80`): the 3D engine's fences stopped completing. A level that also resets the whole block (SOFT_RESET_UVD)
-leaves the VCPU dead. A decoder that fails every picture instantly makes QuickTime ask for the next one at once (100 % of a core): the component should not be installed
+leaves the VCPU dead (Linux has no such reset at run time on this family). A decoder that fails every picture instantly makes QuickTime ask for the next one at once (100 % of a core): the component should not be installed
 until the wedge is understood.
 
 ## Why

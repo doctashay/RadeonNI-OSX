@@ -7434,3 +7434,25 @@ Narrowed with the paced session, the probes, the memory diff (`tools/guest/vramd
 - A smaller restart (bits 62: only the VCPU reset and boot, nothing rewritten or reprogrammed) hung the G5 (fans at full speed, no network); the user rebooted it. Not to be repeated.
 - Left unexplained: what in a restart the activation breaks. Still possible: the clock idling in `fini` (UPLL programming, bit 8), the firmware and region rewrite (16), the register programming (32), the VCPU reset
   and boot themselves. Tools for it exist; each run costs a restart of the G5 and the last one hung it.
+
+## 2026-10-19 (night, end): the heap and stack of the video firmware were at video memory address 0, the top of the framebuffer; fix built, not run
+
+The G5 hung a second time minutes after the first reboot (nothing of mine was running; the last things on it were read-only) and was rebooted by hand again; it was not on the network
+afterwards, so it could not be halted over ssh (a loop gave up after 6 minutes). A read-only comparison with Linux (a delegated agent, `hw/rdn_uvd.c` against `uvd_v2_2.c`,
+`uvd_v1_0.c`, `radeon_uvd.c`, `evergreen.c`) found, and I checked, the following:
+- `uvd_v2_2_resume()` writes three cache windows of the VCPU: the firmware, then the heap (`UVD_VCPU_CACHE_OFFSET1/SIZE1`), then the stack with the sessions (`OFFSET2/SIZE2`); Linux's own register dump
+  (`build/uvd-ref/linux-uvd-regs.txt`, server) has 0xe600 / 0x8000 / 0x16600 / 0x15e00 there. Our minimal start (`program_memory`, the `RDN_UVD_F_MINIMAL` branch) wrote only window 0
+  and the chip id, and returned: windows 1 and 2 were never programmed (all our healthy and wedged register snapshots read OFFSET1 = OFFSET2 = 0). The bisection of 2026-10-18 only
+  showed they are not needed to boot.
+- If the firmware's heap and stack are addressed through them, they are at memory address 0 plus the offsets: the first megabyte of video memory, which is the top rows of the screen
+  (7680 bytes a row: about the first 170 rows, the menu bar included). The window server draws there in software; a change of the menu-bar owner repaints it. That would overwrite the
+  firmware's live data (open sessions stop being served), and the firmware's own stores would draw into the screen's top rows. It matches: only a change of the foreground application triggers it (not
+  windows, LSUIElement apps, background launches), nothing reaches the kext, a fresh session works again (its state is rebuilt), and `tools/guest/vramdiff.c` could not see it because it compared only from 16 MB up.
+  What it does not explain by itself is why nothing recovers short of a reboot.
+- Built: `RDN_UVD_F_WINDOWS` (on by default in the kext's start flags; `rdnuvd init 0x10c00` right after boot gives the old start for comparison) writes the two windows as Linux does.
+  `vramdiff -c 'command' from_kb to_kb` diffs a range around one command.
+- Corrections: Linux has no UVD reset at run time on this family (`evergreen_gpu_soft_reset` has no UVD; `SOFT_RESET_UVD` is only deasserted at start), so "level 2" had no precedent; Linux starts
+  UVD only from `evergreen_startup` after `evergreen_mc_program`, with the display off (`evergreen_mc_stop`), and never restarts it live under scan-out.
+- To do when the G5 is on again, in this order: (1) health check, read only; (2) the A/B before the fix: after a boot, `rdnuvd init 0x10c00`, then `vramdiff -c '<one decode session>' 0 1400`, and look at the
+  top rows of a screen grab: pages changing in the first 1.3 MB mean the firmware writes into the screen; (3) install the new kext, reboot, the same diff (expect no changes), then the paced session with
+  `activate`, and the restart loop around the activation. Further ideas from the same comparison if this is not it: hold the display and wait for the memory controller to be idle around a restart, word-sized stores for the firmware rewrite (the byte loops are about a million single-byte stores), release the sub-blocks with the clock gate cleared first.
