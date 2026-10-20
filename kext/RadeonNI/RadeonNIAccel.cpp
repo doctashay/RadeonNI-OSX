@@ -698,7 +698,8 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	/* tests: bits 24 to 27 say which nibbles of UVD_LMI_ADDR_EXT get the segment (0: all) */
 	rdn_uvd_set_ext_nibbles(nibbles ? nibbles : 0xf);
 	rdn_uvd_set_push_via_aperture((flags & RDN_UVD_F_PUSH_APERTURE) != 0);
-	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24) | RDN_UVD_F_PUSH_APERTURE);
+	bool noDma = (flags & RDN_UVD_F_NO_DMA) != 0;
+	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24) | RDN_UVD_F_PUSH_APERTURE | RDN_UVD_F_NO_DMA);
 	if (!flags)
 		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI | RDN_UVD_F_PLL | RDN_UVD_F_WINDOWS;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;
@@ -847,6 +848,13 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	}
 
 	if (wantSegment && ref && fHiddenSize) {
+		if (noDma || !dmaStageUp()) {
+			rdn_uvd_set_put_hook(0, 0);
+			if (!noDma)
+				IOLog("RadeonNI: UVD: no DMA staging; the register window writes big regions\n");
+		} else {
+			rdn_uvd_set_put_hook(dmaPutHook, this);
+		}
 		IOLockLock(fLock);
 		ret = uvdStartSegment(flags, force, fw, fwSize, ref, status);
 		IOLockUnlock(fLock);
@@ -955,6 +963,115 @@ void RadeonNIAccel::uvdRestart(UInt32 level)
 		return;
 	}
 	IOLog("RadeonNI: UVD restarted (epoch %lu, reset level %lu)\n", (unsigned long)fUvdEpoch, (unsigned long)level);
+}
+
+/*
+ * The staging buffer: 1 MB of the kext's own memory in the GART, made when first wanted. Without the lock; takes it for the page table.
+ */
+bool RadeonNIAccel::dmaStageUp(void)
+{
+	const UInt32 total = 1u << 20;
+	IOBufferMemoryDescriptor *mem;
+	uint64_t at = 0;
+	UInt32 done;
+
+	if (fDmaMem)
+		return true;
+	if (!fGart.ready || !fEngineUp)
+		return false;
+	mem = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut, total, 4096);
+	if (!mem || mem->prepare() != kIOReturnSuccess) {
+		if (mem)
+			mem->release();
+		return false;
+	}
+	bzero(mem->getBytesNoCopy(), total);
+	IOLockLock(fLock);
+	if (fDmaMem || rdn_mem_alloc(&fGartSpace, total, 4096, &at)) {
+		bool have = fDmaMem != 0;
+
+		IOLockUnlock(fLock);
+		mem->complete();
+		mem->release();
+		return have;
+	}
+	for (done = 0; done < total; done += 4096) {
+		IOByteCount length = 0;
+		IOPhysicalAddress bus = mem->getPhysicalSegment(done, &length);
+
+		if (!bus)
+			break;
+		rdn_gart_set_page(&fGart, (UInt32)((at + done) / 4096), bus);
+	}
+	if (done < total) {
+		while (done) {
+			done -= 4096;
+			rdn_gart_clear_page(&fGart, (UInt32)((at + done) / 4096));
+		}
+		rdn_gart_flush(&fGart);
+		rdn_mem_free(&fGartSpace, at);
+		IOLockUnlock(fLock);
+		mem->complete();
+		mem->release();
+		return false;
+	}
+	rdn_gart_flush(&fGart);
+	fDmaMem = mem;
+	fDmaCpu = (UInt8 *)mem->getBytesNoCopy();
+	fDmaGpu = rdn_gart_addr((UInt32)(at / 4096));
+	fDmaAt = (UInt32)at;
+	fDmaBytes = total;
+	IOLockUnlock(fLock);
+	IOLog("RadeonNI: DMA staging of %lu KB in the GART at GPU 0x%lx\n", (unsigned long)(total >> 10), (unsigned long)fDmaGpu);
+	return true;
+}
+
+/*
+ * Write bytes to video memory (beyond the aperture, say) with the command processor's DMA from the staging buffer; the few bytes before
+ * a dword boundary and after the last whole dword go through the register window. With fLock held.
+ */
+int RadeonNIAccel::dmaPut(UInt32 offset, const void *src, UInt32 bytes)
+{
+	const UInt8 *p = (const UInt8 *)src;
+	UInt32 head = (4 - (offset & 3)) & 3, tail;
+	int r = 0;
+
+	if (!fDmaMem)
+		return rdn_vram_put(fAccel.card, offset, src, bytes);
+	if (head > bytes)
+		head = bytes;
+	if (head) {
+		r = rdn_vram_put(fAccel.card, offset, p, head);
+		if (r)
+			return r;
+		offset += head;
+		p += head;
+		bytes -= head;
+	}
+	tail = bytes & 3;
+	bytes -= tail;
+	while (bytes) {
+		UInt32 n = bytes < fDmaBytes ? bytes : fDmaBytes, seq = 0;
+
+		bcopy(p, fDmaCpu, n);
+		rdnStoreBarrier();
+		r = rdn_cp_dma(&fAccel, fDmaGpu, rdn_vram_addr(&fAccel, offset), n, &seq);
+		if (!r)
+			r = rdn_fence_wait(&fAccel, seq, 2000);
+		if (r)
+			return r;
+		offset += n;
+		p += n;
+		bytes -= n;
+	}
+	if (tail)
+		r = rdn_vram_put(fAccel.card, offset, p, tail);
+	return r;
+}
+
+int RadeonNIAccel::dmaPutHook(void *cookie, uint32_t offset, const void *src, uint32_t bytes)
+{
+	return ((RadeonNIAccel *)cookie)->dmaPut(offset, src, bytes);
 }
 
 /*
@@ -1159,7 +1276,8 @@ IOReturn RadeonNIAccel::vramPut(task_t task, UInt32 offset, UInt32 address, UInt
 			break;
 		}
 		IOLockLock(fLock);
-		if (!fUvdUp || !uvdSegmentCheck(offset + done, n) || rdn_vram_put(fAccel.card, offset + done, piece, n))
+		if (!fUvdUp || !uvdSegmentCheck(offset + done, n) ||
+		    (n >= 4096 && fDmaMem ? dmaPut(offset + done, piece, n) : rdn_vram_put(fAccel.card, offset + done, piece, n)))
 			ret = kIOReturnIOError;
 		IOLockUnlock(fLock);
 		done += n;
