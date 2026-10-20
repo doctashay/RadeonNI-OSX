@@ -595,6 +595,17 @@ static void program_memory(struct rdn_uvd *uvd)
 	}
 }
 
+/* evergreen_gpu_init(): the decoder's tiling follows the 3D engine's */
+static void program_tiling(struct rdn_uvd *uvd)
+{
+	struct rdn_card *card = uvd->accel->card;
+	uint32_t cfg = rd(card, 0x98f8);	/* GB_ADDR_CONFIG */
+
+	wr(card, UVD_UDEC_ADDR_CONFIG, cfg);
+	wr(card, UVD_UDEC_DB_ADDR_CONFIG, cfg);
+	wr(card, UVD_UDEC_DBW_ADDR_CONFIG, cfg);
+}
+
 /*
  * The segment, again. After a restart the sub-blocks are held in reset when program_memory() writes the address extension
  * and come out of it later (vcpu_start): a value written to a block in reset may be lost. In the aperture that does not show (segment 0 is
@@ -646,6 +657,25 @@ static int vcpu_start(struct rdn_uvd *uvd)
 		if (reset_level & RDN_UVD_RESET_SUB) {
 			wr(card, UVD_SOFT_RESET, VCPU_SOFT_RESET);
 			mdelay(card, 5);
+			/*
+			 * Everything written while the sub-blocks were in reset (the memory window, the tiling, the memory interface and
+			 * the MPC muxes, all done before this point) may have been lost with the reset: once more, now that they are out of it.
+			 */
+			if (!(reset_level & RDN_UVD_RESET_NO_PROGRAM)) {
+				program_tiling(uvd);
+				program_memory(uvd);
+				if (uvd->flags & RDN_UVD_F_LMI) {
+					wr(card, UVD_LMI_CTRL, 0x40 | (1 << 8) | (1 << 13) | (1 << 21) | (1 << 9) | (1 << 20));
+					wr(card, UVD_LMI_SWAP_CNTL, uvd->swapped ? 0xa : 0);
+					wr(card, UVD_MP_SWAP_CNTL, 0);
+					wr(card, UVD_MPC_SET_MUXA0, 0x40c2040);
+					wr(card, UVD_MPC_SET_MUXA1, 0x0);
+					wr(card, UVD_MPC_SET_MUXB0, 0x40c2040);
+					wr(card, UVD_MPC_SET_MUXB1, 0x0);
+					wr(card, UVD_MPC_SET_ALU, 0);
+					wr(card, UVD_MPC_SET_MUX, 0x88);
+				}
+			}
 		}
 		program_ext(uvd);
 		/* clock gating off, VCPU clock on, VCPU out of reset */
@@ -971,14 +1001,8 @@ static int init_common(struct rdn_uvd *uvd, struct rdn_accel *accel,
 			(unsigned)bad, (unsigned)fw_size, (unsigned)first);
 	}
 
-	if (!(reset_level & RDN_UVD_RESET_NO_PROGRAM)) {
-		/* evergreen_gpu_init(): the decoder's tiling follows the 3D engine's */
-		uint32_t cfg = rd(card, 0x98f8);	/* GB_ADDR_CONFIG */
-
-		wr(card, UVD_UDEC_ADDR_CONFIG, cfg);
-		wr(card, UVD_UDEC_DB_ADDR_CONFIG, cfg);
-		wr(card, UVD_UDEC_DBW_ADDR_CONFIG, cfg);
-	}
+	if (!(reset_level & RDN_UVD_RESET_NO_PROGRAM))
+		program_tiling(uvd);
 	if (flags & (RDN_UVD_F_PM_GLOBAL | RDN_UVD_F_PM_SCLK)) {
 		/* what Linux's trace has set that ours has not (journal 2026-10-17) */
 		uvd->pm_general = rd(card, 0x63c);	/* GENERAL_PWRMGT */
