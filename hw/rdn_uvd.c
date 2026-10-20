@@ -470,11 +470,16 @@ static int vcpu_start(struct rdn_uvd *uvd)
 	int i, j, r = 0;
 
 	if (uvd->flags & RDN_UVD_F_MINIMAL) {
-		/* the RLC (evergreen_rlc_start() writes RLC_ENABLE) after the memory window, and time to come up */
-		if (rlc_ucode)
-			rlc_load(card);
-		wr(card, 0x3f00, 1);
-		mdelay(card, 300);
+		/*
+		 * The RLC (evergreen_rlc_start() writes RLC_ENABLE) after the memory window, and time to come up. Not when the block is started
+		 * again (level 2): it is running from the first start, and stopping and loading it while the window server is busy breaks the decoder.
+		 */
+		if (reset_level < 2) {
+			if (rlc_ucode)
+				rlc_load(card);
+			wr(card, 0x3f00, 1);
+			mdelay(card, 300);
+		}
 		if (uvd->flags & RDN_UVD_F_LMI) {
 			/* uvd_v1_0_start(): initialize the UVD memory controller and the MPC muxes */
 			wr(card, UVD_LMI_CTRL, 0x40 | (1 << 8) | (1 << 13) | (1 << 21) | (1 << 9) | (1 << 20));

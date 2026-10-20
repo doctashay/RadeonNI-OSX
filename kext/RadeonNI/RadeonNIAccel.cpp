@@ -1002,7 +1002,7 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 			creates = true;
 	/* a new generation of decoders: nobody else's session is alive, so the firmware starts clean (and not in the middle of a command) */
 	if (creates && !fUvdLive && fUvdDirty && rdn_uvd_fence_done(&fUvd, fUvdLastSeq))
-		uvdRestart(1);
+		uvdRestart(2);
 	if (!fUvdUp) {
 		IOLockUnlock(fLock);
 		return kIOReturnNotReady;
@@ -1347,7 +1347,7 @@ IOReturn RadeonNIAccel::uvdReset(UInt32 *epoch)
 		IOLockLock(fLock);
 	}
 	fUvdDirty = true;
-	uvdRestart(1);
+	uvdRestart(2);
 	*epoch = fUvdEpoch;
 	IOLockUnlock(fLock);
 	return fUvdUp ? kIOReturnSuccess : kIOReturnIOError;
@@ -1393,7 +1393,7 @@ void RadeonNIAccel::uvdUser(bool add)
 			fUvdClocksUp = false;
 			if (fUvd.flags & RDN_UVD_F_PLL)
 				IOLog("RadeonNI: UVD clocks down\n");
-			uvdRestart(1);
+			uvdRestart(2);
 		}
 	}
 	IOLockUnlock(fLock);

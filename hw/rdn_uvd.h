@@ -161,7 +161,7 @@ void rdn_uvd_set_rlc_ucode(const void *fw, uint32_t size);
 /*
  * How much of the block the next stop and start reset (a global, like the RLC microcode: set it before rdn_uvd_fini() and
  * rdn_uvd_init(), back to 0 after): 0 only the VCPU (the minimal start relies on the rest being in its cold state);
- * 1 also every sub-block (UVD_SOFT_RESET, as Linux's uvd_v1_0_start does). A level 2 that also reset the whole block
+ * 1 also every sub-block (UVD_SOFT_RESET, as Linux's uvd_v1_0_start does); 2 the same without touching the RLC (it is running since the first start). A level 2 that also reset the whole block
  * (SOFT_RESET_UVD in SRBM_SOFT_RESET, evergreen_gpu_soft_reset()) was tried on the card: the VCPU did not boot afterwards
  * (UVD_STATUS 0) with the minimal start, so there is none.
  */
