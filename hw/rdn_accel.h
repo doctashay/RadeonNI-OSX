@@ -134,6 +134,8 @@ int rdn_ring_test(struct rdn_accel *accel);
  * register when it reaches that point, after flushing the caches.
  */
 int rdn_fence_emit(struct rdn_accel *accel, uint32_t *seq);
+/* Copy `bytes` (a multiple of 4) between GPU addresses with the command processor's DMA engine, then a fence (hw/rdn_cp.c). */
+int rdn_cp_dma(struct rdn_accel *accel, uint64_t src, uint64_t dst, uint32_t bytes, uint32_t *seq);
 bool rdn_fence_done(struct rdn_accel *accel, uint32_t seq);
 int rdn_fence_wait(struct rdn_accel *accel, uint32_t seq, uint32_t timeout_ms);
 

@@ -213,6 +213,17 @@ private:
 	/* How the next start of the block resets it: 0 for the first start, fUvdRestartBits when it moves between the aperture and a segment (the RLC runs already). */
 	UInt32 fUvdStartLevel;
 	UInt32 fUvdIbFence[kUvdIbSlots];
+	/*
+	 * Staging in the GART for the command processor's DMA into video memory the CPU cannot map: the register window's writes do
+	 * not reach the decoder the way DMA does (docs/UVD.md). dmaPut() is called with fLock held.
+	 */
+	IOBufferMemoryDescriptor *fDmaMem;
+	UInt8 *fDmaCpu;
+	uint64_t fDmaGpu;
+	UInt32 fDmaAt, fDmaBytes;
+	bool dmaStageUp(void);
+	int dmaPut(UInt32 offset, const void *src, UInt32 bytes);
+	static int dmaPutHook(void *cookie, uint32_t offset, const void *src, uint32_t bytes);
 	UInt32 uvdPickSegment(UInt32 force);
 	void uvdSegmentFree(void);
 	bool uvdSegmentCheck(UInt32 offset, UInt32 bytes);

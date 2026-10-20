@@ -382,6 +382,41 @@ int rdn_fence_emit(struct rdn_accel *accel, uint32_t *seq)
 	return 0;
 }
 
+/*
+ * The command processor's DMA engine copies `bytes` (a multiple of 4) from the GPU address `src` to `dst`, with CP_SYNC on the
+ * last packet so that the packets after it wait for the copy, as Linux's r600_copy_cpdma() does; then a fence. The bytes are
+ * copied as they are (no swapping), whichever side is system memory behind the GART.
+ */
+int rdn_cp_dma(struct rdn_accel *accel, uint64_t src, uint64_t dst, uint32_t bytes, uint32_t *seq)
+{
+	uint32_t loops = (bytes + 0x1fffff - 1) / 0x1fffff, i;
+	int r;
+
+	if (!bytes || (bytes & 3))
+		return -EINVAL;
+	r = rdn_ring_begin(accel, loops * 6);
+	if (r)
+		return r;
+	for (i = 0; i < loops; i++) {
+		uint32_t size = bytes > 0x1fffff ? 0x1fffff : bytes;
+		uint32_t hi = (uint32_t)(src >> 32) & 0xff;
+
+		bytes -= size;
+		if (!bytes)
+			hi |= PACKET3_CP_DMA_CP_SYNC;
+		rdn_ring_emit(accel, PACKET3(PACKET3_CP_DMA, 4));
+		rdn_ring_emit(accel, (uint32_t)src);
+		rdn_ring_emit(accel, hi);
+		rdn_ring_emit(accel, (uint32_t)dst);
+		rdn_ring_emit(accel, (uint32_t)(dst >> 32) & 0xff);
+		rdn_ring_emit(accel, size);
+		src += size;
+		dst += size;
+	}
+	rdn_ring_commit(accel);
+	return rdn_fence_emit(accel, seq);
+}
+
 bool rdn_fence_done(struct rdn_accel *accel, uint32_t seq)
 {
 	/* Sequence numbers wrap; "reached" is within half the range. */

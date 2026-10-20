@@ -372,6 +372,16 @@ int rdn_vram_get(struct rdn_card *card, uint32_t offset, void *dst, uint32_t byt
  */
 static bool push_via_aperture;
 
+/* A better way to write big regions of video memory than the register window, if the caller has one (the kext: the command processor's DMA). */
+static int (*put_hook)(void *cookie, uint32_t offset, const void *src, uint32_t bytes);
+static void *put_hook_cookie;
+
+void rdn_uvd_set_put_hook(int (*hook)(void *cookie, uint32_t offset, const void *src, uint32_t bytes), void *cookie)
+{
+	put_hook = hook;
+	put_hook_cookie = cookie;
+}
+
 void rdn_uvd_set_push_via_aperture(bool on)
 {
 	push_via_aperture = on;
@@ -391,6 +401,8 @@ static int uvd_put(struct rdn_uvd *uvd, uint32_t offset, const void *src, uint32
 		rdn_hdp_flush(accel);
 		return 0;
 	}
+	if (put_hook && bytes >= 4096)
+		return put_hook(put_hook_cookie, offset, src, bytes);
 	return rdn_vram_put(accel->card, offset, src, bytes);
 }
 
