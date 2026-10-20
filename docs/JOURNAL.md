@@ -7419,3 +7419,18 @@ reproduction (paced decode session, `open -g winprobe.app`, `osascript ... activ
 - Next: find which memory client's requests hang (the display engine's reads, the HDP, UVD's own ports) by stopping them one at a time in the wedge and watching SRBM_STATUS: blank the
   display (`rdn_display_hold`), flush the HDP, read the MC's own status registers (Linux `evergreen_mc_wait_for_idle`, `evergreen_print_gpu_status_regs`), and try `SRBM_SOFT_RESET` of the
   memory controller blocks in the wedge instead of a start of the decoder. Also what the software drawing into the framebuffer does at the switch (the window server maps the framebuffer's aperture).
+
+## 2026-10-19 (night, last): the hard wedge needs a restart of the block during the foreground change; a minimal restart variant hung the G5
+
+Narrowed with the paced session, the probes, the memory diff (`tools/guest/vramdiff.c`) and forced restarts (`tools/guest/uvdreset.c`, `RDN_UC_UVD_RESET`):
+- Retracted: the memory controller is not stuck. `SRBM_STATUS` busy bits are the display's own traffic (about 9 % of 300 samples in every state; stopping the display's reads
+  clears them); HDP flush, display hold, decoder sub-block reset and block reset change nothing. And nobody writes into video memory above 16 MB during a launch, an
+  activation and an exit (vramdiff, 0 pages changed). The `getVRAMRange` change (reporting 31 MB, not the whole aperture) was reverted for lack of evidence.
+- A session open across the activation stops being served (its pictures go wrong a second later), but a fresh process then decodes fine, and so do the kext's restarts, until
+  the application quits. Running the whole launch, activation and quit with the block idle and nothing restarting it leaves the decoder healthy (vramdiff run, PASS afterwards).
+- Forced restarts of the block (`uvdreset`, about 3 a second, nothing decoding) overlapping the whole sequence leave it permanently wedged. Separately, with the control (no event) and the background
+  launch they do not; overlapping the activation they do. Restarts without the RLC (300 ms each), without the stall of the memory interface and the register bus, and without the
+  sub-block reset (restart bits 6) wedge it just the same. So it is not the RLC, not the stall, not the sub-block reset.
+- A smaller restart (bits 62: only the VCPU reset and boot, nothing rewritten or reprogrammed) hung the G5 (fans at full speed, no network); the user rebooted it. Not to be repeated.
+- Left unexplained: what in a restart the activation breaks. Still possible: the clock idling in `fini` (UPLL programming, bit 8), the firmware and region rewrite (16), the register programming (32), the VCPU reset
+  and boot themselves. Tools for it exist; each run costs a restart of the G5 and the last one hung it.
