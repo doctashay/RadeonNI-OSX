@@ -59,7 +59,7 @@ struct radeon_drm_winsys {
     * segment of the video memory beyond the aperture (docs/UVD.md) they go there (uvd_seg), and the type and number of the
     * newest decode message are what the feedback must carry (rdn_winsys_uvd_answered()).
     */
-   bool video, uvd_seg;
+   bool video, uvd_seg, uvd_split;
    uint32_t uvd_msg_type, uvd_msg_num;
    /* The newest decoder stream's message and feedback buffers as aperture offsets (rdn_winsys_uvd_answered()). */
    bool uvd_check;
