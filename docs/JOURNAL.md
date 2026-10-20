@@ -7539,3 +7539,19 @@ Written, all behind a switch that is off by default (the aperture start is uncha
   INSTALLED (old one: `RadeonNI.kext/Contents/RadeonNI.before-segment-202610200742`) but the G5 has not been restarted, so the running kext is the old one. The restart was refused by the permission system here and left to the user.
 - Not done yet, in this order: first segment-mode run with the one-picture vector, then the vector suite and 720p, then speed (the bulk of the bitstream still goes through the register window; the plan is the command processor's DMA from a buffer behind the
   GART), then the QuickTime component, then re-picking the segment when it is full.
+
+## 2026-10-20 (late night): the decoder in the hidden segments: what the card does (G5, kext restarted 17 times with the user's yes)
+
+Goal from the user: the whole decoder in a hidden 256 MB segment, another segment if one is in use. Written first (earlier entry); this is the run on the G5. Order of what was learned, each from a kext/Mesa change and one or more restarts:
+1. Block in segment 3 with the segment in nibbles 0 and 3 of `UVD_LMI_ADDR_EXT` (Linux's): VCPU boots (window at 0x30000000, readback equal), ring test passes, then the first stream never finishes. Negative.
+2. Segment 7 (a kext test: the aperture's own heap, but every write through the register window and the winsys's copies): a one-picture vector decodes bit-exactly. So the whole plumbing (window put/get, shadows, streams by value,
+   feedback read through the window, session tracking through the window) is right.
+3. Segment 1 with nibbles 0 and 3: the create stream finishes (fence 3), the decode stalls (`UVD_STATUS` 0x10003). All four nibbles: bit-exact on a fresh block. (`docs/UVD.md`: nibbles 1 and 2 are for the decoder's own clients.)
+4. Every later start of the block hangs it: a restart (the kext restarts at the last user's exit), a restart with nothing run in between, a mode change, with and without the sub-block reset, the RLC, clock idling, a 500 ms wait,
+   the extension register rewritten after the reset, the whole region read back equal (so no lost writes). Aperture mode restarts fine. In segment 7 with the firmware window pushed through the aperture (CPU + HDP flush) restarts
+   fine too; pushed by DMA from the GART it does not. With the kext logging how the firmware window differs from the file: after a boot 40 bytes (the firmware ran and patched itself), after a restart 0 forever (it never runs).
+   With the window alternating between two addresses on restarts: the first restart boots (a decode passes), the second (back at the first address) does not. A dummy aperture write plus HDP flush before the VCPU is released: no effect.
+   Conclusion: the decoder (or the memory controller for it) keeps what it read from the firmware window's addresses and only CPU writes through the aperture drop it.
+5. Split mode (nibbles 1 and 2 name a hidden segment, the block as ever in the aperture): the whole vector suite and 720p are bit-exact, three runs in a row with restarts between. 720p: 17 MB in the segment, 7 MB in the aperture.
+Also found on the way: the model test (`tests/uvd_model.c`) was stale (the evergreen fence protocol) and now runs the block in a segment; `rdn_uvdtest` prints `malloc` errors on Leopard (known, the static test; the library does not).
+Not done: the bitstream in the segment, 1080p, the QuickTime component with split mode, the GPU-side speed work, re-picking the segment when it fills up, the default (off).
