@@ -1270,7 +1270,7 @@ IOReturn RadeonNIAccel::debugOp(UInt32 op, UInt32 *srbmStatus)
 			ret = kIOReturnNotReady;
 		break;
 	default:
-		if (op >= 20 && op < 28)
+		if (op >= 20 && op < 84)
 			fUvdRestartBits = op - 20;
 		else
 			ret = kIOReturnBadArgument;

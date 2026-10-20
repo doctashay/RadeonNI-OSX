@@ -166,6 +166,9 @@ void rdn_uvd_set_rlc_ucode(const void *fw, uint32_t size);
 #define RDN_UVD_RESET_SUB	1	/* also reset every sub-block (UVD_SOFT_RESET), as Linux's uvd_v1_0_start does */
 #define RDN_UVD_RESET_NO_RLC	2	/* leave the RLC alone (it runs since the first start) */
 #define RDN_UVD_RESET_NO_STALL	4	/* do not stall the memory interface and the register bus around the reset */
+#define RDN_UVD_RESET_NO_IDLE	8	/* do not lower the clocks when the block is stopped (rdn_uvd_fini) */
+#define RDN_UVD_RESET_NO_REWRITE 16	/* do not write the firmware and clear the VCPU region and ring again */
+#define RDN_UVD_RESET_NO_PROGRAM 32	/* do not program the decoder's address, memory window, LMI and MPC registers again */
 void rdn_uvd_set_reset_level(unsigned level);
 
 /* For debugging: 1 reset every sub-block (with the memory controller and the register bus stalled around it), 2 reset the whole block (SRBM_SOFT_RESET). */

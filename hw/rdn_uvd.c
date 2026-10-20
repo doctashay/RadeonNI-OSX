@@ -480,7 +480,7 @@ static int vcpu_start(struct rdn_uvd *uvd)
 			wr(card, 0x3f00, 1);
 			mdelay(card, 300);
 		}
-		if (uvd->flags & RDN_UVD_F_LMI) {
+		if ((uvd->flags & RDN_UVD_F_LMI) && !(reset_level & RDN_UVD_RESET_NO_PROGRAM)) {
 			/* uvd_v1_0_start(): initialize the UVD memory controller and the MPC muxes */
 			wr(card, UVD_LMI_CTRL, 0x40 | (1 << 8) | (1 << 13) | (1 << 21) | (1 << 9) | (1 << 20));
 			wr(card, UVD_LMI_SWAP_CNTL, uvd->swapped ? 0xa : 0);
@@ -750,16 +750,16 @@ int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 	uvd->swapped = RDN_BIG_ENDIAN;
 
 	/* radeon_uvd_resume(): the firmware as in the file, the rest zero */
-	{
+	if (!(reset_level & RDN_UVD_RESET_NO_REWRITE)) {
 		uint32_t x = (flags & RDN_UVD_F_SWAP4) ? 3 : (flags & RDN_UVD_F_SWAP2) ? 2 : 0;
 
 		for (i = 0; i < fw_size; i++)
 			vcpu_cpu[i ^ x] = fw[i];
+		for (; i < vcpu_bytes; i++)
+			vcpu_cpu[i] = 0;
+		for (i = 0; i < ring_bytes + RDN_UVD_RING_EXTRA; i++)
+			ring_cpu[i] = 0;
 	}
-	for (; i < vcpu_bytes; i++)
-		vcpu_cpu[i] = 0;
-	for (i = 0; i < ring_bytes + RDN_UVD_RING_EXTRA; i++)
-		ring_cpu[i] = 0;
 	rdn_hdp_flush(accel);
 	{
 		/* read the firmware back from where the VCPU will fetch it */
@@ -775,7 +775,7 @@ int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 			(unsigned)bad, (unsigned)fw_size, (unsigned)first);
 	}
 
-	{
+	if (!(reset_level & RDN_UVD_RESET_NO_PROGRAM)) {
 		/* evergreen_gpu_init(): the decoder's tiling follows the 3D engine's */
 		uint32_t cfg = rd(card, 0x98f8);	/* GB_ADDR_CONFIG */
 
@@ -793,7 +793,7 @@ int rdn_uvd_init_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 			wr(card, 0x644, uvd->pm_sclk | 0x4080);
 	}
 	/* uvd_v2_2_resume() runs before uvd_v1_0_init() raises the clocks */
-	if (!(flags & RDN_UVD_F_PLL_FIRST))
+	if (!(flags & RDN_UVD_F_PLL_FIRST) && !(reset_level & RDN_UVD_RESET_NO_PROGRAM))
 		program_memory(uvd);
 	/* raise clocks while booting up the VCPU (the minimal start leaves that to the first command stream) */
 	r = (flags & RDN_UVD_F_MINIMAL) ? 0 : rdn_uvd_wake(uvd);
@@ -873,7 +873,8 @@ void rdn_uvd_fini(struct rdn_uvd *uvd)
 		return;
 	vcpu_stop(uvd);
 	uvd->ready = false;
-	(void)rdn_uvd_idle(uvd);
+	if (!(reset_level & RDN_UVD_RESET_NO_IDLE))
+		(void)rdn_uvd_idle(uvd);
 }
 
 /* ---- work -------------------------------------------------------------- */
