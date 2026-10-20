@@ -81,12 +81,13 @@ check() {
     python3 -I - "$exports" "$out/undefined.txt" <<'PY'
 import re, sys, collections
 d, und = sys.argv[1], sys.argv[2]
-# What the kext may use: the libraries its Info.plist declares (com.apple.kernel.iokit, .libkern, .mach). The lists of
-# the others (BSD, unsupported, the whole kernel) hold more, but loading fails ("Undefined symbols") if the symbol is only there.
+# What the kext may use: the kernel's legacy set (System6.0, with the unsupported list) and the iokit, libkern and mach
+# libraries its Info.plist declares. The BSD interface (com.apple.kpi.bsd: proc_selfpid and the like) is not among them, and
+# the kext cannot declare it next to com.apple.kernel.* ("use only one style"): loading fails with "Undefined symbols".
 have, elsewhere = set(), set()
 for n, mine in (('IOKit', True), ('IOKit.ppc', True), ('Libkern', True), ('Libkern.ppc', True), ('Mach', True),
-                ('Mach.ppc', True), ('System6.0', False), ('System6.0.ppc', False), ('BSDKernel', False),
-                ('BSDKernel.ppc', False), ('Unsupported', False), ('Unsupported.ppc', False)):
+                ('Mach.ppc', True), ('System6.0', True), ('System6.0.ppc', True), ('BSDKernel', False),
+                ('BSDKernel.ppc', False), ('Unsupported', True), ('Unsupported.ppc', True)):
     for l in open('%s/%s.exports' % (d, n), errors='replace'):
         l = l.strip()
         if l and not l.startswith('#'):
@@ -109,7 +110,7 @@ for s in syms:
     if c and c.startswith(FAMILY):
         fam[c] += 1
     elif s in elsewhere:
-        unknown.append(s + '   (exported by the kernel, but not by a library the kext declares)')
+        unknown.append(s + '   (only in the BSD interface, which the kext cannot use)')
     else:
         unknown.append(s)
 print('undefined: %d; in the kernel lists: %d; from the IOPCIFamily and '
