@@ -189,7 +189,7 @@ private:
 	/* A page of video memory for messages of the kext's own. */
 	UInt32 fUvdScratch;
 	/* The session messages in a stream of commands: type (0 create, 2 destroy) and handle of each. */
-	struct UvdMsg { UInt32 type, handle; };
+	struct UvdMsg { UInt32 type, handle, size; };
 	enum { kMaxUvdMsgs = 8 };
 	UInt32 uvdFind(const volatile UInt32 *w, UInt32 words, UvdMsg *msgs);
 	IOReturn uvdSubmitCommon(uint64_t ibAddress, UInt32 words, UvdMsg *msgs, UInt32 n, UInt32 *fence, UInt32 *handles,

@@ -1276,6 +1276,7 @@ UInt32 RadeonNIAccel::uvdFind(const volatile UInt32 *w, UInt32 words, UvdMsg *ms
 				type_ = m[4] | m[5] << 8 | m[6] << 16 | (UInt32)m[7] << 24;
 				if ((type_ == 0 || type_ == 2) && n < kMaxUvdMsgs) {
 					msgs[n].type = type_;
+					msgs[n].size = m[0] | m[1] << 8 | m[2] << 16 | (UInt32)m[3] << 24;
 					msgs[n].handle = m[8] | m[9] << 8 | m[10] << 16 | (UInt32)m[11] << 24;
 					n++;
 				}
@@ -1497,9 +1498,10 @@ IOReturn RadeonNIAccel::uvdSubmitWords(task_t task, UInt32 address, UInt32 words
 
 		if (said < 24) {
 			said++;
-			IOLog("RadeonNI: UVD: stream of %lu words, %lu session message(s)%s, live %lu, dirty %d, epoch %lu, clocks %s, UVD_STATUS 0x%08lx\n",
+			IOLog("RadeonNI: UVD: stream of %lu words, %lu session message(s)%s, live %lu, dirty %d, epoch %lu, clocks %s, UVD_STATUS 0x%08lx; message size %lu type %lu handle 0x%08lx\n",
 			      (unsigned long)words, (unsigned long)n, n && msgs[0].type == 0 ? " (create)" : "", (unsigned long)fUvdLive,
-			      fUvdDirty, (unsigned long)fUvdEpoch, fUvdClocksUp ? "up" : "down", (unsigned long)rdn_rreg(fAccel.card, 0xf6bc));
+			      fUvdDirty, (unsigned long)fUvdEpoch, fUvdClocksUp ? "up" : "down", (unsigned long)rdn_rreg(fAccel.card, 0xf6bc),
+			      (unsigned long)(n ? msgs[0].size : 0), (unsigned long)(n ? msgs[0].type : 0), (unsigned long)(n ? msgs[0].handle : 0));
 		}
 	}
 	/* the slot's last stream must have run before it is written over */
