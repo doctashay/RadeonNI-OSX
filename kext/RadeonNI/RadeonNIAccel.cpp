@@ -693,7 +693,11 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 
 	UInt32 force = (flags >> RDN_UVD_F_SEGMENT_AT) & 7;
 
-	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT));
+	UInt32 nibbles = (flags >> 24) & 0xf;
+
+	/* tests: bits 24 to 27 say which nibbles of UVD_LMI_ADDR_EXT get the segment (0: all) */
+	rdn_uvd_set_ext_nibbles(nibbles ? nibbles : 0xf);
+	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24));
 	if (!flags)
 		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI | RDN_UVD_F_PLL | RDN_UVD_F_WINDOWS;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;

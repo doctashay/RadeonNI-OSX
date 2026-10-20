@@ -162,6 +162,9 @@ int rdn_uvd_init_window(struct rdn_uvd *uvd, struct rdn_accel *accel,
 int rdn_vram_put(struct rdn_card *card, uint32_t offset, const void *src, uint32_t bytes);
 int rdn_vram_get(struct rdn_card *card, uint32_t offset, void *dst, uint32_t bytes);
 
+/* Which nibbles of UVD_LMI_ADDR_EXT get the segment (rdn_uvd.c): bit i of `mask` for bits 4i..4i+3; the default is all four. For tests. */
+void rdn_uvd_set_ext_nibbles(unsigned mask);
+
 /* Log the registers that tell how the block is doing (the clocks must be up). */
 void rdn_uvd_dump(struct rdn_uvd *uvd, const char *why);
 

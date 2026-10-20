@@ -467,6 +467,29 @@ static uint32_t rlc_ucode_size;
 
 static unsigned reset_level;
 
+/*
+ * UVD_LMI_ADDR_EXT holds the 256 MB segment (address bits 28 to 31) in four nibbles, as far as is known: bits 0 to 3 for the VCPU,
+ * 4 to 7 and 8 to 11 for other clients of the memory interface (the decoder's own reads and writes of bitstream and pictures,
+ * presumably), bits 12 to 15 for the ring. Linux sets the first and the last and only uses segment 0, where the others do not
+ * matter. Which nibbles are set (bit i of the mask for nibble i): all four unless a test says otherwise.
+ */
+static unsigned ext_nibbles = 0xf;
+
+void rdn_uvd_set_ext_nibbles(unsigned mask)
+{
+	ext_nibbles = mask & 0xf;
+}
+
+static uint32_t ext_value(uint32_t segment)
+{
+	uint32_t v = 0, i;
+
+	for (i = 0; i < 4; i++)
+		if (ext_nibbles & (1u << i))
+			v |= (segment & 0xf) << (4 * i);
+	return v;
+}
+
 void rdn_uvd_set_reset_level(unsigned level)
 {
 	reset_level = level;
@@ -525,7 +548,7 @@ static void program_memory(struct rdn_uvd *uvd)
 			wr(card, UVD_VCPU_CACHE_SIZE2, size);
 		}
 		if (uvd->flags & RDN_UVD_F_EXT) {
-			wr(card, UVD_LMI_ADDR_EXT, (uint32_t)(((at >> 28) & 0xF) << 12 | ((at >> 28) & 0xF)));
+			wr(card, UVD_LMI_ADDR_EXT, ext_value((uint32_t)(at >> 28)));
 			wr(card, UVD_LMI_EXT40_ADDR, (uint32_t)((at >> 32) & 0xFF) | (0x9 << 16) | (0x1u << 31));
 		}
 		return;

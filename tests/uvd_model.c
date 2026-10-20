@@ -322,7 +322,7 @@ int main(int argc, char **argv)
 		check(r == 0 && uvd.ready, "segment: init succeeds (VCPU boots, ring test passes through the window)");
 		check(memcmp(mem + vcpu_at, fw, FW_SIZE) == 0, "segment: firmware in video memory byte for byte");
 		check(mem[vcpu_at + FW_SIZE] == 0 && mem[vcpu_at + bytes - 1] == 0, "segment: the rest of the region cleared");
-		check(regs[UVD_LMI_ADDR_EXT / 4] == ((1u << 12) | 1u), "segment: address extension is segment 1 (twice)");
+		check(regs[UVD_LMI_ADDR_EXT / 4] == 0x1111u, "segment: address extension is segment 1 (all four nibbles)");
 		check(regs[UVD_VCPU_CACHE_OFFSET0 / 4] == (uint32_t)((VRAM_BASE + vcpu_at) >> 3), "segment: cache 0 at the firmware");
 		check(window_ops > bytes / 4, "segment: the bytes went through the window");
 		for (i = 0; i < 2; i++) {
