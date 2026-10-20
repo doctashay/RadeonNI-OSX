@@ -1,0 +1,18 @@
+r600: decode GPU trace counters as little-endian
+
+MEM_WRITE stores the trace ID without byte swapping. Reading it as a native
+uint32_t on PowerPC misidentifies the last reached marker (83 becomes
+0x53000000 in the captured Portal hang).
+
+diff --git a/src/gallium/drivers/r600/eg_debug.c b/src/gallium/drivers/r600/eg_debug.c
+--- a/src/gallium/drivers/r600/eg_debug.c
++++ b/src/gallium/drivers/r600/eg_debug.c
+@@ -318,7 +318,7 @@ static void eg_dump_last_ib(struct r600_context *rctx, FILE *f)
+ 						       PIPE_MAP_UNSYNCHRONIZED |
+ 						       PIPE_MAP_READ);
+ 		if (map)
+-			last_trace_id = *map;
++			last_trace_id = util_le32_to_cpu(*map);
+ 	}
+ 
+ 	eg_parse_ib(f, rctx->last_gfx.ib, rctx->last_gfx.num_dw,
