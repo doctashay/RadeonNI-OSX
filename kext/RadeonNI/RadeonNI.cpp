@@ -122,6 +122,9 @@ static void os_log(void *cookie, enum rdn_log_level level, const char *fmt,
 	IOLog("RadeonNI: %s\n", line);
 }
 
+/* What the framebuffer is asked to do, for the command buffer recorder (RDN_UC_IBLOG): kind 'f', the number as the offset, a value as the size. */
+#define IBNOTE(id, value) do { if (fAccel) fAccel->ibRecord('f', 0, (id), (value)); } while (0)
+
 UInt32 RadeonNI::readReg(UInt32 offset)
 {
 	return OSReadLittleInt32(fRegs, offset);
@@ -791,6 +794,7 @@ IOReturn RadeonNI::getAttribute(IOSelect attribute, UInt32 *value)
 
 IOReturn RadeonNI::setCursorImage(void *cursorImage)
 {
+	IBNOTE(1, 0);
 	IOHardwareCursorDescriptor desc;
 	IOHardwareCursorInfo info;
 	volatile UInt32 *dst;
@@ -838,6 +842,7 @@ IOReturn RadeonNI::setCursorImage(void *cursorImage)
 
 IOReturn RadeonNI::setCursorState(SInt32 x, SInt32 y, bool visible)
 {
+	IBNOTE(2, visible ? 1 : 0);
 	if (!fHWCursor)
 		return kIOReturnUnsupported;
 	fCursorX = x;
@@ -1051,6 +1056,7 @@ IOReturn RadeonNI::getCurrentDisplayMode(IODisplayModeID *displayMode,
 
 IOReturn RadeonNI::setDisplayMode(IODisplayModeID displayMode, IOIndex depth)
 {
+	IBNOTE(7, displayMode);
 	if (fModeSet && displayMode == fCurrentMode && depth == fCurrentDepth)
 		return kIOReturnSuccess;
 	return programMode(displayMode, depth);
@@ -1070,6 +1076,7 @@ IOReturn RadeonNI::getStartupDisplayMode(IODisplayModeID *displayMode,
 IOReturn RadeonNI::setCLUTWithEntries(IOColorEntry *colors, UInt32 index,
 	UInt32 numEntries, IOOptionBits options)
 {
+	IBNOTE(4, 0);
 	UInt32 i, slot;
 
 	for (i = 0; i < numEntries; i++) {
@@ -1092,6 +1099,7 @@ IOReturn RadeonNI::setCLUTWithEntries(IOColorEntry *colors, UInt32 index,
 IOReturn RadeonNI::setGammaTable(UInt32 channelCount, UInt32 dataCount,
 	UInt32 dataWidth, void *data)
 {
+	IBNOTE(3, 0);
 	UInt32 i, ch, src, v;
 
 	if (!data || !dataCount || (channelCount != 1 && channelCount != 3) ||
@@ -1197,6 +1205,7 @@ IOReturn RadeonNI::setAttributeForConnection(IOIndex connectIndex,
 
 IOReturn RadeonNI::setAttribute(IOSelect attribute, UInt32 value)
 {
+	IBNOTE(attribute, value);
 	switch (attribute) {
 	case kIOPowerAttribute:
 		/*
@@ -1264,6 +1273,7 @@ IOReturn RadeonNI::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber,
 	IOSelect blockType, IOOptionBits options, UInt8 *data,
 	IOByteCount *length)
 {
+	IBNOTE(6, blockNumber);
 	UInt32 offset;
 	IOByteCount n;
 
@@ -1286,6 +1296,7 @@ IOReturn RadeonNI::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber,
 /* The picture and the signal off, or back (a mode set, with link training). */
 void RadeonNI::setOutputPower(bool on)
 {
+	IBNOTE(9, on ? 1 : 0);
 	if (!fLock)
 		return;
 	IOLockLock(fLock);
@@ -1372,6 +1383,7 @@ void RadeonNI::stopHotplug()
  */
 void RadeonNI::pollHotplug()
 {
+	IBNOTE(8, 0);
 	int sense;
 
 	if (!fLock || !fModeSet)
