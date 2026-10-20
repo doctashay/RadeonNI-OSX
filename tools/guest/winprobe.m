@@ -6,7 +6,7 @@
  *   winprobe window seconds     a plain Cocoa window, redrawn five times a second
  *   winprobe gl seconds         a Cocoa window with an OpenGL view, cleared and flushed five times a second
  *
- * Inside a bundle (winprobe.app, started by `open`), with no arguments: a plain window for 40 s, as an application LaunchServices knows (Dock
+ * Inside a bundle (winprobe.app, started by `open`), with no arguments: a plain window for 300 s, as an application LaunchServices knows (Dock
  * icon, menu bar). Info.plist with LSUIElement set makes it one without a Dock icon and menu bar.
  *
  * Builds on the G5 (its Xcode):
@@ -53,11 +53,11 @@ int main(int argc, char **argv)
 	double seconds;
 	int a = 1;
 
-	/* LaunchServices starts a bundle with -psn_... first; no arguments at all means a plain window for 40 s */
+	/* LaunchServices starts a bundle with -psn_... first; no arguments at all means a plain window for 300 s */
 	if (a < argc && !strncmp(argv[a], "-psn", 4))
 		a++;
 	mode = a < argc ? argv[a] : "window";
-	seconds = a + 1 < argc ? atof(argv[a + 1]) : 40;
+	seconds = a + 1 < argc ? atof(argv[a + 1]) : 300;
 	NSWindow *window = nil;
 	ColorView *view = nil;
 	NSOpenGLView *glview = nil;
