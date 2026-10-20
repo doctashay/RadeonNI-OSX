@@ -631,8 +631,8 @@ IOReturn RadeonNIAccel::allocVram(UInt32 size, UInt32 align, UInt32 *offset,
 	IOLockLock(fLock);
 	if (segment) {
 		/* the decoder's own 256 MB (docs/UVD.md) */
-		r = fUvdSeg ? rdn_mem_alloc_range(&fHidden, size, align, fUvdSegLo, fUvdSegHi, &off) : -1;
-	} else if (hidden && fUvdSeg) {
+		r = fUvdSeg ? rdn_mem_alloc_range(fUvdSegMem, size, align, fUvdSegLo, fUvdSegHi, &off) : -1;
+	} else if (hidden && fUvdSeg && fUvdSegMem == &fHidden) {
 		/* the segment is kept for the decoder while the rest of the hidden memory has room */
 		r = rdn_mem_alloc_range(&fHidden, size, align, fHiddenOffset, fUvdSegLo, &off);
 		if (r)
@@ -691,7 +691,9 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	bool wantSegment = (flags & RDN_UVD_F_SEGMENT) != 0;
 	bool wantAperture = (flags & RDN_UVD_F_APERTURE) != 0;
 
-	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE);
+	UInt32 force = (flags >> RDN_UVD_F_SEGMENT_AT) & 7;
+
+	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT));
 	if (!flags)
 		flags = RDN_UVD_F_MINIMAL | RDN_UVD_F_LMI | RDN_UVD_F_PLL | RDN_UVD_F_WINDOWS;
 	UInt32 fwSize = 0, vcpuOff = 0, ringOff = 0;
@@ -702,7 +704,8 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	int r;
 
 	IOLockLock(fLock);
-	if (fUvdUp && ((wantSegment && !fUvdSeg) || (wantAperture && fUvdSeg)) && !fUvdUsers && !fUvdLive) {
+	if (fUvdUp && ((wantSegment && (!fUvdSeg || (force && force != fUvdSeg))) || (wantAperture && fUvdSeg)) &&
+	    !fUvdUsers && !fUvdLive) {
 		/*
 		 * Asked for the other place and nothing runs: start again there. The fence numbers go on and the epoch changes,
 		 * as at any restart; a program that kept buffers of the old place does not use them again (tests only).
@@ -838,7 +841,7 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 
 	if (wantSegment && ref && fHiddenSize) {
 		IOLockLock(fLock);
-		ret = uvdStartSegment(flags, fw, fwSize, ref, status);
+		ret = uvdStartSegment(flags, force, fw, fwSize, ref, status);
 		IOLockUnlock(fLock);
 		if (ret == kIOReturnSuccess) {
 			IOFree(fw, fwSize);
@@ -949,17 +952,26 @@ void RadeonNIAccel::uvdRestart(UInt32 level)
  * one with the most room that has at least 96 MB free in one piece, the highest on a tie (hidden allocations are first
  * fit from the bottom). Called with fLock held. 0 if there is none.
  */
-UInt32 RadeonNIAccel::uvdPickSegment(void)
+UInt32 RadeonNIAccel::uvdPickSegment(UInt32 force)
 {
 	const uint64_t kMinFree = 96ull << 20;
 	UInt32 n, best = 0;
 	uint64_t bestFree = 0;
 
+	if (force == 7) {
+		/* a test: the aperture's own heap, but through the register window like the others */
+		uint64_t big = 0;
+
+		(void)rdn_mem_available_range(&fMem, HEAP_OFFSET, fAccel.aperture_size, &big);
+		return big >= (32ull << 20) ? 7 : 0;
+	}
 	if (!fHiddenSize)
 		return 0;
 	for (n = 1; n <= 6; n++) {
 		uint64_t lo = (uint64_t)n << 28, hi = lo + (1ull << 28), big = 0, avail;
 
+		if (force && n != force)
+			continue;
 		if (lo < fHiddenOffset || hi > (uint64_t)fHiddenOffset + fHiddenSize)
 			continue;
 		avail = rdn_mem_available_range(&fHidden, lo, hi, &big);
@@ -978,7 +990,7 @@ void RadeonNIAccel::uvdSegmentFree(void)
 
 	for (i = 0; i < kUvdOwn; i++)
 		if (fUvdOwn[i].size) {
-			rdn_mem_free(&fHidden, fUvdOwn[i].offset);
+			rdn_mem_free(fUvdSegMem, fUvdOwn[i].offset);
 			fUvdOwn[i].size = 0;
 		}
 	if (fUvdVcpuShadow) {
@@ -1011,9 +1023,10 @@ bool RadeonNIAccel::uvdSegmentCheck(UInt32 offset, UInt32 bytes)
  * Start the block with its firmware window, ring, scratch page and indirect buffer slots in a segment, the way
  * rdn_uvd_init_window() wants them. Called with fLock held; on failure nothing stays taken.
  */
-IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, const void *fw, UInt32 fwSize, uint32_t ref, UInt32 *status)
+IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, UInt32 force, const void *fw, UInt32 fwSize, uint32_t ref,
+					UInt32 *status)
 {
-	UInt32 seg = uvdPickSegment(), i;
+	UInt32 seg = uvdPickSegment(force), i;
 	UInt32 vcpuBytes = rdn_uvd_vcpu_bytes(fwSize, RDN_UVD_DEFAULT_HANDLES);
 	UInt32 sizes[kUvdOwn];
 	uint64_t lo, hi, at;
@@ -1027,8 +1040,14 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, const void *fw, UInt32 fwS
 	sizes[3] = kUvdIbSlots * 4096;	/* the indirect buffer slots */
 	lo = (uint64_t)seg << 28;
 	hi = lo + (1ull << 28);
+	fUvdSegMem = &fHidden;
+	if (seg == 7) {
+		lo = HEAP_OFFSET;
+		hi = fAccel.aperture_size;
+		fUvdSegMem = &fMem;
+	}
 	for (i = 0; i < kUvdOwn; i++) {
-		if (rdn_mem_alloc_range(&fHidden, sizes[i], 4096, lo, hi, &at)) {
+		if (rdn_mem_alloc_range(fUvdSegMem, sizes[i], 4096, lo, hi, &at)) {
 			uvdSegmentFree();
 			return kIOReturnNoMemory;
 		}
@@ -1799,6 +1818,27 @@ bool RadeonNIAccel::uvdFenceWait(UInt32 fence, UInt32 timeoutMs)
 	for (;;) {
 		IOLockLock(fLock);
 		done = fUvdUp && rdn_uvd_fence_done(&fUvd, fence);
+		if (!done && waited >= timeoutMs && timeoutMs >= 1000 && fUvdUp && fUvdClocksUp && fUvdDumps < 3) {
+			/* a stream that never finished: what the block says (the clocks are up, so the reads answer) */
+			UInt8 word[4], sample[32];
+			UInt32 at = fUvdSeg ? fUvdOwn[1].offset : fUvd.ring_offset;
+
+			fUvdDumps++;
+			rdn_uvd_dump(&fUvd, "a stream did not finish");
+			if (fUvdSeg && !rdn_vram_get(fAccel.card, at + 4096, word, 4))
+				IOLog("RadeonNI: UVD: fence word %02x%02x%02x%02x (waiting for %lu), wptr %lu\n", word[0], word[1], word[2], word[3],
+				      (unsigned long)fence, (unsigned long)fUvd.wptr);
+			if (fUvdSeg && !rdn_vram_get(fAccel.card, fUvdIbBase + ((fUvdIbNext + kUvdIbSlots - 1) % kUvdIbSlots) * 4096, sample, 32))
+				IOLog("RadeonNI: UVD: last stream %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\n",
+				      (unsigned long)((sample[0] << 24) | (sample[1] << 16) | (sample[2] << 8) | sample[3]),
+				      (unsigned long)((sample[4] << 24) | (sample[5] << 16) | (sample[6] << 8) | sample[7]),
+				      (unsigned long)((sample[8] << 24) | (sample[9] << 16) | (sample[10] << 8) | sample[11]),
+				      (unsigned long)((sample[12] << 24) | (sample[13] << 16) | (sample[14] << 8) | sample[15]),
+				      (unsigned long)((sample[16] << 24) | (sample[17] << 16) | (sample[18] << 8) | sample[19]),
+				      (unsigned long)((sample[20] << 24) | (sample[21] << 16) | (sample[22] << 8) | sample[23]),
+				      (unsigned long)((sample[24] << 24) | (sample[25] << 16) | (sample[26] << 8) | sample[27]),
+				      (unsigned long)((sample[28] << 24) | (sample[29] << 16) | (sample[30] << 8) | sample[31]));
+		}
 		IOLockUnlock(fLock);
 		if (done || waited >= timeoutMs)
 			return done;

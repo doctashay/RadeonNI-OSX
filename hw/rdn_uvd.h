@@ -54,6 +54,7 @@
 #define RDN_UVD_F_PLL		(1 << 16)	/* with MINIMAL: the clocks go up (Linux's 533/400 MHz) at the first command stream, rdn_uvd_wake(), and down at rdn_uvd_idle(); without it the block runs on the bypass clock */
 #define RDN_UVD_F_WINDOWS	(1 << 17)	/* with MINIMAL: also the heap and the stack/session windows of the VCPU's memory (uvd_v2_2_resume() writes all three); without them the firmware's heap and stack are at video memory address 0 */
 #define RDN_UVD_F_SEGMENT	(1 << 18)	/* (kext) the block in a 256 MB segment beyond the aperture (docs/UVD.md); alone it means the default start with it */
+#define RDN_UVD_F_SEGMENT_AT	20		/* (kext) with SEGMENT: bits 20 to 22 name the segment to use, 1 to 6 (hidden) or 7 (the aperture's own, through the register window: to test the plumbing); 0 picks */
 #define RDN_UVD_F_APERTURE	(1 << 19)	/* (kext) a started block that idles is started again in the aperture (tests: to compare the two) */
 #define RDN_UVD_F_GART		(1 << 9)	/* (kext) the VCPU region and ring in GART memory: addresses with bits 32-39 zero */
 
@@ -160,6 +161,9 @@ int rdn_uvd_init_window(struct rdn_uvd *uvd, struct rdn_accel *accel,
  */
 int rdn_vram_put(struct rdn_card *card, uint32_t offset, const void *src, uint32_t bytes);
 int rdn_vram_get(struct rdn_card *card, uint32_t offset, void *dst, uint32_t bytes);
+
+/* Log the registers that tell how the block is doing (the clocks must be up). */
+void rdn_uvd_dump(struct rdn_uvd *uvd, const char *why);
 
 int rdn_uvd_init(struct rdn_uvd *uvd, struct rdn_accel *accel,
 		 uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,

@@ -200,6 +200,9 @@ private:
 	 * scratch page, indirect buffer slots) is in it; the shadows are the library's system memory copies of the first two.
 	 */
 	UInt32 fUvdSeg, fUvdSegLo, fUvdSegHi;
+	/* Where the segment's memory comes from (fHidden; fMem for segment 7, the aperture's own, a test), and dumps made of a stalled stream. */
+	struct rdn_mem *fUvdSegMem;
+	UInt32 fUvdDumps;
 	enum { kUvdOwn = 4, kUvdIbSlots = 16 };
 	struct { UInt32 offset, size; } fUvdOwn[kUvdOwn];
 	UInt8 *fUvdVcpuShadow, *fUvdRingShadow;
@@ -208,10 +211,10 @@ private:
 	/* The fence number to go on from when the block is started in the other place. */
 	UInt32 fUvdModeFenceBase;
 	UInt32 fUvdIbFence[kUvdIbSlots];
-	UInt32 uvdPickSegment(void);
+	UInt32 uvdPickSegment(UInt32 force);
 	void uvdSegmentFree(void);
 	bool uvdSegmentCheck(UInt32 offset, UInt32 bytes);
-	IOReturn uvdStartSegment(UInt32 flags, const void *fw, UInt32 fwSize, uint32_t ref, UInt32 *status);
+	IOReturn uvdStartSegment(UInt32 flags, UInt32 force, const void *fw, UInt32 fwSize, uint32_t ref, UInt32 *status);
 	bool uvdReadMessageHeader(uint64_t address, UInt8 *out);
 	IOBufferMemoryDescriptor *fUvdGartMem;
 	UInt32 fUvdGartAt;

@@ -786,8 +786,8 @@ int rdn_uvd_wake(struct rdn_uvd *uvd)
 				  RDN_UVD_DCLK);
 }
 
-/* What the block says when the VCPU does not come up. */
-static void uvd_dump(struct rdn_uvd *uvd, const char *why)
+/* What the block says when the VCPU does not come up (or, from the kext, when a stream's fence does not come). */
+void rdn_uvd_dump(struct rdn_uvd *uvd, const char *why)
 {
 	struct rdn_card *card = uvd->accel->card;
 	static const struct { const char *name; uint32_t reg; } r[] = {
@@ -956,12 +956,12 @@ static int init_common(struct rdn_uvd *uvd, struct rdn_accel *accel,
 		program_memory(uvd);
 	r = vcpu_start(uvd);
 	if (r) {
-		uvd_dump(uvd, "the VCPU did not answer");
+		rdn_uvd_dump(uvd, "the VCPU did not answer");
 		goto done;
 	}
 	r = ring_test(uvd);
 	if (r) {
-		uvd_dump(uvd, "ring test failed");
+		rdn_uvd_dump(uvd, "ring test failed");
 		goto done;
 	}
 
