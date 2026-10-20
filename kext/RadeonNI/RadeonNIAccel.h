@@ -168,6 +168,8 @@ private:
 	UInt32 fUvdFlags;
 	uint32_t fUvdRef;
 	bool fUvdDirty;
+	/* How a restart of the block is done (RDN_UVD_RESET_*), set by RDN_UC_DEBUG 20 + bits for experiments. */
+	UInt32 fUvdRestartBits;
 	/* The command buffer recorder: a ring of what was submitted and the text of what the scan found. */
 	struct IbEntry { UInt32 ms, client, pid, offset, words, kind, found; };
 	bool fIbOn;

@@ -474,7 +474,7 @@ static int vcpu_start(struct rdn_uvd *uvd)
 		 * The RLC (evergreen_rlc_start() writes RLC_ENABLE) after the memory window, and time to come up. Not when the block is started
 		 * again (level 2): it is running from the first start, and stopping and loading it while the window server is busy breaks the decoder.
 		 */
-		if (reset_level < 2) {
+		if (!(reset_level & RDN_UVD_RESET_NO_RLC)) {
 			if (rlc_ucode)
 				rlc_load(card);
 			wr(card, 0x3f00, 1);
@@ -493,7 +493,7 @@ static int vcpu_start(struct rdn_uvd *uvd)
 			wr(card, UVD_MPC_SET_MUX, 0x88);
 		}
 		/* after a reset of the sub-blocks they come out of it first, the VCPU last (uvd_v1_0_start()) */
-		if (reset_level >= 1) {
+		if (reset_level & RDN_UVD_RESET_SUB) {
 			wr(card, UVD_SOFT_RESET, VCPU_SOFT_RESET);
 			mdelay(card, 5);
 		}
@@ -621,13 +621,15 @@ static void vcpu_stop(struct rdn_uvd *uvd)
 	/* force RBC into idle state */
 	wr(card, UVD_RBC_RB_CNTL, 0x11010101);
 	/* stall UMC and register bus before resetting VCPU */
-	wr_p(card, UVD_LMI_CTRL2, 1 << 8, ~(1 << 8));
-	wr_p(card, UVD_RB_ARB_CTRL, 1 << 3, ~(1 << 3));
+	if (!(reset_level & RDN_UVD_RESET_NO_STALL)) {
+		wr_p(card, UVD_LMI_CTRL2, 1 << 8, ~(1 << 8));
+		wr_p(card, UVD_RB_ARB_CTRL, 1 << 3, ~(1 << 3));
+	}
 	mdelay(card, 1);
 	/* put VCPU into reset */
 	wr(card, UVD_SOFT_RESET, VCPU_SOFT_RESET);
 	mdelay(card, 5);
-	if (reset_level >= 1) {
+	if (reset_level & RDN_UVD_RESET_SUB) {
 		/* every sub-block, with the memory controller and the register bus stalled, as uvd_v1_0_start() does */
 		wr(card, UVD_SOFT_RESET, LMI_SOFT_RESET | VCPU_SOFT_RESET | LBSI_SOFT_RESET | RBC_SOFT_RESET |
 		   CSM_SOFT_RESET | CXW_SOFT_RESET | TAP_SOFT_RESET | LMI_UMC_SOFT_RESET);
@@ -636,8 +638,10 @@ static void vcpu_stop(struct rdn_uvd *uvd)
 	/* disable VCPU clock */
 	wr(card, UVD_VCPU_CNTL, 0x0);
 	/* unstall UMC and register bus */
-	wr_p(card, UVD_LMI_CTRL2, 0, ~(1 << 8));
-	wr_p(card, UVD_RB_ARB_CTRL, 0, ~(1 << 3));
+	if (!(reset_level & RDN_UVD_RESET_NO_STALL)) {
+		wr_p(card, UVD_LMI_CTRL2, 0, ~(1 << 8));
+		wr_p(card, UVD_RB_ARB_CTRL, 0, ~(1 << 3));
+	}
 }
 
 void rdn_uvd_debug_reset(struct rdn_uvd *uvd, unsigned what)

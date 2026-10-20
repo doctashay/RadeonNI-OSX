@@ -161,7 +161,7 @@ enum {
 	/*
 	 * Debugging the memory controller's busy flags (docs/UVD.md): scalar in: 1 stop the display controllers' reads of video memory,
 	 * 2 let them read again, 3 flush the host data path, 4 reset the decoder's sub-blocks (the decoder needs a restart after it),
-	 * 5 reset the decoder's whole block with SRBM_SOFT_RESET (same). Out: SRBM_STATUS (0xE50) 20 ms after the operation.
+	 * 5 reset the decoder's whole block with SRBM_SOFT_RESET (same), 20 to 27 set how the block is restarted (RDN_UVD_RESET_* bits: 1 sub-blocks, 2 no RLC, 4 no stall). Out: SRBM_STATUS (0xE50) 20 ms after the operation.
 	 */
 	RDN_UC_DEBUG,
 	RDN_UC_METHOD_COUNT
