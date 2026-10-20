@@ -575,7 +575,7 @@ static void program_memory(struct rdn_uvd *uvd)
 
 	/* bits 28-31 */
 	addr = (gpu >> 28) & 0xF;
-	wr(card, UVD_LMI_ADDR_EXT, (uint32_t)((addr << 12) | (addr << 0)));
+	wr(card, UVD_LMI_ADDR_EXT, ext_value((uint32_t)addr));
 
 	/* bits 32-39 */
 	addr = (gpu >> 32) & 0xFF;
