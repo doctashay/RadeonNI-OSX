@@ -999,6 +999,39 @@ static int init_common(struct rdn_uvd *uvd, struct rdn_accel *accel,
 		}
 		rdn_log(card->os, RDN_LOG_INFO, "uvd: firmware readback: %u of %u bytes differ (first at %u)",
 			(unsigned)bad, (unsigned)fw_size, (unsigned)first);
+		if (window) {
+			/* all of both regions, not only the firmware: the heap, stack and session areas were cleared too */
+			uint8_t chunk[256];
+			uint32_t at, n, off, wrong = 0, where = 0;
+
+			for (at = 0; at < vcpu_bytes + ring_bytes + RDN_UVD_RING_EXTRA; at += n) {
+				const volatile uint8_t *want;
+
+				if (at < vcpu_bytes) {
+					n = vcpu_bytes - at < sizeof(chunk) ? vcpu_bytes - at : (uint32_t)sizeof(chunk);
+					off = vcpu_off + at;
+					want = vcpu_cpu + at;
+				} else {
+					uint32_t k = at - vcpu_bytes;
+
+					n = ring_bytes + RDN_UVD_RING_EXTRA - k < sizeof(chunk) ? ring_bytes + RDN_UVD_RING_EXTRA - k : (uint32_t)sizeof(chunk);
+					off = ring_off + k;
+					want = ring_cpu + k;
+				}
+				if (rdn_vram_get(card, off, chunk, n)) {
+					wrong = ~0u;
+					break;
+				}
+				for (i = 0; i < n; i++)
+					if (chunk[i] != want[i]) {
+						if (!wrong)
+							where = at + i;
+						wrong++;
+					}
+			}
+			rdn_log(card->os, RDN_LOG_INFO, "uvd: the whole region read back: %u bytes differ (first at %u)", (unsigned)wrong,
+				(unsigned)where);
+		}
 	}
 
 	if (!(reset_level & RDN_UVD_RESET_NO_PROGRAM))
