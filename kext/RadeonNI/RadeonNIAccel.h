@@ -203,7 +203,7 @@ private:
 	/* Where the segment's memory comes from (fHidden; fMem for segment 7, the aperture's own, a test), and dumps made of a stalled stream. */
 	struct rdn_mem *fUvdSegMem;
 	UInt32 fUvdDumps;
-	enum { kUvdOwn = 4, kUvdIbSlots = 16 };
+	enum { kUvdOwn = 5, kUvdIbSlots = 16 };
 	struct { UInt32 offset, size; } fUvdOwn[kUvdOwn];
 	UInt8 *fUvdVcpuShadow, *fUvdRingShadow;
 	UInt32 fUvdVcpuShadowBytes, fUvdRingShadowBytes;

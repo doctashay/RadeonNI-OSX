@@ -942,9 +942,15 @@ void RadeonNIAccel::uvdRestart(UInt32 level)
 	fenceBase = fUvd.fence_emitted;
 	rdn_uvd_set_reset_level(level);
 	rdn_uvd_fini(&fUvd);
-	if (fUvdSeg)
+	if (fUvdSeg) {
+		/* the firmware window goes to its other place: the decoder does not boot from the old one again (stale lines?) */
+		UInt32 other = fUvdOwn[4].offset;
+
+		fUvdOwn[4].offset = fUvdOwn[0].offset;
+		fUvdOwn[0].offset = other;
 		r = rdn_uvd_init_window(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
 					fUvdVcpuShadow, fUvdOwn[0].offset, fUvdRingShadow, fUvdOwn[1].offset, 4096, fUvdFlags);
+	}
 	else
 		r = rdn_uvd_init(&fUvd, &fAccel, fUvdRef, (const uint8_t *)fw, fwSize, RDN_UVD_DEFAULT_HANDLES,
 				 fUvd.vcpu_offset, fUvd.ring_offset, 4096, fUvdFlags);
@@ -1197,6 +1203,7 @@ IOReturn RadeonNIAccel::uvdStartSegment(UInt32 flags, UInt32 force, const void *
 	sizes[1] = 8192;			/* the ring (4096 bytes and its fence word) */
 	sizes[2] = 4096;			/* the scratch page */
 	sizes[3] = kUvdIbSlots * 4096;	/* the indirect buffer slots */
+	sizes[4] = vcpuBytes;			/* a second place for the firmware window, for restarts (docs/UVD.md) */
 	lo = (uint64_t)seg << 28;
 	hi = lo + (1ull << 28);
 	fUvdSegMem = &fHidden;
