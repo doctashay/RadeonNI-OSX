@@ -31,6 +31,8 @@ struct rdn_device_info {
    uint64_t hidden_size;
    /* GPU address of offset 0 of what gart_alloc() hands out. */
    uint64_t gart_gpu_base;
+   /* Synchronized CP DMA burst limit for GART-to-GART copies; zero if unrestricted. */
+   uint32_t cp_dma_gtt_copy_max_bytes;
    /* From the 3D engine setup (evergreen_gpu_init). */
    uint32_t tile_config;
    uint32_t backend_map;

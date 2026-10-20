@@ -1921,6 +1921,7 @@ static void rdn_init_info(struct radeon_drm_winsys *ws)
 
    info->gfx_ib_pad_with_type2 = true;
    info->has_cp_dma = true;
+   info->cp_dma_gtt_copy_max_bytes = dev->cp_dma_gtt_copy_max_bytes;
    info->tcc_cache_line_size = 64;
    info->has_graphics = true;
    info->has_image_opcodes = true;

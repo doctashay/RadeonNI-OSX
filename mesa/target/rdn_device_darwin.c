@@ -52,6 +52,35 @@ struct darwin_device {
 	uint32_t gart_bytes;
 };
 
+static bool has_u4_pcie_parent(io_registry_entry_t service)
+{
+	io_registry_entry_t entry = service, parent;
+	bool found = false;
+	unsigned depth;
+
+	IOObjectRetain(entry);
+	for (depth = 0; depth < 32; depth++) {
+		CFTypeRef value = IORegistryEntryCreateCFProperty(entry,
+			CFSTR("compatible"), kCFAllocatorDefault, 0);
+		if (value && CFGetTypeID(value) == CFDataGetTypeID()) {
+			const UInt8 *data = CFDataGetBytePtr((CFDataRef)value);
+			CFIndex length = CFDataGetLength((CFDataRef)value), at;
+			for (at = 0; at + 8 <= length; at++) {
+				if ((!at || !data[at - 1]) && !memcmp(data + at, "u4-pcie", 8))
+					found = true;
+			}
+		}
+		if (value)
+			CFRelease(value);
+		if (found || IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent))
+			break;
+		IOObjectRelease(entry);
+		entry = parent;
+	}
+	IOObjectRelease(entry);
+	return found;
+}
+
 static int dev_alloc(struct rdn_device *dev, uint64_t size, uint64_t align,
 		     uint64_t *offset)
 {
@@ -732,6 +761,8 @@ struct rdn_device *rdn_device_open(void)
 		goto fail;
 	}
 	kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE, &d->conn);
+	if (has_u4_pcie_parent(service))
+		d->base.info.cp_dma_gtt_copy_max_bytes = 128;
 	IOObjectRelease(service);
 	if (kr) {
 		fprintf(stderr, "rdn: cannot open the accelerator (0x%x)\n", kr);
