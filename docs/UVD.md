@@ -189,6 +189,28 @@ run it while a clip plays). What this means in practice (found 2026-10-20 with t
   as the decoder does, so that does not matter.
 - To see which decoder a clip really used: `grep RadeonNIAVC /var/log/system.log` ("declined" means QuickTime's own decoder), or `~/gpucheck.sh`.
 
+### The decoder in a hidden 256 MB segment (design, 2026-10-20; in progress)
+
+Why: the decoder lives in the first 256 MB (the aperture's), where the window server and Quartz Extreme already hold about 124 MB of the 222 MB heap; the card has 768 MB beyond the aperture that
+nothing uses (`vramfree -h`). The decoder's limit is not the aperture but its segment: every address it uses is masked to one 256 MB window chosen by `UVD_LMI_ADDR_EXT` (bits 28 to 31 of the firmware's
+address, written twice, in bits 0 to 3 and 12 to 15) and `UVD_LMI_EXT40_ADDR`; Linux sets them from `rdev->uvd.gpu_addr` and requires every buffer of a stream to lie in that window (`radeon_uvd_cs_reloc`),
+but never uses any but the first. The earlier test that put only the picture buffer in hidden memory broke that rule. Nothing says the other segments do not work; this section is the attempt.
+
+What changes, with the old behaviour kept (a switch, off until the user decides):
+- **One segment for everything the block touches**: firmware window (heap, stack, sessions), ring and its fence word, indirect buffers, messages, feedback, bitstream, reference buffer, context, pictures. The
+  kext chooses the segment when it starts the block: the hidden segment (1 to 3) with the most free room (at least 96 MB, higher numbers first because hidden allocations are first-fit from the bottom), else
+  the aperture as before. The block's own blocks sit at the start of the segment; ordinary hidden allocations avoid the segment unless the rest is full.
+- **The CPU cannot map it**, so bytes go through the register window: `MM_INDEX` (0x0) = byte offset | 0x80000000 and `MM_INDEX_HI` (0x18), data at `MM_DATA` (0x4); Linux's `radeon_ttm_vram_read/write` do the
+  same for the debugfs file. Slow (a few MB/s), so used for the firmware, the ring, the IB and small reads at first; the bulk (bitstream) later goes by the command processor's DMA from a
+  buffer behind the GART. `hw/rdn_uvd.c` keeps a copy of the firmware region and the ring in system memory and pushes the changed bytes (`rdn_vram_put`/`get`, `rdn_uvd_init_window`).
+- **Kext**: `RDN_UVD_F_SEGMENT` in the start flags; methods to allocate inside the segment, put and get video memory bytes (from and to the caller's memory, bounds-checked), and submit an indirect buffer
+  given as words (the kext writes it into its own slot in the segment). `uvdFind` (session messages) and the destroy messages no longer read through the aperture.
+- **Winsys** (decoder process only, `rdn_winsys_set_video`): shareable buffers go to the segment (place `RDN_SEGMENT`), with a copy in system memory made when the CPU maps one; the stream's flush
+  uploads the dirty copies (the message whole, the bitstream up to the message's `bsd_size`), clears the feedback counter in video memory, submits the words, and `rdn_winsys_uvd_answered` reads the
+  feedback word with `vram_get`.
+- Switch while experimenting: `RDN_UVD_SEGMENT=1` in the environment of the decoding program, or the file `/Library/Application Support/RadeonNI/uvd-segment` ("1"); once the block is up its mode is the
+  kext's, whoever asks later.
+
 ### The decoder wedged when the frontmost application changed (resolved 2026-10-20)
 
 **Cause and fix:** the minimal start programmed only the VCPU's cache window 0 (firmware) and the chip id. Windows 1 (heap) and 2 (stack and sessions) stayed 0, so the firmware's heap and
