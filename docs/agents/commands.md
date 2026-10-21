@@ -139,7 +139,8 @@ skill (`scripts/mac.sh`).
   linux-firmware or kernel.org when `firmware/` lacks it) and
   `g5/install.sh`, `g5/uninstall.sh`, `g5/README.txt` into
   `build/RadeonNI-g5.tar.gz`, to be unpacked and installed on the real
-  Mac. There, `sudo ./install.sh --accel [--hwcursor]` installs the kext
+  Mac. There, `sudo ./install.sh --accel` (the hardware cursor is always on
+  with it; `--hwcursor` is accepted and changes nothing) installs the kext
   with the Quartz Extreme personality `kext.sh` uses under QEMU, plus the
   bundle and the plug-in; without options, phase 1's. The installer's
   bundle and plug-in step has not run anywhere yet.

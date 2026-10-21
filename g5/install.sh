@@ -15,8 +15,11 @@
 # the microcode files TURKS_pfp.bin and TURKS_me.bin next to this script.
 # It also installs RadeonNIGLDriver.bundle (OpenGL) and RadeonNIGA.plugin
 # from this package into /System/Library/Extensions; they do nothing
-# without the accelerator. --hwcursor (with --accel) uses the card's
-# hardware cursor; accelerated Leopard installs enable it by default.
+# without the accelerator. With --accel the card's hardware cursor is always
+# on, on 10.4 and 10.5: the software cursor saves the pixels under the pointer
+# and writes them back when it moves, which overwrites what the GPU drew there
+# in between (stale pieces of a menu's highlight were left behind). --hwcursor
+# is still accepted and changes nothing.
 # Run the script again without options to go back.
 #
 # --check only asks the system whether it would load the kext (kextload -t
@@ -59,6 +62,8 @@ for arg in "$@"; do
     esac
 done
 [ "$hwcursor" = 0 ] || [ "$accel" = 1 ] || fail "--hwcursor needs --accel"
+# The hardware cursor is never left off when the accelerator is installed.
+[ "$accel" = 0 ] || hwcursor=1
 
 [ "$(id -u)" = 0 ] || fail "run as root: sudo ./install.sh [vbios.rom]"
 [ -d "$here/$KEXT" ] || fail "$KEXT not found next to this script"
@@ -69,8 +74,6 @@ case "$(sw_vers -productVersion)" in
     [ -f "$here/LEOPARD" ] ||
         fail "this package is built for Mac OS X 10.4; this is $(sw_vers -productVersion). The 10.5 package has a file LEOPARD."
     if [ "$accel" = 1 ]; then
-        # Software cursor restoration can overwrite asynchronous screen updates.
-        hwcursor=1
         [ -f "$here/LEOPARD-ACCEL" ] ||
             fail "--accel on 10.5 needs the package built for it (a file LEOPARD-ACCEL, scripts/leopard.sh package-accel)"
         echo "Mac OS X $(sw_vers -productVersion): EXPERIMENTAL accelerator. Tested on a Power Mac G5"

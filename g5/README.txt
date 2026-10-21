@@ -62,8 +62,9 @@ Acceleration
   --accel starts the card's 3D engine at boot, for OpenGL and Quartz
   Extreme, and installs RadeonNIGLDriver.bundle and RadeonNIGA.plugin
   from this folder. It needs TURKS_pfp.bin and TURKS_me.bin in this
-  folder. --hwcursor (with --accel) uses the card's hardware cursor. To go
-  back to the framebuffer alone: sudo sh ./install.sh, and restart.
+  folder. With --accel the card's hardware cursor is always on (--hwcursor
+  is accepted and does nothing extra). To go back to the framebuffer alone:
+  sudo sh ./install.sh, and restart.
 
 What the driver does
   It initialises the card from cold (no x86 BIOS runs on a Mac), reads the
