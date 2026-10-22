@@ -112,7 +112,7 @@ PY
 
 case "${1:-}" in
 build)
-    tar -C "$root" -cf - hw kext | gssh 'rm -rf ~/osx-gpu && mkdir -p ~/osx-gpu && tar -C ~/osx-gpu -xf -'
+    tar -C "$root" -cf - hw kext tests/uvd_decode_fixture.c tests/uvd_decode_fixture.h | gssh 'rm -rf ~/osx-gpu && mkdir -p ~/osx-gpu && tar -C ~/osx-gpu -xf -'
     gssh 'cd ~/osx-gpu/kext/RadeonNI && make 2>&1 && ls -l build/RadeonNI.kext/Contents/MacOS/ && file build/RadeonNI.kext/Contents/MacOS/RadeonNI'
     ;;
 load)
