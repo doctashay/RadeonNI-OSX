@@ -256,8 +256,8 @@ void *__emutls_get_address(void *object)
 }
 
 /* libgcc's other entry point: a common variable seen in several objects. */
-void __emutls_register_common(void *object, unsigned int size,
-			      unsigned int align, void *templ)
+void __emutls_register_common(void *object, uintptr_t size,
+			      uintptr_t align, void *templ)
 {
 	struct emutls_object *obj = object;
 

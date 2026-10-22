@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,58 @@
 #include "util/macros.h"
 
 static struct rdn_device *the_device;
+
+struct external_store {
+   struct external_store *next;
+   uint64_t offset, size;
+   unsigned references;
+};
+static struct external_store *external_stores;
+static pthread_mutex_t external_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool track_store(uint64_t offset, uint64_t size)
+{
+   struct external_store *store = calloc(1, sizeof(*store));
+   if (!store) {
+      the_device->free(the_device, offset);
+      return false;
+   }
+   store->offset = offset;
+   store->size = size;
+   store->references = 1;
+   pthread_mutex_lock(&external_lock);
+   store->next = external_stores;
+   external_stores = store;
+   pthread_mutex_unlock(&external_lock);
+   return true;
+}
+
+static void *retain_store(struct rdn_device *dev, uint64_t offset)
+{
+   struct external_store *store;
+   pthread_mutex_lock(&external_lock);
+   for (store = external_stores; store; store = store->next) {
+      if (offset >= store->offset && offset - store->offset < store->size) {
+         ++store->references;
+         break;
+      }
+   }
+   pthread_mutex_unlock(&external_lock);
+   return store;
+}
+
+static void release_store(struct rdn_device *dev, void *reference)
+{
+   struct external_store *store = reference, **link;
+   pthread_mutex_lock(&external_lock);
+   if (--store->references == 0) {
+      for (link = &external_stores; *link != store; link = &(*link)->next) {}
+      *link = store->next;
+      dev->free(dev, store->offset);
+      free(store);
+   }
+   pthread_mutex_unlock(&external_lock);
+}
 
 #ifdef RDN_TARGET_SOFT
 #include "tests/rdn_soft.h"
@@ -67,6 +120,8 @@ rdn_target_vram_alloc(uint32_t bytes, uint32_t *offset)
 #endif
    if (!the_device || the_device->alloc(the_device, bytes, 4096, &o))
       return false;
+   if (!track_store(o, bytes))
+      return false;
    *offset = (uint32_t)o;
    return true;
 }
@@ -79,6 +134,8 @@ rdn_target_vram_alloc_hidden(uint32_t bytes, uint32_t *offset)
    if (!the_device || !the_device->alloc_hidden ||
        the_device->alloc_hidden(the_device, bytes, 4096, &o))
       return false;
+   if (!track_store(o, bytes))
+      return false;
    *offset = (uint32_t)o;
    return true;
 }
@@ -86,8 +143,15 @@ rdn_target_vram_alloc_hidden(uint32_t bytes, uint32_t *offset)
 void
 rdn_target_vram_free(uint32_t offset)
 {
-   if (the_device)
-      the_device->free(the_device, offset);
+   struct external_store *store;
+   if (!the_device)
+      return;
+   /* Take a temporary reference while locating the owner's reference. */
+   store = retain_store(the_device, offset);
+   if (store) {
+      release_store(the_device, store);
+      release_store(the_device, store);
+   }
 }
 
 void *
@@ -112,15 +176,34 @@ rdn_target_surface_buffer(uint32_t id, uint32_t offset, uint32_t row_bytes,
                                      height);
 }
 
-uint32_t
-rdn_target_surface_list(uint32_t (*list)[5], uint32_t max)
+bool
+rdn_target_surface_query(uint32_t id, uint32_t info[5], bool *found)
+{
+   struct rdn_surface s = {0};
+   *found = false;
+   if (!the_device || !the_device->surface_query ||
+       !the_device->surface_query(the_device, id, &s, found))
+      return false;
+   info[0] = s.id;
+   info[1] = s.offset;
+   info[2] = s.row_bytes;
+   info[3] = s.width;
+   info[4] = s.height;
+   return true;
+}
+
+bool
+rdn_target_surface_snapshot(uint32_t (*list)[5], uint32_t max, uint32_t *count)
 {
    struct rdn_surface s[32];
-   uint32_t n, i;
+   int n, i;
 
+   *count = 0;
    if (!the_device || !the_device->surface_list)
-      return 0;
+      return false;
    n = the_device->surface_list(the_device, s, MIN2(max, 32));
+   if (n < 0 || n > MIN2(max, 32))
+      return false;
    for (i = 0; i < n; i++) {
       list[i][0] = s[i].id;
       list[i][1] = s[i].offset;
@@ -128,8 +211,18 @@ rdn_target_surface_list(uint32_t (*list)[5], uint32_t max)
       list[i][3] = s[i].width;
       list[i][4] = s[i].height;
    }
-   return n;
+   *count = n;
+   return true;
 }
+
+uint32_t
+rdn_target_surface_list(uint32_t (*list)[5], uint32_t max)
+{
+   uint32_t count;
+   rdn_target_surface_snapshot(list, max, &count);
+   return count;
+}
+
 
 uint32_t
 rdn_target_surface_locked(void)
@@ -197,6 +290,8 @@ osmesa_create_screen(void)
    if (!ws)
       return NULL;
    the_device = dev;
+   dev->retain_external = retain_store;
+   dev->release_external = release_store;
    /*
     * Buffers over the program's own memory (GL_AMD_pinned_memory). r600
     * leaves it off on big-endian; vertex arrays, the only thing they are
@@ -207,4 +302,12 @@ osmesa_create_screen(void)
    if (rdn_subdata_copy())
       ((struct pipe_caps *)&ws->screen->caps)->allow_glthread_buffer_subdata_opt = true;
    return ws->screen;
+}
+
+bool
+rdn_target_surface_backing(uint32_t id, void **address, uint32_t *stride,
+                           uint32_t *width, uint32_t *height)
+{
+   return the_device && the_device->surface_backing &&
+          the_device->surface_backing(the_device, id, address, stride, width, height);
 }

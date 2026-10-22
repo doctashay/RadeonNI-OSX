@@ -149,6 +149,7 @@ RadeonNIAccel *RadeonNIAccel::withFramebuffer(RadeonNI *fb, IOService *provider)
 
 	accel->fSurfaces = fb->getProperty("Surfaces") == kOSBooleanTrue;
 	accel->fSurfaceGate = fb->getProperty("SurfaceGate") == kOSBooleanTrue;
+	accel->setProperty("BackingSurfaces", fb->getProperty("BackingSurfaces") == kOSBooleanTrue);
 	accel->fEngineUp = accel->startEngine();
 	accel->setProperty("RadeonNIEngine", accel->fEngineUp);
 
@@ -365,7 +366,7 @@ void RadeonNIAccel::gartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages)
  * The memory stays the program's: no kernel address space is spent on it,
  * which on this 32-bit kernel would not reach far.
  */
-IOReturn RadeonNIAccel::gartBind(task_t task, UInt32 address, UInt32 size,
+IOReturn RadeonNIAccel::gartBind(task_t task, UInt64 address, UInt32 size,
 				 void *owner, UInt32 *offset)
 {
 	IOMemoryDescriptor *memory;
@@ -377,8 +378,14 @@ IOReturn RadeonNIAccel::gartBind(task_t task, UInt32 address, UInt32 size,
 	if (!size || (address & (RDN_GART_PAGE_SIZE - 1)) ||
 	    (size & (RDN_GART_PAGE_SIZE - 1)))
 		return kIOReturnBadArgument;
+#ifdef RDN_LEOPARD
+	memory = IOMemoryDescriptor::withAddressRange(address, size, kIODirectionOutIn, task);
+#else
+	if (address > 0xffffffffULL)
+		return kIOReturnUnsupported;
 	memory = IOMemoryDescriptor::withAddress((vm_address_t)address, size,
-						 kIODirectionOutIn, task);
+	                                       kIODirectionOutIn, task);
+#endif
 	if (!memory)
 		return kIOReturnNoMemory;
 	if (memory->prepare() != kIOReturnSuccess) {
@@ -398,9 +405,10 @@ IOReturn RadeonNIAccel::gartBind(task_t task, UInt32 address, UInt32 size,
 	}
 	for (done = 0; done < size; done += RDN_GART_PAGE_SIZE) {
 		IOByteCount length = 0;
+		/* The G5 PCI bus needs IOMapper addresses, not raw physical pages. */
 		IOPhysicalAddress bus = memory->getPhysicalSegment(done, &length);
 
-		if (!bus)
+		if (!bus || length < RDN_GART_PAGE_SIZE)
 			break;
 		rdn_gart_set_page(&fGart, (UInt32)((at + done) / RDN_GART_PAGE_SIZE), bus);
 	}
@@ -462,6 +470,49 @@ void RadeonNIAccel::gartUnbindAll(void *owner)
 			gartUnbind(fGartBound[slot].offset, owner);
 }
 
+void RadeonNIAccel::releaseClientMemory(const UInt32 *offsets, UInt32 count,
+                                         void *owner)
+{
+	UInt32 i, j, fence;
+	bool hasMemory = count != 0;
+
+	IOLockLock(fLock);
+	for (i = 0; i < kMaxGartBindings; i++)
+		if (fGartBound[i].memory && fGartBound[i].owner == owner)
+			hasMemory = true;
+	/* Reservations have no VRAM offset to match during client teardown. */
+	for (i = 0; i < fShapeCapacity; i++)
+		if (fShapes[i].used && fShapes[i].owner == owner)
+			bzero(&fShapes[i], sizeof(fShapes[i]));
+	if (!hasMemory) {
+		IOLockUnlock(fLock);
+		return;
+	}
+	/* Stop future compositor copies from referencing this client's stores. */
+	for (i = 0; i < fShapeCapacity; i++)
+		for (j = 0; fShapes[i].used && j < count; j++)
+			if (fShapes[i].bufWidth && fShapes[i].bufOffset == offsets[j]) {
+				bzero(&fShapes[i], sizeof(fShapes[i]));
+				break;
+			}
+	fence = fAccel.fence_emitted;
+	IOLockUnlock(fLock);
+
+	if (!fenceWait(fence, 10000)) {
+		/* Keep GPU-visible memory pinned until reboot after a hang. */
+		IOLockLock(fLock);
+		for (i = 0; i < kMaxGartBindings; i++)
+			if (fGartBound[i].memory && fGartBound[i].owner == owner)
+				fGartBound[i].owner = 0;
+		IOLockUnlock(fLock);
+		IOLog("RadeonNI: client cleanup fence %lu timed out; retaining GPU memory\n", fence);
+		return;
+	}
+	for (i = 0; i < count; i++)
+		freeVram(offsets[i]);
+	gartUnbindAll(owner);
+}
+
 void RadeonNIAccel::retire(IOService *provider)
 {
 	if (fFramebuffer) {
@@ -497,6 +548,11 @@ void RadeonNIAccel::retire(IOService *provider)
 		fShim = 0;
 	}
 	fFramebuffer = 0;
+	if (fShapes) {
+		IOFree(fShapes, fShapeCapacity * sizeof(*fShapes));
+		fShapes = 0;
+		fShapeCapacity = 0;
+	}
 	if (fLock) {
 		IOLockFree(fLock);
 		fLock = 0;
@@ -730,6 +786,21 @@ IOReturn RadeonNIAccel::regRead(UInt32 offset, UInt32 *value)
 	return kIOReturnSuccess;
 }
 
+IOReturn RadeonNIAccel::waitForCPU(void)
+{
+	UInt32 fence;
+
+	IOLockLock(fLock);
+	if (!fEngineUp) {
+		IOLockUnlock(fLock);
+		return kIOReturnNotReady;
+	}
+	fence = fAccel.fence_emitted;
+	IOLockUnlock(fLock);
+	/* Surface imports do not yet carry a per-surface producer fence. */
+	return fenceWait(fence, 2000) ? kIOReturnSuccess : kIOReturnTimeout;
+}
+
 void RadeonNIAccel::syncForCPU(void)
 {
 	IOLockLock(fLock);
@@ -737,27 +808,59 @@ void RadeonNIAccel::syncForCPU(void)
 	IOLockUnlock(fLock);
 }
 
-void RadeonNIAccel::setSurfaceRegion(UInt32 wid, const IOAccelDeviceRegion *rgn,
+/* fLock held. Existing records survive a failed expansion. */
+int RadeonNIAccel::surfaceSlot(UInt32 wid, bool create)
+{
+	int empty = -1;
+	for (UInt32 i = 0; i < fShapeCapacity; ++i) {
+		if (fShapes[i].used && fShapes[i].wid == wid) return i;
+		if (!fShapes[i].used && empty < 0) empty = i;
+	}
+	if (!create || empty >= 0) return create ? empty : -1;
+	UInt32 capacity = fShapeCapacity ? fShapeCapacity * 2 : 32;
+	if (capacity <= fShapeCapacity || capacity > 0x7fffffffU / sizeof(*fShapes))
+		return -1;
+	SurfaceRecord *records = (SurfaceRecord *)IOMalloc(capacity * sizeof(*records));
+	if (!records) return -1;
+	bzero(records, capacity * sizeof(*records));
+	if (fShapes) {
+		bcopy(fShapes, records, fShapeCapacity * sizeof(*records));
+		IOFree(fShapes, fShapeCapacity * sizeof(*fShapes));
+	}
+	empty = fShapeCapacity;
+	fShapes = records;
+	fShapeCapacity = capacity;
+	return empty;
+}
+
+void RadeonNIAccel::querySurface(UInt32 wid, struct rdn_user_surface_info *info)
+{
+	bzero(info, sizeof(*info));
+	IOLockLock(fLock);
+	int slot = surfaceSlot(wid, false);
+	if (slot >= 0) {
+		info->id = wid;
+		info->offset = fShapes[slot].bufOffset;
+		info->row_bytes = fShapes[slot].bufRowBytes;
+		info->width = fShapes[slot].bufWidth;
+		info->height = fShapes[slot].bufHeight;
+	}
+	IOLockUnlock(fLock);
+}
+
+bool RadeonNIAccel::setSurfaceRegion(UInt32 wid, const IOAccelDeviceRegion *rgn,
 				     UInt32 rects)
 {
-	int i, slot = -1;
+	int slot;
 	UInt32 r;
 
 	IOLockLock(fLock);
-	for (i = 0; i < kMaxSurfaces; i++) {
-		if (fShapes[i].used && fShapes[i].wid == wid) {
-			slot = i;
-			break;
-		}
-		if (!fShapes[i].used && slot < 0)
-			slot = i;
-	}
+	slot = surfaceSlot(wid, true);
 	if (slot >= 0) {
 		struct rdn_user_region *region = &fShapes[slot].region;
 
 		if (!fShapes[slot].used) {
-			fShapes[slot].bufWidth = 0;
-			fShapes[slot].gl = false;
+			bzero(&fShapes[slot], sizeof(fShapes[slot]));
 		}
 		fShapes[slot].used = true;
 		fShapes[slot].wid = wid;
@@ -774,6 +877,7 @@ void RadeonNIAccel::setSurfaceRegion(UInt32 wid, const IOAccelDeviceRegion *rgn,
 		}
 	}
 	IOLockUnlock(fLock);
+	return slot >= 0;
 }
 
 bool RadeonNIAccel::getSurfaceRegion(UInt32 wid, struct rdn_user_region *region)
@@ -782,7 +886,7 @@ bool RadeonNIAccel::getSurfaceRegion(UInt32 wid, struct rdn_user_region *region)
 	int i;
 
 	IOLockLock(fLock);
-	for (i = 0; i < kMaxSurfaces && !found; i++) {
+	for (i = 0; i < fShapeCapacity && !found; i++) {
 		if (!fShapes[i].used || fShapes[i].wid != wid)
 			continue;
 		*region = fShapes[i].region;
@@ -792,34 +896,31 @@ bool RadeonNIAccel::getSurfaceRegion(UInt32 wid, struct rdn_user_region *region)
 	return found;
 }
 
-void RadeonNIAccel::setSurfaceBuffer(UInt32 wid, UInt32 offset, UInt32 rowBytes,
-				     UInt32 width, UInt32 height)
+bool RadeonNIAccel::setSurfaceBuffer(UInt32 wid, UInt32 offset, UInt32 rowBytes,
+				     UInt32 width, UInt32 height, void *owner)
 {
-	int i, slot = -1;
+	int slot;
 
 	IOLockLock(fLock);
-	for (i = 0; i < kMaxSurfaces; i++) {
-		if (fShapes[i].used && fShapes[i].wid == wid) {
-			slot = i;
-			break;
-		}
-		if (!fShapes[i].used && slot < 0)
-			slot = i;
-	}
+	slot = surfaceSlot(wid, true);
 	if (slot >= 0) {
 		/* The owner may be first: the shape then comes later. */
 		if (!fShapes[slot].used) {
+			bzero(&fShapes[slot], sizeof(fShapes[slot]));
 			fShapes[slot].used = true;
 			fShapes[slot].wid = wid;
 			bzero(&fShapes[slot].region, sizeof(fShapes[slot].region));
 		}
 		fShapes[slot].gl = true;
+		if (!fShapes[slot].owner || width)
+			fShapes[slot].owner = owner;
 		fShapes[slot].bufOffset = offset;
 		fShapes[slot].bufRowBytes = rowBytes;
 		fShapes[slot].bufWidth = width;
 		fShapes[slot].bufHeight = height;
 	}
 	IOLockUnlock(fLock);
+	return slot >= 0;
 }
 
 bool RadeonNIAccel::getSurfaceBuffer(UInt32 wid, UInt32 *offset, UInt32 *rowBytes,
@@ -829,7 +930,7 @@ bool RadeonNIAccel::getSurfaceBuffer(UInt32 wid, UInt32 *offset, UInt32 *rowByte
 	int i;
 
 	IOLockLock(fLock);
-	for (i = 0; i < kMaxSurfaces && !found; i++) {
+	for (i = 0; i < fShapeCapacity && !found; i++) {
 		if (!fShapes[i].used || fShapes[i].wid != wid ||
 		    !fShapes[i].bufWidth)
 			continue;
@@ -843,13 +944,47 @@ bool RadeonNIAccel::getSurfaceBuffer(UInt32 wid, UInt32 *offset, UInt32 *rowByte
 	return found;
 }
 
+bool RadeonNIAccel::setSurfaceBacking(UInt32 wid, task_t task,
+                                     const struct rdn_user_backing *backing)
+{
+	int slot = -1;
+	IOLockLock(fLock);
+	slot = surfaceSlot(wid, true);
+	if (slot >= 0) {
+		if (!fShapes[slot].used) bzero(&fShapes[slot], sizeof(fShapes[slot]));
+		fShapes[slot].used = true;
+		fShapes[slot].wid = wid;
+		fShapes[slot].backingTask = task;
+		fShapes[slot].backing = *backing;
+	}
+	IOLockUnlock(fLock);
+	return slot >= 0;
+}
+
+bool RadeonNIAccel::getSurfaceBacking(UInt32 wid, task_t task,
+                                     struct rdn_user_backing *backing)
+{
+	bool found = false;
+	IOLockLock(fLock);
+	for (int i = 0; i < fShapeCapacity; ++i) {
+		if (fShapes[i].used && fShapes[i].wid == wid &&
+		    fShapes[i].backingTask == task && fShapes[i].backing.width) {
+			*backing = fShapes[i].backing;
+			found = true;
+			break;
+		}
+	}
+	IOLockUnlock(fLock);
+	return found;
+}
+
 bool RadeonNIAccel::isGLSurface(UInt32 wid)
 {
 	bool found = false;
 	int i;
 
 	IOLockLock(fLock);
-	for (i = 0; i < kMaxSurfaces && !found; i++)
+	for (i = 0; i < fShapeCapacity && !found; i++)
 		found = fShapes[i].used && fShapes[i].wid == wid && fShapes[i].gl;
 	IOLockUnlock(fLock);
 	return found;
@@ -861,7 +996,7 @@ void RadeonNIAccel::listSurfaces(struct rdn_user_surfaces *list)
 
 	list->count = 0;
 	IOLockLock(fLock);
-	for (i = 0; i < kMaxSurfaces && list->count < RDN_USER_SURFACES; i++) {
+	for (i = 0; i < fShapeCapacity && list->count < RDN_USER_SURFACES; i++) {
 		if (!fShapes[i].used || !fShapes[i].bufWidth)
 			continue;
 		list->surface[list->count].id = fShapes[i].wid;
@@ -901,7 +1036,7 @@ IOReturn RadeonNIAccel::flushSurface(UInt32 wid)
 		return kIOReturnSuccess;
 	bzero(&src, sizeof(src));
 	IOLockLock(fLock);
-	for (i = 0; i < kMaxSurfaces; i++) {
+	for (i = 0; i < fShapeCapacity; i++) {
 		if (!fShapes[i].used || fShapes[i].wid != wid ||
 		    !fShapes[i].bufWidth)
 			continue;
@@ -980,9 +1115,9 @@ void RadeonNIAccel::forgetSurface(UInt32 wid)
 	int i;
 
 	IOLockLock(fLock);
-	for (i = 0; i < kMaxSurfaces; i++)
+	for (i = 0; i < fShapeCapacity; i++)
 		if (fShapes[i].used && fShapes[i].wid == wid)
-			fShapes[i].used = false;
+			bzero(&fShapes[i], sizeof(fShapes[i]));
 	IOLockUnlock(fLock);
 }
 
@@ -1269,16 +1404,10 @@ bool RadeonNIUserClient::start(IOService *provider)
 
 void RadeonNIUserClient::freeAll(void)
 {
-	UInt32 i;
-
 	if (!fAccel || !fOffsets)
 		return;
-	/* Whatever the client still has queued must be done with the memory. */
-	fAccel->syncForCPU();
-	for (i = 0; i < fCount; i++)
-		fAccel->freeVram(fOffsets[i]);
+	fAccel->releaseClientMemory(fOffsets, fCount, this);
 	fCount = 0;
-	fAccel->gartUnbindAll(this);
 }
 
 IOReturn RadeonNIUserClient::clientClose(void)
@@ -1345,6 +1474,12 @@ IOExternalMethod *RadeonNIUserClient::getTargetAndMethodForIndex(
 		  kIOUCScalarIScalarO, 5, 1 },
 		{ 0, (IOMethod)&RadeonNIUserClient::methodScreenCopy,
 		  kIOUCScalarIScalarO, 5, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodGartBind64,
+		  kIOUCScalarIScalarO, 3, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodSurfaceBacking,
+		  kIOUCScalarIStructO, 1, sizeof(struct rdn_user_backing) },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodSurfaceQuery,
+		  kIOUCScalarIStructO, 1, sizeof(struct rdn_user_surface_info) },
 	};
 
 	if (index >= RDN_UC_METHOD_COUNT)
@@ -1376,6 +1511,15 @@ IOReturn RadeonNIUserClient::methodGetInfo(struct rdn_user_info *info,
 	if (*size < sizeof(*info))
 		return kIOReturnBadArgument;
 	fAccel->getInfo(info);
+	*size = sizeof(*info);
+	return kIOReturnSuccess;
+}
+
+IOReturn RadeonNIUserClient::methodSurfaceQuery(UInt32 wid,
+	struct rdn_user_surface_info *info, IOByteCount *size)
+{
+	if (!info || !size || *size < sizeof(*info)) return kIOReturnBadArgument;
+	fAccel->querySurface(wid, info);
 	*size = sizeof(*info);
 	return kIOReturnSuccess;
 }
@@ -1423,6 +1567,12 @@ IOReturn RadeonNIUserClient::methodGartBind(UInt32 address, UInt32 size,
 					    UInt32 *offset)
 {
 	return fAccel->gartBind(fTask, address, size, this, offset);
+}
+
+IOReturn RadeonNIUserClient::methodGartBind64(UInt32 low, UInt32 high,
+                                                UInt32 size, UInt32 *offset)
+{
+	return fAccel->gartBind(fTask, ((UInt64)high << 32) | low, size, this, offset);
 }
 
 IOReturn RadeonNIUserClient::methodGartUnbind(UInt32 offset)
@@ -1518,12 +1668,17 @@ IOReturn RadeonNIUserClient::methodSurfaceList(struct rdn_user_surfaces *list,
 IOReturn RadeonNIUserClient::methodSurfaceBuffer(UInt32 wid, UInt32 offset,
 	UInt32 rowBytes, UInt32 width, UInt32 height)
 {
+	/* Release reservations even when the pbuffer never attached. */
+	if (offset == 0xffffffffU && !rowBytes && !width && !height) {
+		fAccel->forgetSurface(wid);
+		return kIOReturnSuccess;
+	}
 	/* Inside the aperture, or nothing. */
 	if (width && ((UInt64)offset + (UInt64)rowBytes * height >
 		      fAccel->apertureBytes() || rowBytes < width * 4))
 		return kIOReturnBadArgument;
-	fAccel->setSurfaceBuffer(wid, offset, rowBytes, width, height);
-	return kIOReturnSuccess;
+	return fAccel->setSurfaceBuffer(wid, offset, rowBytes, width, height, this)
+		? kIOReturnSuccess : kIOReturnNoResources;
 }
 
 IOReturn RadeonNIUserClient::methodSurfaceRegion(UInt32 wid,
@@ -1534,5 +1689,14 @@ IOReturn RadeonNIUserClient::methodSurfaceRegion(UInt32 wid,
 	if (!fAccel->getSurfaceRegion(wid, region))
 		return kIOReturnNotFound;
 	*size = sizeof(*region);
+	return kIOReturnSuccess;
+}
+
+IOReturn RadeonNIUserClient::methodSurfaceBacking(UInt32 wid,
+	struct rdn_user_backing *backing, IOByteCount *size)
+{
+	if (!backing || !size || *size < sizeof(*backing)) return kIOReturnBadArgument;
+	if (!fAccel->getSurfaceBacking(wid, fTask, backing)) return kIOReturnNotFound;
+	*size = sizeof(*backing);
 	return kIOReturnSuccess;
 }

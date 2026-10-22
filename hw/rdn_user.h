@@ -44,7 +44,8 @@ enum {
 	 * height. Where the surface's picture is kept: a linear buffer of
 	 * 32-bit pixels, top row first, which the kext shows to whoever
 	 * locks the surface for reading (the window server). Width 0 takes
-	 * the buffer away again.
+	 * the buffer away again. Offset UINT32_MAX with the other fields zero
+	 * releases the registration, including an unattached reservation.
 	 */
 	RDN_UC_SURFACE_BUFFER,
 	/* struct out: struct rdn_user_surfaces, every surface with a buffer */
@@ -119,6 +120,12 @@ enum {
 	 * RDN_UC_SCREEN_FILL.
 	 */
 	RDN_UC_SCREEN_COPY,
+	/* scalars in: address low/high words, byte length; out: GART offset. */
+	RDN_UC_GART_BIND64,
+	/* Surface backing metadata, restricted to its owning task. */
+	RDN_UC_SURFACE_BACKING,
+	/* scalar in: surface ID; out: metadata, with id 0 when absent. */
+	RDN_UC_SURFACE_QUERY,
 	RDN_UC_METHOD_COUNT
 };
 
@@ -126,6 +133,14 @@ enum {
 #define RDN_UC_POWER_PERFORMANCE	1	/* the PowerPlay table's fastest */
 #define RDN_UC_POWER_BOOT		2	/* what ASIC_Init leaves */
 #define RDN_UC_TEMPERATURE_BIAS		1000000
+
+struct rdn_user_backing {
+	uint32_t address_lo, address_hi, row_bytes, width, height;
+};
+
+struct rdn_user_surface_info {
+	uint32_t id, offset, row_bytes, width, height;
+};
 
 struct rdn_user_info {
 	uint32_t version;		/* RDN_USER_VERSION */

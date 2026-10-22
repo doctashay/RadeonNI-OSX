@@ -13,7 +13,7 @@
 #include <sys/time.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
-#include <IOKit/IOKitLib.h>
+#include "rdn_iokit.h"
 
 #include "rdn_device.h"
 #include "hw/rdn_user.h"
@@ -51,6 +51,35 @@ struct darwin_device {
 	struct gart_chunk gart[GART_CHUNKS];
 	uint32_t gart_bytes;
 };
+
+static bool has_u4_pcie_parent(io_registry_entry_t service)
+{
+	io_registry_entry_t entry = service, parent;
+	bool found = false;
+	unsigned depth;
+
+	IOObjectRetain(entry);
+	for (depth = 0; depth < 32; depth++) {
+		CFTypeRef value = IORegistryEntryCreateCFProperty(entry,
+			CFSTR("compatible"), kCFAllocatorDefault, 0);
+		if (value && CFGetTypeID(value) == CFDataGetTypeID()) {
+			const UInt8 *data = CFDataGetBytePtr((CFDataRef)value);
+			CFIndex length = CFDataGetLength((CFDataRef)value), at;
+			for (at = 0; at + 8 <= length; at++) {
+				if ((!at || !data[at - 1]) && !memcmp(data + at, "u4-pcie", 8))
+					found = true;
+			}
+		}
+		if (value)
+			CFRelease(value);
+		if (found || IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent))
+			break;
+		IOObjectRelease(entry);
+		entry = parent;
+	}
+	IOObjectRelease(entry);
+	return found;
+}
 
 static int dev_alloc(struct rdn_device *dev, uint64_t size, uint64_t align,
 		     uint64_t *offset)
@@ -92,6 +121,18 @@ static void mem_os_free(void *cookie, void *ptr)
 	free(ptr);
 }
 
+static int bind_address(struct darwin_device *d, uintptr_t address,
+                        uint32_t bytes, int *offset)
+{
+#ifdef __LP64__
+	return IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_BIND64, 3, 1,
+		(uint32_t)address, (uint32_t)(address >> 32), bytes, offset);
+#else
+	return IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_BIND, 2, 1,
+		(uint32_t)address, bytes, offset);
+#endif
+}
+
 /* A new chunk of at least `size` bytes in a free slot; NULL if there is none. */
 static struct gart_chunk *gart_new_chunk(struct darwin_device *d, uint64_t size,
 					 uint64_t align)
@@ -128,8 +169,7 @@ static struct gart_chunk *gart_new_chunk(struct darwin_device *d, uint64_t size,
 		return NULL;
 	}
 	{
-		int br = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_BIND, 2, 1,
-						       (int)addr, (int)bytes, &offset);
+		int br = bind_address(d, addr, bytes, &offset);
 
 		if (br || rdn_mem_init(&c->mem, &d->mem_os, (uint32_t)offset, bytes)) {
 			if (getenv("RDN_STATS"))
@@ -281,8 +321,7 @@ static int dev_gart_bind_user(struct rdn_device *dev, void *address, uint64_t si
 
 	if (((uintptr_t)address & 4095) || (size & 4095) || !size ||
 	    size > GART_MOST_BYTES - d->gart_bytes ||
-	    IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_BIND, 2, 1,
-					  (int)(uintptr_t)address, (int)size, &at))
+	    bind_address(d, (uintptr_t)address, (uint32_t)size, &at))
 		return -1;
 	d->gart_bytes += (uint32_t)size;
 	*offset = (uint32_t)at;
@@ -469,6 +508,27 @@ static bool dev_surface_region(struct rdn_device *dev, uint32_t id,
 	return true;
 }
 
+static bool dev_surface_backing(struct rdn_device *dev, uint32_t id,
+                                void **address, uint32_t *stride,
+                                uint32_t *width, uint32_t *height)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	struct rdn_user_backing b;
+	IOByteCount size = sizeof(b);
+	if (IOConnectMethodScalarIStructureO(d->conn, RDN_UC_SURFACE_BACKING, 1,
+	                                    &size, (int)id, &b) || size != sizeof(b))
+		return false;
+	uint64_t ptr = ((uint64_t)b.address_hi << 32) | b.address_lo;
+	if (!ptr || ptr > UINTPTR_MAX || !b.width || !b.height ||
+	    b.width > 16384 || b.height > 16384 || b.row_bytes < b.width * 4)
+		return false;
+	*address = (void *)(uintptr_t)ptr;
+	*stride = b.row_bytes;
+	*width = b.width;
+	*height = b.height;
+	return true;
+}
+
 static bool dev_surface_buffer(struct rdn_device *dev, uint32_t id,
 			       uint64_t offset, uint32_t row_bytes,
 			       uint32_t width, uint32_t height)
@@ -480,17 +540,17 @@ static bool dev_surface_buffer(struct rdn_device *dev, uint32_t id,
 					     (int)width, (int)height) == 0;
 }
 
-static uint32_t dev_surface_list(struct rdn_device *dev, struct rdn_surface *list,
+static int dev_surface_list(struct rdn_device *dev, struct rdn_surface *list,
 				 uint32_t max)
 {
 	struct darwin_device *d = (struct darwin_device *)dev;
-	static struct rdn_user_surfaces s;
+	struct rdn_user_surfaces s;
 	IOByteCount size = sizeof(s);
 	uint32_t i;
 
 	if (IOConnectMethodScalarIStructureO(d->conn, RDN_UC_SURFACE_LIST, 0,
 					     &size, &s))
-		return 0;
+		return -1;
 	for (i = 0; i < s.count && i < max && i < RDN_USER_SURFACES; i++) {
 		list[i].id = s.surface[i].id;
 		list[i].offset = s.surface[i].offset;
@@ -499,6 +559,43 @@ static uint32_t dev_surface_list(struct rdn_device *dev, struct rdn_surface *lis
 		list[i].height = s.surface[i].height;
 	}
 	return i;
+}
+
+static bool dev_surface_query(struct rdn_device *dev, uint32_t id,
+                              struct rdn_surface *surface, bool *found)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	struct rdn_user_surface_info info;
+	IOByteCount size = sizeof(info);
+	kern_return_t ret;
+
+	*found = false;
+	memset(surface, 0, sizeof(*surface));
+	ret = IOConnectMethodScalarIStructureO(d->conn, RDN_UC_SURFACE_QUERY, 1,
+	                                      &size, (int)id, &info);
+	if (ret == kIOReturnUnsupported) {
+		/* Older kernels have only the original 32-slot registry. */
+		struct rdn_surface list[RDN_USER_SURFACES];
+		int n = dev_surface_list(dev, list, RDN_USER_SURFACES);
+		if (n < 0) return false;
+		for (int i = 0; i < n; ++i) {
+			if (list[i].id == id) {
+				*surface = list[i];
+				*found = true;
+				break;
+			}
+		}
+		return true;
+	}
+	if (ret || size != sizeof(info) || (info.id && info.id != id))
+		return false;
+	surface->id = info.id;
+	surface->offset = info.offset;
+	surface->row_bytes = info.row_bytes;
+	surface->width = info.width;
+	surface->height = info.height;
+	*found = info.id != 0;
+	return true;
 }
 
 static uint32_t dev_surface_locked(struct rdn_device *dev)
@@ -526,8 +623,13 @@ struct rdn_device *rdn_device_open(void)
 	struct rdn_user_info info;
 	IOByteCount size = sizeof(info);
 	io_service_t service;
+#ifdef __LP64__
+	mach_vm_address_t addr = 0;
+	mach_vm_size_t len = 0;
+#else
 	vm_address_t addr = 0;
 	vm_size_t len = 0;
+#endif
 	kern_return_t kr;
 
 	if (!d)
@@ -539,6 +641,8 @@ struct rdn_device *rdn_device_open(void)
 		goto fail;
 	}
 	kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE, &d->conn);
+	if (has_u4_pcie_parent(service))
+		d->base.info.cp_dma_gtt_copy_max_bytes = 128;
 	IOObjectRelease(service);
 	if (kr) {
 		fprintf(stderr, "rdn: cannot open the accelerator (0x%x)\n", kr);
@@ -615,9 +719,11 @@ struct rdn_device *rdn_device_open(void)
 	d->base.sync_for_cpu = dev_sync_for_cpu;
 	d->base.destroy = dev_destroy;
 	d->base.surface_region = dev_surface_region;
+	d->base.surface_backing = dev_surface_backing;
 	d->base.screen_refresh = dev_screen_refresh;
 	d->base.surface_buffer = dev_surface_buffer;
 	d->base.surface_list = dev_surface_list;
+	d->base.surface_query = dev_surface_query;
 	d->base.surface_locked = dev_surface_locked;
 	return &d->base;
 

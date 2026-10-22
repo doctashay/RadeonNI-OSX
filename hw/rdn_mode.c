@@ -30,7 +30,7 @@ static bool dtd_mode(const uint8_t *d, struct rdn_mode *mode)
 	clock = (uint32_t)(d[0] | (d[1] << 8)) * 10;
 	if (!clock)
 		return false;
-	/* No interlaced scanning here, and no pixel clock a single link cannot carry. */
+	/* Keep progressive timings within the supported pixel-clock range. */
 	if ((d[17] & 0x80) || clock > RDN_MODE_MAX_CLOCK)
 		return false;
 

@@ -13,6 +13,9 @@ SLE=/System/Library/Extensions
 
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo ./uninstall.sh" >&2; exit 1; }
 
+rm -f /Library/LaunchAgents/org.radeonni.activate-qe.plist
+rm -rf "/Library/Application Support/RadeonNI/ActivateQE.app"
+
 for b in RadeonNIGLDriver.bundle RadeonNIGA.plugin; do
     if [ -d "$SLE/$b" ]; then
         rm -rf "$SLE/$b"

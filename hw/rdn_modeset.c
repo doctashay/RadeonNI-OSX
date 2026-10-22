@@ -294,6 +294,16 @@ static bool output_is_dp(struct rdn_card *card)
 	return card_output(card)->displayport && card->dp.sink;
 }
 
+/* Dual-link DVI uses both halves of one UNIPHY above 165 MHz. */
+bool rdn_output_is_duallink(struct rdn_card *card, const struct rdn_mode *mode)
+{
+	const struct rdn_output *out = card_output(card);
+
+	return !out->displayport && mode->clock > 165000 &&
+	       (out->connector_id == CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_I ||
+	        out->connector_id == CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_D);
+}
+
 /*
  * radeon_atom_pick_pll() for DCE5: the DCPLL clocks every DisplayPort link
  * when the board has no external clock for that, as this one has not.
@@ -659,7 +669,8 @@ static uint32_t adjust_pll(struct rdn_card *card, const struct rdn_mode *mode,
 	ps_le16(&ps, 0, (output_is_dp(card) ? card->dp.rate : mode->clock) / 10);
 	ps_u8(&ps, 2, card_output(card)->transmitter_id); /* ucTransmitterID */
 	ps_u8(&ps, 3, encoder_mode);			/* ucEncodeMode */
-	ps_u8(&ps, 4, DISPPLL_CONFIG_COHERENT_MODE);	/* ucDispPllConfig */
+	ps_u8(&ps, 4, DISPPLL_CONFIG_COHERENT_MODE |
+	      (rdn_output_is_duallink(card, mode) ? DISPPLL_CONFIG_DUAL_LINK : 0));	/* ucDispPllConfig */
 	ps_u8(&ps, 5, 0);				/* ucExtTransmitterID */
 	if (ps_exec(card, index, &ps))
 		return 0;
@@ -1084,7 +1095,7 @@ static int dig_encoder_setup(struct rdn_card *card, const struct rdn_mode *mode,
 		ps_u8(&ps, 5, dp ? card->dp.lanes : 0);	/* ucLaneNum */
 	} else {
 		ps_u8(&ps, 4, encoder_mode);		/* ucEncoderMode */
-		ps_u8(&ps, 5, dp ? card->dp.lanes : 4);	/* ucLaneNum */
+		ps_u8(&ps, 5, dp ? card->dp.lanes : rdn_output_is_duallink(card, mode) ? 8 : 4);	/* ucLaneNum */
 	}
 	ps_u8(&ps, 6, PANEL_8BIT_PER_COLOR);		/* ucBitPerColor */
 	ps_u8(&ps, 7, out->hpd + 1);			/* ucHPD_ID */
@@ -1112,6 +1123,8 @@ static int dig_transmitter_setup(struct rdn_card *card,
 
 	if (cmd_table_check(card, index, "UNIPHYTransmitterControl", 1, 4))
 		return -EINVAL;
+	if (rdn_output_is_duallink(card, mode))
+		config |= ATOM_TRANSMITTER_CONFIG_V4_DUAL_LINK_CONNECTOR;
 	config |= 1 << 1;				/* fCoherentMode */
 	if (out->linkb)
 		config |= 1 << 2;			/* ucLinkSel */
@@ -1124,11 +1137,12 @@ static int dig_transmitter_setup(struct rdn_card *card,
 		ps_u8(&ps, 1, lane_set);		/* asMode.ucLaneSet */
 	} else {
 		/* usPixelClock */
-		ps_le16(&ps, 0, (dp ? card->dp.rate : mode->clock) / 10);
+		ps_le16(&ps, 0, (dp ? card->dp.rate :
+			 rdn_output_is_duallink(card, mode) ? mode->clock / 2 : mode->clock) / 10);
 	}
 	ps_u8(&ps, 2, config);				/* acConfig */
 	ps_u8(&ps, 3, action);				/* ucAction */
-	ps_u8(&ps, 4, dp ? card->dp.lanes : 4);		/* ucLaneNum */
+	ps_u8(&ps, 4, dp ? card->dp.lanes : rdn_output_is_duallink(card, mode) ? 8 : 4);		/* ucLaneNum */
 	return ps_exec(card, index, &ps);
 }
 
@@ -1363,6 +1377,13 @@ int rdn_modeset(struct rdn_card *card, const struct rdn_mode *mode,
 	struct rdn_pll pll;
 	int r;
 
+	if (!dp && mode->clock > 165000 &&
+	    (hdmi || !rdn_output_is_duallink(card, mode) || mode->clock > 330000))
+		return -EINVAL;
+	if (rdn_output_is_duallink(card, mode))
+		rdn_log(card->os, RDN_LOG_INFO,
+			"dual-link DVI: pixel clock %u kHz, link clock %u kHz, 8 lanes",
+			(unsigned)mode->clock, (unsigned)mode->clock / 2);
 	if (out->displayport && !dp) {
 		rdn_log(card->os, RDN_LOG_ERROR,
 			"%s: no DisplayPort sink was detected", out->name);

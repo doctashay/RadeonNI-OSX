@@ -142,6 +142,14 @@ package() {
         cp "$root/gld/Info.plist" "$stage/RadeonNIGLDriver.bundle/Contents/Info.plist"
         cp "$root/build/relink/RadeonNIGLDriver.dylib" "$stage/RadeonNIGLDriver.bundle/Contents/MacOS/RadeonNIGLDriver"
         chmod 755 "$stage/RadeonNIGLDriver.bundle/Contents/MacOS/RadeonNIGLDriver"
+        if [ "${LEOPARD_NATIVE:-0}" = 1 ]; then
+            tar -C "$root/g5" -cf - activate-qe.m | gssh 'mkdir -p ~/osx-gpu-qe && tar -C ~/osx-gpu-qe -xf - && gcc-4.0 -arch ppc -o ~/osx-gpu-qe/activate-qe ~/osx-gpu-qe/activate-qe.m -framework Cocoa -framework QuartzCore'
+            mkdir -p "$stage/ActivateQE.app/Contents/MacOS"
+            gssh 'tar -C ~/osx-gpu-qe -cf - activate-qe' | tar -C "$stage/ActivateQE.app/Contents/MacOS" -xf -
+            chmod 755 "$stage/ActivateQE.app/Contents/MacOS/activate-qe"
+            cp "$root/g5/ActivateQE-Info.plist" "$stage/ActivateQE.app/Contents/Info.plist"
+            cp "$root/g5/org.radeonni.activate-qe.plist" "$stage/"
+        fi
         "$root/scripts/fetch-firmware.sh" > /dev/null
         cp "$root/firmware/TURKS_pfp.bin" "$root/firmware/TURKS_me.bin" "$root/firmware/TURKS_mc.bin" \
            "$root/firmware/LICENSE.radeon" "$stage/"

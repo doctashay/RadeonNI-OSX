@@ -1,0 +1,130 @@
+--- a/src/gallium/auxiliary/util/u_vbuf.c
++++ b/src/gallium/auxiliary/util/u_vbuf.c
+@@ -462,6 +462,8 @@
+    struct translate *tr;
+    struct pipe_transfer *vb_transfer[PIPE_MAX_ATTRIBS] = {0};
+    struct pipe_resource *out_buffer = NULL;
++   struct pipe_transfer *index_transfer = NULL;
++   enum pipe_error result = PIPE_OK;
+    uint8_t *out_map;
+    unsigned out_offset, mask;
+ 
+@@ -525,6 +527,8 @@
+ 
+          map = pipe_buffer_map_range(mgr->pipe, vb->buffer.resource, offset, size,
+                                      PIPE_MAP_READ, &vb_transfer[i]);
++         if (!map)
++            goto fail;
+       }
+ 
+       /* Subtract min_index so that indexing with the index buffer works. */
+@@ -537,7 +541,6 @@
+ 
+    /* Translate. */
+    if (unroll_indices) {
+-      struct pipe_transfer *transfer = NULL;
+       const unsigned offset = draw->start * info->index_size;
+       uint8_t *map;
+ 
+@@ -547,14 +550,16 @@
+                      &out_offset, &out_buffer, releasebuf,
+                      (void**)&out_map);
+       if (!out_buffer)
+-         return PIPE_ERROR_OUT_OF_MEMORY;
++         goto fail;
+ 
+       if (info->has_user_indices) {
+          map = (uint8_t*)info->index.user + offset;
+       } else {
+          map = pipe_buffer_map_range(mgr->pipe, info->index.resource, offset,
+                                      draw->count * info->index_size,
+-                                     PIPE_MAP_READ, &transfer);
++                                     PIPE_MAP_READ, &index_transfer);
++         if (!map)
++            goto fail;
+       }
+ 
+       switch (info->index_size) {
+@@ -569,9 +574,6 @@
+          break;
+       }
+ 
+-      if (transfer) {
+-         pipe_buffer_unmap(mgr->pipe, transfer);
+-      }
+    } else {
+       /* Create and map the output buffer. */
+       u_upload_alloc(mgr->pipe->stream_uploader,
+@@ -581,12 +583,16 @@
+                      &out_offset, &out_buffer, releasebuf,
+                      (void**)&out_map);
+       if (!out_buffer)
+-         return PIPE_ERROR_OUT_OF_MEMORY;
++         goto fail;
+ 
+       out_offset -= key->output_stride * start_vertex;
+ 
+       tr->run(tr, 0, num_vertices, 0, 0, out_map);
+    }
++
++out:
++   if (index_transfer)
++      pipe_buffer_unmap(mgr->pipe, index_transfer);
+ 
+    /* Unmap all buffers. */
+    mask = vb_mask;
+@@ -598,6 +604,9 @@
+       }
+    }
+ 
++   if (result != PIPE_OK)
++      return result;
++
+    /* Setup the new vertex buffer. */
+    mgr->real_vertex_buffer[out_vb].buffer_offset = out_offset;
+ 
+@@ -606,6 +615,10 @@
+    mgr->real_vertex_buffer[out_vb].is_user_buffer = false;
+ 
+    return PIPE_OK;
++
++fail:
++   result = PIPE_ERROR_OUT_OF_MEMORY;
++   goto out;
+ }
+ 
+ static bool
+@@ -677,6 +690,8 @@
+    memcpy(mgr->fallback_vbs, fallback_vbs, sizeof(fallback_vbs));
+    return true;
+ }
++
++static void u_vbuf_translate_end(struct u_vbuf *mgr);
+ 
+ static bool
+ u_vbuf_translate_begin(struct u_vbuf *mgr,
+@@ -804,8 +819,10 @@
+                                         mask[type], mgr->fallback_vbs[type],
+                                         start[type], num[type], min_index,
+                                         unroll_indices && type == VB_VERTEX, releasebuf);
+-         if (err != PIPE_OK)
++         if (err != PIPE_OK) {
++            u_vbuf_translate_end(mgr);
+             return false;
++         }
+       }
+    }
+ 
+@@ -1763,11 +1780,11 @@
+          drawid_offset++;
+    }
+ 
++out:
+    if (mgr->using_translate) {
+       u_vbuf_translate_end(mgr);
+    }
+ 
+-out:
+    pipe_resource_release(pipe, releasebuf);
+    for (unsigned i = 0; i < release_count; i++)
+       pipe_resource_release(pipe, releasebufs[i]);

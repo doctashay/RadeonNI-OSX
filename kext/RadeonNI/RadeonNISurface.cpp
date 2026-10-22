@@ -8,6 +8,7 @@
 #include <IOKit/IOLib.h>
 #include <libkern/libkern.h>
 #include <stdarg.h>
+#include <stddef.h>
 
 #include "RadeonNIAccel.h"
 #include "RadeonNISurface.h"
@@ -49,7 +50,8 @@ bool RadeonNISurfaceClient::initWithTask(task_t owningTask, void *securityID,
 	if (!super::initWithTask(owningTask, securityID, type))
 		return false;
 	fTask = owningTask;
-	return true;
+	fBackingLock = IOLockAlloc();
+	return fBackingLock != NULL;
 }
 
 /*
@@ -62,6 +64,8 @@ IOReturn RadeonNISurfaceClient::lockForRead(IOAccelSurfaceInformation *info,
 					    IOByteCount *size)
 {
 	UInt32 offset, rowBytes, width, height, start, length;
+	uint64_t end;
+	IOReturn ret;
 	IOMemoryDescriptor *aperture;
 
 	if (!info || !size || *size < sizeof(*info))
@@ -71,16 +75,22 @@ IOReturn RadeonNISurfaceClient::lockForRead(IOAccelSurfaceInformation *info,
 	aperture = fAccel->apertureMemory();
 	if (!aperture)
 		return kIOReturnNotReady;
+	end = (uint64_t)offset + (uint64_t)rowBytes * height;
+	if (!width || !height || (uint64_t)width * 4 > rowBytes ||
+	    end > aperture->getLength() || end > 0xffffffffULL - PAGE_SIZE + 1)
+		return kIOReturnBadArgument;
+	ret = fAccel->waitForCPU();
+	if (ret != kIOReturnSuccess)
+		return ret;
 	unlockRead();
 	start = offset & ~(UInt32)(PAGE_SIZE - 1);
-	length = (offset - start + rowBytes * height + PAGE_SIZE - 1) &
-		 ~(UInt32)(PAGE_SIZE - 1);
+	length = ((UInt32)(end + PAGE_SIZE - 1) & ~(UInt32)(PAGE_SIZE - 1)) - start;
+	if ((uint64_t)start + length > aperture->getLength())
+		return kIOReturnBadArgument;
 	fReadMap = aperture->map(fTask, 0, kIOMapAnywhere | kIOMapReadOnly,
 				 start, length);
 	if (!fReadMap)
 		return kIOReturnNoMemory;
-	/* What the GPU drew must be what the CPU reads. */
-	fAccel->syncForCPU();
 	bzero(info, sizeof(*info));
 	info->address[0] = fReadMap->getVirtualAddress() + (offset - start);
 	info->rowBytes = rowBytes;
@@ -122,11 +132,14 @@ IOReturn RadeonNISurfaceClient::clientClose(void)
 	      this, (unsigned long)fWid, (unsigned long)fCalls);
 	publishCounts(true);
 	unlockRead();
+	IOLockLock(fBackingLock);
+	releaseBacking();
+	IOLockUnlock(fBackingLock);
 	/*
 	 * The window server's and the program's clients share the surface
 	 * by its ID; only when the window server lets go is it forgotten.
 	 */
-	if (fAccel && fWid && fSetShape)
+	if (fAccel && fWid && (fSetShape || fBackingMode))
 		fAccel->forgetSurface(fWid);
 	terminate();
 	return kIOReturnSuccess;
@@ -374,11 +387,11 @@ IOExternalMethod *RadeonNISurfaceClient::getTargetAndMethodForIndex(
 	return (IOExternalMethod *)&methods[index];
 }
 
-/* Nothing can be locked yet: there is no surface memory behind this. */
+/* Backed surfaces synchronize the caller's buffer with GPU storage. */
 IOReturn RadeonNISurfaceClient::readLockOptions(UInt32 options,
 	IOAccelSurfaceInformation *info, IOByteCount *size)
 {
-	IOReturn ret = lockForRead(info, size);
+	IOReturn ret = fBackingMode ? lockBacking(info, size) : lockForRead(info, size);
 
 	note(kIOAccelSurfaceReadLockOptions, options, ret, 0, 0);
 	return ret;
@@ -402,13 +415,18 @@ IOReturn RadeonNISurfaceClient::writeLockOptions(UInt32 options,
 	IOAccelSurfaceInformation *info, IOByteCount *size)
 {
 	note(kIOAccelSurfaceWriteLockOptions, options, 0, 0, 0);
-	return kIOReturnUnsupported;
+	return fBackingMode ? lockBacking(info, size) : kIOReturnUnsupported;
 }
 
 IOReturn RadeonNISurfaceClient::writeUnlockOptions(UInt32 options)
 {
 	note(kIOAccelSurfaceWriteUnlockOptions, options, 0, 0, 0);
-	return kIOReturnSuccess;
+	if (!fBackingMode) return kIOReturnSuccess;
+	IOLockLock(fBackingLock);
+	IOReturn ret = syncBacking(false);
+	unlockRead();
+	IOLockUnlock(fBackingLock);
+	return ret;
 }
 
 IOReturn RadeonNISurfaceClient::read(IOAccelSurfaceReadData *data, void *out,
@@ -424,15 +442,20 @@ IOReturn RadeonNISurfaceClient::setShapeBacking(UInt32 options, UInt32 fbIndex,
 {
 	note(kIOAccelSurfaceSetShapeBacking, options, fbIndex, backing, rowBytes);
 	noteRegion(kIOAccelSurfaceSetShapeBacking, rgn, size);
-	return kIOReturnSuccess;
+	return configureBacking(options, fbIndex, backing, rowBytes, 0, rgn, size);
 }
 
 IOReturn RadeonNISurfaceClient::setIDMode(UInt32 wid, UInt32 mode)
 {
-	if (fAccel->surfaceGate() && !fAccel->isGLSurface(wid)) {
-		fRefused = true;
-		note(kIOAccelSurfaceSetIDMode, wid, mode, 1, 0);
-		return kIOReturnUnsupported;
+	/* Surface 1 is the window server's screen compositor, not an app buffer. */
+	if (fAccel->surfaceGate() && wid != 1 && !fAccel->isGLSurface(wid)) {
+		if (mode != (kIOAccelSurfaceModeWindowedBit | kIOAccelSurfaceModeColorDepth8888) ||
+		    fAccel->getProperty("BackingSurfaces") != kOSBooleanTrue) {
+			fRefused = true;
+			note(kIOAccelSurfaceSetIDMode, wid, mode, 1, 0);
+			return kIOReturnUnsupported;
+		}
+		fBackingMode = true;
 	}
 	fWid = wid;
 	fMode = mode;
@@ -454,12 +477,13 @@ IOReturn RadeonNISurfaceClient::setShape(UInt32 options, UInt32 fbIndex,
 	noteRegion(kIOAccelSurfaceSetShape, rgn, size);
 	if (fRefused)
 		return kIOReturnUnsupported;
-	/* The structure is declared with one rectangle and holds num_rects. */
+	const UInt32 header = offsetof(IOAccelDeviceRegion, rect);
+	if (!rgn || size < header ||
+	    rgn->num_rects > (size - header) / sizeof(IOAccelBounds))
+		return kIOReturnBadArgument;
+	if (!fAccel->setSurfaceRegion(fWid, rgn, rgn->num_rects))
+		return kIOReturnNoResources;
 	fSetShape = true;
-	if (rgn && size >= sizeof(IOAccelDeviceRegion) - sizeof(IOAccelBounds) &&
-	    rgn->num_rects <= (size - (sizeof(IOAccelDeviceRegion) -
-				       sizeof(IOAccelBounds))) / sizeof(IOAccelBounds))
-		fAccel->setSurfaceRegion(fWid, rgn, rgn->num_rects);
 	return kIOReturnSuccess;
 }
 
@@ -471,11 +495,15 @@ IOReturn RadeonNISurfaceClient::flush(UInt32 fbMask, UInt32 options)
 {
 	IOReturn ret = kIOReturnSuccess;
 
-	if (fAccel && fWid && (fbMask & 1))
+	if (fBackingMode) {
+		IOLockLock(fBackingLock);
+		ret = syncBacking(true);
+		IOLockUnlock(fBackingLock);
+	} else if (fAccel && fWid && (fbMask & 1))
 		ret = fAccel->flushSurface(fWid);
 	countFlush(fbMask, options);
 	note(kIOAccelSurfaceFlush, fbMask, options, ret, 0);
-	return kIOReturnSuccess;
+	return ret;
 }
 
 IOReturn RadeonNISurfaceClient::queryLock(void)
@@ -487,7 +515,7 @@ IOReturn RadeonNISurfaceClient::queryLock(void)
 IOReturn RadeonNISurfaceClient::readLock(IOAccelSurfaceInformation *info,
 					 IOByteCount *size)
 {
-	IOReturn ret = lockForRead(info, size);
+	IOReturn ret = fBackingMode ? lockBacking(info, size) : lockForRead(info, size);
 
 	note(kIOAccelSurfaceReadLock, ret, 0, 0, 0);
 	return ret;
@@ -503,14 +531,12 @@ IOReturn RadeonNISurfaceClient::readUnlock(void)
 IOReturn RadeonNISurfaceClient::writeLock(IOAccelSurfaceInformation *info,
 					  IOByteCount *size)
 {
-	note(kIOAccelSurfaceWriteLock, 0, 0, 0, 0);
-	return kIOReturnUnsupported;
+	return writeLockOptions(kIOAccelSurfaceLockInBacking, info, size);
 }
 
 IOReturn RadeonNISurfaceClient::writeUnlock(void)
 {
-	note(kIOAccelSurfaceWriteUnlock, 0, 0, 0, 0);
-	return kIOReturnSuccess;
+	return writeUnlockOptions(kIOAccelSurfaceLockInBacking);
 }
 
 IOReturn RadeonNISurfaceClient::control(UInt32 selector, UInt32 arg,
@@ -519,6 +545,18 @@ IOReturn RadeonNISurfaceClient::control(UInt32 selector, UInt32 arg,
 	countControl(selector, arg);
 	note(kIOAccelSurfaceControl, selector, arg, 0, 0);
 	*result = 0;
+	if (fBackingMode) {
+		if (selector != 1 && selector != 4 && selector != 5)
+			return kIOReturnUnsupported;
+		/* The backing is pinned and retained; making it nonvolatile synchronizes it. */
+		if (selector == 4 || selector == 5) *result = 1;
+		if (selector == 1 || (selector == 5 && !arg)) {
+			IOLockLock(fBackingLock);
+			IOReturn ret = syncBacking(true);
+			IOLockUnlock(fBackingLock);
+			return ret;
+		}
+	}
 	return kIOReturnSuccess;
 }
 
@@ -528,5 +566,137 @@ IOReturn RadeonNISurfaceClient::setShapeBackingAndLength(UInt32 options,
 {
 	note(kIOAccelSurfaceSetShapeBackingAndLength, options, fbIndex, backing, rowBytes);
 	noteRegion(kIOAccelSurfaceSetShapeBackingAndLength, rgn, size);
+	return configureBacking(options, fbIndex, backing, rowBytes, length, rgn, size);
+}
+
+void RadeonNISurfaceClient::releaseBacking(void)
+{
+	if (fBackingMap) { fBackingMap->release(); fBackingMap = NULL; }
+	if (fBackingMemory) {
+		fBackingMemory->complete();
+		fBackingMemory->release();
+		fBackingMemory = NULL;
+	}
+	fBackingAddress = fBackingStride = fBackingWidth = fBackingHeight = 0;
+}
+
+void RadeonNISurfaceClient::free(void)
+{
+	releaseBacking();
+	if (fBackingLock) IOLockFree(fBackingLock);
+	super::free();
+}
+
+IOReturn RadeonNISurfaceClient::configureBacking(UInt32 options, UInt32 fbIndex,
+	UInt32 address, UInt32 stride, UInt32 length,
+	IOAccelDeviceRegion *region, IOByteCount size)
+{
+	if (fRefused || !fWid || fWid == 1 ||
+	    fMode != (kIOAccelSurfaceModeWindowedBit | kIOAccelSurfaceModeColorDepth8888))
+		return kIOReturnUnsupported;
+	if (fbIndex) return kIOReturnBadArgument;
+	const UInt32 header = offsetof(IOAccelDeviceRegion, rect);
+	if (!region || size < header ||
+	    region->num_rects > (size - header) / sizeof(IOAccelBounds) ||
+	    !address || region->bounds.w <= 0 || region->bounds.h <= 0 ||
+	    region->bounds.w > 16384 || region->bounds.h > 16384 ||
+	    stride < (UInt32)region->bounds.w * 4)
+		return kIOReturnBadArgument;
+	UInt64 bytes = (UInt64)stride * region->bounds.h;
+	if (bytes > 0x7fffffffU || (UInt64)address + bytes > 0x100000000ULL ||
+	    (length && bytes > length)) return kIOReturnBadArgument;
+	/* WindowServer also publishes direct CPU edits by rebinding the backing. */
+	IOLockLock(fBackingLock);
+	bool unchanged = fBackingMap && fBackingAddress == address &&
+		fBackingStride == stride && fBackingWidth == (UInt32)region->bounds.w &&
+		fBackingHeight == (UInt32)region->bounds.h;
+	if (unchanged) {
+		IOReturn ret = kIOReturnNoResources;
+		if (fAccel->setSurfaceRegion(fWid, region, region->num_rects))
+			ret = (options & kIOAccelSurfaceShapeStaleBackingBit)
+				? kIOReturnSuccess : syncBacking(false);
+		IOLockUnlock(fBackingLock);
+		return ret;
+	}
+	IOLockUnlock(fBackingLock);
+	IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddress(
+		(vm_address_t)address, (IOByteCount)bytes, kIODirectionOutIn, fTask);
+	if (!memory) return kIOReturnNoMemory;
+	IOReturn ret = memory->prepare();
+	if (ret != kIOReturnSuccess) { memory->release(); return ret; }
+	IOMemoryMap *mapping = memory->map();
+	if (!mapping) { memory->complete(); memory->release(); return kIOReturnNoMemory; }
+	struct rdn_user_backing backing = {address, 0, stride,
+		(UInt32)region->bounds.w, (UInt32)region->bounds.h};
+	bool adopted = false;
+	IOLockLock(fBackingLock);
+	ret = fAccel->waitForCPU();
+	if (ret == kIOReturnSuccess && !fAccel->setSurfaceBacking(fWid, fTask, &backing))
+		ret = kIOReturnNoResources;
+	if (ret == kIOReturnSuccess) {
+		releaseBacking();
+		adopted = true;
+		fBackingMode = true;
+		fBackingMemory = memory;
+		fBackingMap = mapping;
+		fBackingAddress = address;
+		fBackingStride = stride;
+		fBackingWidth = backing.width;
+		fBackingHeight = backing.height;
+		fSetShape = fAccel->setSurfaceRegion(fWid, region, region->num_rects);
+		ret = fSetShape ? syncBacking(false) : kIOReturnNoResources;
+	}
+	IOLockUnlock(fBackingLock);
+	if (!adopted) {
+		mapping->release(); memory->complete(); memory->release();
+	}
+	return ret;
+}
+
+IOReturn RadeonNISurfaceClient::syncBacking(bool toCPU)
+{
+	UInt32 offset, stride, width, height;
+	if (!fBackingMap) return kIOReturnNotReady;
+	if (!fAccel->getSurfaceBuffer(fWid, &offset, &stride, &width, &height))
+		return kIOReturnSuccess;
+	/* Resizing replaces the GL store on the next drawable attachment. */
+	if (width != fBackingWidth || height != fBackingHeight)
+		return kIOReturnSuccess;
+	IOMemoryDescriptor *aperture = fAccel->apertureMemory();
+	UInt64 end = (UInt64)offset + (UInt64)stride * height;
+	if (!aperture || stride < width * 4 || end > aperture->getLength())
+		return kIOReturnBadArgument;
+	IOReturn ret = fAccel->waitForCPU();
+	if (ret != kIOReturnSuccess) return ret;
+	IOMemoryMap *mapping = aperture->map();
+	if (!mapping) return kIOReturnNoMemory;
+	UInt8 *gpu = (UInt8 *)mapping->getVirtualAddress() + offset;
+	UInt8 *cpu = (UInt8 *)fBackingMap->getVirtualAddress();
+	for (UInt32 y = 0; y < height; ++y) {
+		if (toCPU) bcopy(gpu + y * stride, cpu + y * fBackingStride, width * 4);
+		else bcopy(cpu + y * fBackingStride, gpu + y * stride, width * 4);
+	}
+	__asm__ volatile("sync" ::: "memory");
+	mapping->release();
 	return kIOReturnSuccess;
+}
+
+IOReturn RadeonNISurfaceClient::lockBacking(IOAccelSurfaceInformation *info,
+                                           IOByteCount *size)
+{
+	if (!info || !size || *size < sizeof(*info)) return kIOReturnBadArgument;
+	IOLockLock(fBackingLock);
+	IOReturn ret = syncBacking(true);
+	if (ret == kIOReturnSuccess) {
+		bzero(info, sizeof(*info));
+		info->address[0] = fBackingAddress;
+		info->rowBytes = fBackingStride;
+		info->width = fBackingWidth;
+		info->height = fBackingHeight;
+		info->pixelFormat = kIOAccelSurfaceModeColorDepth8888;
+		*size = sizeof(*info);
+		fAccel->setReadLocked(fWid);
+	}
+	IOLockUnlock(fBackingLock);
+	return ret;
 }

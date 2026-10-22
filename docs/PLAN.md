@@ -1,5 +1,99 @@
 # Plan
 
+## Active roadmap: Leopard stability and family support (2026-10-18)
+
+This roadmap supersedes the historical milestone claims below for Leopard.
+The HD 7570 still hangs in Portal. Neither the fence-publication correction,
+client-close drain, nor disabling glthread resolved the gameplay hang.
+
+Primary qualification target: HD 7570/Turks, PowerMac11,2, PCIe x16,
+Leopard 10.5.8. Stable requires hardware QE/CI, native application OpenGL,
+dual-link DVI and DisplayPort, two displays, hotplug, display sleep, and
+system sleep/wake. Tiger has a separate qualification track.
+
+| Gate | Required work | State |
+|---|---|---|
+| A: Portal cause | Preserve failing baseline; correlate submissions, resources and fences; reduce failure; prove correction with a regression | In progress; cause unknown |
+| B: ownership | Kernel buffer handles and shared references; validated relocations; completion-based retirement; VRAM/GART residency and eviction | Planned |
+| C: Leopard integration | Explicit drawable/pbuffer ownership; tested ABI and entry points; actual GPU QE/CI; remove timing-dependent activation | Planned |
+| D: displays/power | Card service and per-display framebuffers; VBIOS routing; coordinated modesets; hotplug, cursor, vblank and sleep/wake | Planned |
+| E: recovery | Bounded fault capture/reset; failed fences and reset generations; explicit context invalidation | Planned |
+| F: qualification | Game regressions, performance measurements, additional ASICs and modern GL features | Planned |
+
+### Implementation contracts
+
+- Preserve the failing baseline while investigating gate A; do not use a
+  broad refactor to declare its cause resolved.
+- Add a versioned v2 user-client interface: actual capabilities, buffer
+  handles/generations, immutable submissions with access lists/relocations,
+  explicit fence results, retained shared surfaces and display generations.
+- Use the existing r600 relocation path and MIT-licensed Evergreen command
+  validation. Keep OS adapters separate from freestanding hardware code.
+- Retire memory only after every CPU, GPU and imported-surface reference
+  ends. Replace the six-pbuffer delay and immediate surface-store frees.
+- A failed wait never permits reuse. Recovery failures return bounded
+  errors; unexpected GPU resets fail qualification.
+- Expand from Turks to Juniper (HD 5750), then Redwood, Cedar, Cypress,
+  Barts and Caicos. PCI-ID recognition alone does not establish support.
+- Cayman/VLIW4, integrated and multi-GPU configurations, video decoding and
+  display audio are separate projects. Modern GL follows native stability.
+- Profiles may select measured performance choices; correctness must not
+  depend on disabling threading or globally serializing draws.
+
+### Stable-release gates
+
+- Demonstrated pre-fix failure and post-fix success for the reduced hang.
+- 1,000 memory/submission/shared-surface/client-close cycles, including
+  injected allocation and wait failures, without premature reuse.
+- All applicable advertised-feature tests pass; fix harness failures and
+  report unsupported features separately.
+- Actual cursor dragging, menus, transparency, Expose, Dashboard, CI filters,
+  concurrent GL applications, fullscreen changes and display migration.
+- Three two-hour Portal sessions and 24 hours of mixed desktop/game/memory
+  pressure with no unexpected hangs, resets, corruption or driver crashes.
+- 100 mode switches, 50 hotplug/display-sleep cycles, 25 system sleep/wake
+  cycles, independent and mirrored displays, and physical 2560x1600 checks.
+- Ten cold boots and ten restarts in x16, plus install/upgrade/rollback tests.
+- Five benchmark runs, median/tail frame times, investigation of repeatable
+  regressions above five percent. Final qualification runs without tracing.
+
+Record build hashes, OS, PCI/subsystem IDs, firmware hash, monitor/link,
+settings, duration and diagnostic configuration with every result. Untested
+hardware stays unqualified. Ship matched kernel/GL/accelerator packages with
+rollback. Resume upstream preparation after gate A; staging and commits
+require explicit approval.
+
+### Submission diagnostics
+
+`RDN_CAPTURE_DIR` names an existing directory for optional winsys captures.
+Each process/winsys retains sixteen slots containing host-endian command
+words, buffer IDs, placements, ranges, access flags, prior fences and the
+submission result. Slots with unfinished fences are not overwritten.
+This adds file I/O under the submission lock and can perturb timing; it is
+not a performance configuration or evidence of uninstrumented stability.
+
+Decode with `python tools/diagnostics/rdn_ib.py --capture CAPTURE.bin`.
+Raw saved PPC IBs use the default big-endian mode. `--memory aperture.bin`
+also decodes captured indices; stale descriptors and shader usage still need
+independent analysis. Foreign aperture handles do not establish per-surface
+allocation bounds. This recorder does not yet capture resource contents or
+cross-process allocation/free events.
+
+With captured aperture bytes, the decoder also checks logical attribute
+ranges for straight-line fetch shaders against their vertex descriptors.
+It accounts for base vertex and known attribute widths. Unsupported index
+limits, primitive restart, computed indices and missing bytes remain
+unchecked. These checks do not establish allocation lifetime, texture or
+constant-buffer validity, or GPU completion.
+
+`RDN_CAPTURE_MARKERS=1`, together with `RDN_CAPTURE_DIR`, inserts GPU memory
+writes after draw packets. The counter lives in the retained IB allocation;
+the capture header records its aperture offset. Read its four bytes as
+little-endian. It reports CP progress, not completion of the preceding draw.
+This diagnostic preserves asynchronous submission but changes GPU timing.
+
+## Historical Tiger milestones
+
 Phase 1 ends when Mac OS X 10.4 Tiger, running in QEMU, shows its desktop at
 native resolution on a monitor connected to the real Radeon HD 7570.
 

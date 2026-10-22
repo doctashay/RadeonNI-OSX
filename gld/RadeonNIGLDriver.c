@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <mach/mach.h>
+#include <ApplicationServices/ApplicationServices.h>
 #include <OpenGL/gl.h>
 #include <OpenGL/gliContext.h>
 #include <OpenGL/gliDispatch.h>
@@ -122,7 +123,7 @@ static const char *const names[GLD_COUNT] = {
 static gld_fn real[GLD_COUNT];
 /* A pixel format record this bundle allocated itself, if any. */
 static void *own_format;
-static FILE *logf;
+static FILE *log_file;
 static int ready;
 /*
  * RDN_GLD_PATCH: 1 changes the renderer ID in the renderer info, 2 also in
@@ -169,23 +170,23 @@ void rdn_log(const char *fmt, ...)
 {
 	va_list ap;
 
-	if (!logf)
+	if (!log_file)
 		return;
 	/* One line, also when another thread logs at the same time. */
-	flockfile(logf);
-	fprintf(logf, TAG " ", TAG_ARGS);
+	flockfile(log_file);
+	fprintf(log_file, TAG " ", TAG_ARGS);
 	if (log_time) {
 		struct timeval tv;
 
 		gettimeofday(&tv, NULL);
-		fprintf(logf, "%lu.%03lu ", (unsigned long)(tv.tv_sec % 1000), (unsigned long)(tv.tv_usec / 1000));
+		fprintf(log_file, "%lu.%03lu ", (unsigned long)(tv.tv_sec % 1000), (unsigned long)(tv.tv_usec / 1000));
 	}
 	va_start(ap, fmt);
-	vfprintf(logf, fmt, ap);
+	vfprintf(log_file, fmt, ap);
 	va_end(ap);
-	fprintf(logf, "\n");
-	fflush(logf);
-	funlockfile(logf);
+	fprintf(log_file, "\n");
+	fflush(log_file);
+	funlockfile(log_file);
 }
 
 static void kept_at_exit(void)
@@ -258,53 +259,56 @@ static void setup(void)
 	 * which gives each process its own /tmp/rdngld.<pid>.log.
 	 */
 	if (path) {
-		logf = fopen(path, "a");
+		log_file = fopen(path, "a");
 	} else if (access("/tmp/rdngld.on", F_OK) == 0) {
 		char name[64];
 
 		snprintf(name, sizeof(name), "/tmp/rdngld.%d.log", (int)getpid());
-		logf = fopen(name, "a");
+		log_file = fopen(name, "a");
 	}
-	log_time = logf && access("/tmp/rdngld.time", F_OK) == 0;
-	rdn_trace = logf && access("/tmp/rdngld.trace", F_OK) == 0;
+	log_time = log_file && access("/tmp/rdngld.time", F_OK) == 0;
+	rdn_trace = log_file && access("/tmp/rdngld.trace", F_OK) == 0;
 	log_all = rdn_trace;
 	/* The entries Mesa lacks are counted while there is a log. */
-	rdn_logging = logf != NULL;
+	rdn_logging = log_file != NULL;
 	/* Mesa reports the errors a program makes (to the program's standard error). */
-	if (logf && access("/tmp/rdngld.mesadebug", F_OK) == 0)
+	if (log_file && access("/tmp/rdngld.mesadebug", F_OK) == 0)
 		setenv("MESA_DEBUG", "1", 0);
-	if (logf)
+	if (log_file)
 		atexit(kept_at_exit);
 #else
-	logf = fopen(path ? path : DEFAULT_LOG, "a");
+	log_file = fopen(path ? path : DEFAULT_LOG, "a");
 	log_all = 1;
 #endif
 	handle = dlopen(REAL_BUNDLE, RTLD_NOW | RTLD_LOCAL);
-	if (logf)
-		fprintf(logf, TAG " RadeonNIGLDriver loaded in %s, software renderer %s\n",
+	if (log_file)
+		fprintf(log_file, TAG " RadeonNIGLDriver loaded in %s, software renderer %s\n",
 			TAG_ARGS, getprogname(), handle ? "opened" : dlerror());
 	for (i = 0; handle && i < GLD_COUNT; i++) {
 		real[i] = (gld_fn)dlsym(handle, names[i]);
-		if (!real[i] && logf)
-			fprintf(logf, TAG " missing %s\n", TAG_ARGS, names[i]);
+		if (!real[i] && log_file)
+			fprintf(log_file, TAG " missing %s\n", TAG_ARGS, names[i]);
 	}
-	if (logf)
-		fflush(logf);
+	if (log_file)
+		fflush(log_file);
 #ifdef RDN_MESA
 	/* See rdn_hook.c. The window server's context always has a drawable. */
 	if (strcmp(getprogname(), "WindowServer") != 0) {
 		rdn_hook_set_current(rdn_mesa_early_all);
 		if (pbuffers_on()) {
+			rdn_hook_prepare_pbuffer(rdn_mesa_prepare_pbuffer);
 			rdn_hook_tex_image_pbuffer(rdn_mesa_tex_image_pbuffer);
+			rdn_hook_set_parameter(rdn_mesa_cgls_set_integer);
 			rdn_hook_destroy_pbuffer(rdn_mesa_pbuffer_destroyed);
 		}
-		if (logf)
+		if (log_file)
 			rdn_hook_cgl_log();
-	} else if (rdn_ws_core_image()) {
-		/* Core Image in the window server: cglsTexImagePBuffer. */
-		rdn_hook_cgls_tex_image(rdn_mesa_tex_image_pbuffer_ws);
-		rdn_hook_cgls_set_integer(rdn_mesa_cgls_set_integer);
-		rdn_hook_destroy_pbuffer(rdn_mesa_pbuffer_destroyed);
+	} else {
+		rdn_surface_texture_hook = rdn_hook_cgls_set_integer(rdn_mesa_cgls_set_integer);
+		if (rdn_ws_core_image()) {
+			rdn_hook_cgls_tex_image(rdn_mesa_tex_image_pbuffer_ws);
+			rdn_hook_destroy_pbuffer(rdn_mesa_pbuffer_destroyed);
+		}
 	}
 #endif
 }
@@ -344,27 +348,27 @@ static void dump_from(const char *what, long addr, int bytes, int quiet)
 	unsigned long words[DUMP_MAX / 4];
 	int i, got;
 
-	if (!logf || !addr)
+	if (!log_file || !addr)
 		return;
 	if (bytes > DUMP_MAX)
 		bytes = DUMP_MAX;
 	got = peek(addr, words, bytes);
 	if (got < 4) {
 		if (!quiet)
-			fprintf(logf, TAG "   %s: nothing to read at %lx\n",
+			fprintf(log_file, TAG "   %s: nothing to read at %lx\n",
 				TAG_ARGS, what, addr);
 		return;
 	}
-	flockfile(logf);
+	flockfile(log_file);
 	for (i = 0; i < got / 4; i++) {
 		if (i % 8 == 0)
-			fprintf(logf, "%s" TAG "   %s+%03x:", i ? "\n" : "",
+			fprintf(log_file, "%s" TAG "   %s+%03x:", i ? "\n" : "",
 				TAG_ARGS, what, i * 4);
-		fprintf(logf, " %08lx", words[i]);
+		fprintf(log_file, " %08lx", words[i]);
 	}
-	fprintf(logf, "\n");
-	fflush(logf);
-	funlockfile(logf);
+	fprintf(log_file, "\n");
+	fflush(log_file);
+	funlockfile(log_file);
 }
 
 static void dump(const char *what, long addr, int bytes)
@@ -389,7 +393,7 @@ static void known_add(const char *what, long value)
 	static unsigned made;
 	int i, at = -1;
 
-	if (!logf || !value)
+	if (!log_file || !value)
 		return;
 	for (i = 0; i < MAX_KNOWN; i++) {
 		if (known[i].value == value)
@@ -402,7 +406,7 @@ static void known_add(const char *what, long value)
 	known[at].value = value;
 	known[at].what = what;
 	known[at].number = ++made;
-	fprintf(logf, TAG "   %lx is %s %u from here on\n", TAG_ARGS, value, what,
+	fprintf(log_file, TAG "   %lx is %s %u from here on\n", TAG_ARGS, value, what,
 		known[at].number);
 }
 
@@ -452,7 +456,7 @@ static void dump_arg(int arg, long value, int bytes)
 	char what[16];
 	int i, k, got;
 
-	if (!logf || !pointer_like(value) || known_find(value) >= 0)
+	if (!log_file || !pointer_like(value) || known_find(value) >= 0)
 		return;
 	if (bytes > DUMP_MAX)
 		bytes = DUMP_MAX;
@@ -462,7 +466,7 @@ static void dump_arg(int arg, long value, int bytes)
 	for (i = 0; i < got / 4; i++) {
 		k = known_find((long)words[i]);
 		if (k >= 0)
-			fprintf(logf, TAG "   arg%d+%03x is %s %u\n", TAG_ARGS, arg,
+			fprintf(log_file, TAG "   arg%d+%03x is %s %u\n", TAG_ARGS, arg,
 				i * 4, known[k].what, known[k].number);
 	}
 }
@@ -496,9 +500,9 @@ static void dump_drawable(const char *when, long type, long record)
 	char what[24];
 	int i, got;
 
-	if (!logf)
+	if (!log_file)
 		return;
-	fprintf(logf, TAG "   drawable type 0x%lx (%s), record %lx %s\n", TAG_ARGS,
+	fprintf(log_file, TAG "   drawable type 0x%lx (%s), record %lx %s\n", TAG_ARGS,
 		type, drawable_name(type), record, when);
 	if (!pointer_like(record))
 		return;
@@ -532,12 +536,12 @@ static void dump_parameter(const char *call, long parameter, long values)
 	const char *name = "";
 	unsigned i;
 
-	if (!logf)
+	if (!log_file)
 		return;
 	for (i = 0; i < sizeof(cgl) / sizeof(cgl[0]); i++)
 		if (cgl[i].number == parameter)
 			name = cgl[i].name;
-	fprintf(logf, TAG "   %s parameter %ld (0x%lx) %s\n", TAG_ARGS, call,
+	fprintf(log_file, TAG "   %s parameter %ld (0x%lx) %s\n", TAG_ARGS, call,
 		parameter, parameter, name);
 	if (pointer_like(values))
 		dump_from("values", values, 0x20, 1);
@@ -561,7 +565,7 @@ static void describe(int idx, const long *args, long ret)
 	long made = 0;
 	int i;
 
-	if (!logf)
+	if (!log_file)
 		return;
 	switch (idx) {
 	case IDX_gldGetVersion:
@@ -613,7 +617,7 @@ static void describe(int idx, const long *args, long ret)
 			dump_from("context", made, 0x40, 1);
 		}
 		if (pointer_like(args[5]))
-			fprintf(logf, TAG "   engine context %lx, if arg5 is what it was\n",
+			fprintf(log_file, TAG "   engine context %lx, if arg5 is what it was\n",
 				TAG_ARGS, args[5] - ENGINE_CTX_CREATE_ARG);
 		for (i = 1; i < 8; i++)
 			dump_arg(i, args[i], 0x40);
@@ -643,7 +647,7 @@ static void describe(int idx, const long *args, long ret)
 		break;
 	case IDX_gldGetString:
 		if (ret)
-			fprintf(logf, TAG "   string \"%s\"\n", TAG_ARGS,
+			fprintf(log_file, TAG "   string \"%s\"\n", TAG_ARGS,
 				(const char *)ret);
 		break;
 	}
@@ -670,8 +674,8 @@ static void take_over(GLIFunctionDispatch *disp)
 	engine_clear = disp->clear;
 	engine_clear_color = disp->clear_color;
 	disp->clear = rdn_clear;
-	if (logf)
-		fprintf(logf, TAG "   dispatch table %p: clear replaced\n",
+	if (log_file)
+		fprintf(log_file, TAG "   dispatch table %p: clear replaced\n",
 			TAG_ARGS, (void *)disp);
 }
 
@@ -687,7 +691,7 @@ static void scan(long table)
 	unsigned long value, *base;
 	int i;
 
-	if (!want || !logf)
+	if (!want || !log_file)
 		return;
 	if (!rdn_engine_layout())
 		return;
@@ -695,9 +699,9 @@ static void scan(long table)
 	base = (unsigned long *)(table - rdn_engine_layout()->table_off);
 	for (i = 0; i < ENGINE_CTX_SCAN_BYTES / 4; i++)
 		if (base[i] >= value - 4 && base[i] <= value + 0xab8)
-			fprintf(logf, TAG "   engine context %p +%05x: %08lx\n",
+			fprintf(log_file, TAG "   engine context %p +%05x: %08lx\n",
 				TAG_ARGS, (void *)base, i * 4, base[i]);
-	fflush(logf);
+	fflush(log_file);
 }
 
 /*
@@ -733,14 +737,14 @@ static void table_report(void)
 {
 	int i;
 
-	if (!logf)
+	if (!log_file)
 		return;
-	fprintf(logf, TAG " driver table calls:", TAG_ARGS);
+	fprintf(log_file, TAG " driver table calls:", TAG_ARGS);
 	for (i = 0; i < DRIVER_TABLE_ENTRIES; i++)
 		if (table_calls[i])
-			fprintf(logf, " [%d]=%lu", i, table_calls[i]);
-	fprintf(logf, "\n");
-	fflush(logf);
+			fprintf(log_file, " [%d]=%lu", i, table_calls[i]);
+	fprintf(log_file, "\n");
+	fflush(log_file);
 }
 
 static void table_hook(long table)
@@ -815,10 +819,10 @@ static unsigned stub_calls[33];
 
 static long table_stub(int entry, long a, long b, long c, long d)
 {
-	if (logf && stub_calls[entry]++ < (rdn_trace ? STUB_LOGGED_TRACE : STUB_LOGGED)) {
-		fprintf(logf, TAG " driver table entry %d called (%lx, %lx, %lx, %lx)\n",
+	if (log_file && stub_calls[entry]++ < (rdn_trace ? STUB_LOGGED_TRACE : STUB_LOGGED)) {
+		fprintf(log_file, TAG " driver table entry %d called (%lx, %lx, %lx, %lx)\n",
 			TAG_ARGS, entry, a, b, c, d);
-		fflush(logf);
+		fflush(log_file);
 	}
 	return 0;
 }
@@ -911,23 +915,24 @@ static long (*bind_surface)(long, long, long, long, long);
 /*
  * The size of a window's surface, from the window server
  * (CGSGetSurfaceBounds, which the software renderer uses too; its last
- * argument is taken to be a rectangle of four floats). The kext only
+ * argument is a CGRect, whose coordinates are doubles on LP64). The kext only
  * learns the surface's place a moment after it is bound, and a program
  * may draw its one frame before that.
  */
 int rdn_surface_size(unsigned long cid, unsigned long wid, unsigned long sid,
 		     unsigned *width, unsigned *height)
 {
-	int (*bounds)(unsigned long, unsigned long, unsigned long, float *) =
-		(int (*)(unsigned long, unsigned long, unsigned long, float *))
+	int (*bounds)(uint32_t, uint32_t, uint32_t, CGRect *) =
+		(int (*)(uint32_t, uint32_t, uint32_t, CGRect *))
 		dlsym(RTLD_DEFAULT, "CGSGetSurfaceBounds");
-	float r[4] = { 0, 0, 0, 0 };
+	CGRect r = {{0, 0}, {0, 0}};
 
-	if (!bounds || bounds(cid, wid, sid, r) || r[2] < 1 || r[3] < 1 ||
-	    r[2] > 16384 || r[3] > 16384)
+	if (!bounds || bounds(cid, wid, sid, &r) ||
+	    !(r.size.width >= 1 && r.size.width <= 16384) ||
+	    !(r.size.height >= 1 && r.size.height <= 16384))
 		return 0;
-	*width = (unsigned)r[2];
-	*height = (unsigned)r[3];
+	*width = (unsigned)r.size.width;
+	*height = (unsigned)r.size.height;
 	return 1;
 }
 
@@ -946,7 +951,7 @@ static int app_surfaces(void)
 			access("/tmp/rdngld.nosurface", F_OK) != 0;
 	return known;
 }
-static const long *display_words;
+static const uint32_t *display_words;
 
 /* Samples of the last pixel format a program asked for; 0: none. */
 static int asked_samples;
@@ -1035,6 +1040,12 @@ static int pbuffers_on(void)
 }
 #endif
 
+/* Both GLD records start with a native pointer followed by 32-bit fields. */
+static uint32_t *record_words(void *record)
+{
+	return (uint32_t *)((char *)record + sizeof(void *) - sizeof(uint32_t));
+}
+
 /* Changes made to what the software renderer answered. */
 static long adjust(int idx, long a, long b, long c, long d, long ret)
 {
@@ -1045,23 +1056,23 @@ static long adjust(int idx, long a, long b, long c, long d, long ret)
 		 * engine files the plug-in under it.
 		 */
 		if (ret && d && (patch & 4))
-			*(long *)d = RDN_RENDERER_ID & 0xffff;
+			*(uint32_t *)d = RDN_RENDERER_ID & 0xffff;
 		break;
 	case IDX_gldGetRendererInfo:
 		/* Word 1 is the low half of the renderer ID. */
 		if (ret == 0 && a && (patch & 1))
-			((long *)a)[1] = RDN_RENDERER_ID & 0xffff;
+			record_words((void *)a)[1] = RDN_RENDERER_ID & 0xffff;
 		if (ret == 0 && a && RDN_CLAIMS_ACCELERATED) {
-			((unsigned long *)a)[2] |= RECORD_ACCELERATED | RECORD_FULLSCREEN;
+			record_words((void *)a)[2] |= RECORD_ACCELERATED | RECORD_FULLSCREEN;
 			/* Words 12 and 13: video and texture memory, in bytes. */
-			((unsigned long *)a)[12] = RDN_REPORTED_MEMORY;
-			((unsigned long *)a)[13] = RDN_REPORTED_MEMORY;
+			record_words((void *)a)[12] = RDN_REPORTED_MEMORY;
+			record_words((void *)a)[13] = RDN_REPORTED_MEMORY;
 			/*
 			 * The software renderer's depth modes are 32 bits
 			 * only. Mesa's depth buffer has 24, and Call of Duty
 			 * 2 takes no display whose renderer lacks that mode.
 			 */
-			((unsigned long *)a)[6] |= DEPTH_MODE_24;
+			record_words((void *)a)[6] |= DEPTH_MODE_24;
 		}
 		/* Experiment: RDN_GLD_INFO="word:xor[,word:xor]" flips bits. */
 		if (ret == 0 && a && getenv("RDN_GLD_INFO")) {
@@ -1073,7 +1084,7 @@ static long adjust(int idx, long a, long b, long c, long d, long ret)
 				unsigned long x = *end == ':' ? strtoul(end + 1, &end, 0) : 0;
 
 				if (word >= 0 && word < 16)
-					((unsigned long *)a)[word] ^= x;
+					record_words((void *)a)[word] ^= x;
 				p = *end == ',' ? end + 1 : end;
 				if (p == end && *end)
 					break;
@@ -1089,10 +1100,12 @@ static long adjust(int idx, long a, long b, long c, long d, long ret)
 		 * did not allocate.
 		 */
 		if (ret == 0 && a) {
-			unsigned long *fmt = *(unsigned long **)a;
+			void *record = *(void **)a;
+			uint32_t *fmt;
 			int guard = 0;
 
-			for (; fmt && guard < 64; fmt = (unsigned long *)fmt[0], guard++) {
+			for (; record && guard < 64; record = *(void **)record, guard++) {
+				fmt = record_words(record);
 				if (patch & 2)
 					fmt[1] = RDN_RENDERER_ID;
 				if (RDN_CLAIMS_ACCELERATED)
@@ -1114,7 +1127,7 @@ static long adjust(int idx, long a, long b, long c, long d, long ret)
 			long word = strtol(getenv("RDN_GLD_PF"), &end, 0);
 
 			if (*end == ':' && word >= 0 && word < 16)
-				(*(unsigned long **)a)[word] ^= strtoul(end + 1, NULL, 0);
+				record_words(*(void **)a)[word] ^= strtoul(end + 1, NULL, 0);
 		}
 		break;
 	case IDX_gldInitDispatch:
@@ -1143,7 +1156,7 @@ static long adjust(int idx, long a, long b, long c, long d, long ret)
 			rdn_mesa_context_created(*(void **)a, (void *)d);
 		break;
 	case IDX_gldAttachDrawable:
-		if (logf && b == 0x50 && pointer_like(c))
+		if (log_file && b == 0x50 && pointer_like(c))
 			dump("window record after the call", c, 0x80);
 		rdn_mesa_attach((void *)a, b, (const void *)c);
 		break;
@@ -1165,13 +1178,13 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 	int restore_id = 0;
 
 	setup();
-	if (logf) {
+	if (log_file) {
 		char objects[160];
 
 		known_args(objects, sizeof(objects), args);
-		fprintf(logf, TAG " %s(%lx, %lx, %lx, %lx, %lx, %lx, %lx, %lx)%s\n",
+		fprintf(log_file, TAG " %s(%lx, %lx, %lx, %lx, %lx, %lx, %lx, %lx)%s\n",
 			TAG_ARGS, names[idx], a, b, c, d, e, f, g, h, objects);
-		fflush(logf);
+		fflush(log_file);
 		if (idx == IDX_gldSetInteger)
 			dump_parameter("gldSetInteger sets", b, c);
 		if (idx == IDX_gldInitializeLibrary) {
@@ -1197,13 +1210,13 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 	 * word. The software renderer refuses an ID that is not its own.
 	 */
 	if (idx == IDX_gldCreateContext && b &&
-	    *(long *)b == RDN_RENDERER_ID) {
-		*(long *)b = SOFTWARE_RENDERER_ID;
+	    *(uint32_t *)b == RDN_RENDERER_ID) {
+		*(uint32_t *)b = SOFTWARE_RENDERER_ID;
 		restore_id = 1;
 	}
 #ifdef RDN_MESA
 	/* What the context's program called of the entries Mesa lacks. */
-	if (idx == IDX_gldDestroyContext && logf)
+	if (idx == IDX_gldDestroyContext && log_file)
 		rdn_dispatch_kept_report("a context is destroyed");
 	/* Mesa's context goes before the software renderer's own. */
 	if (idx == IDX_gldDestroyContext)
@@ -1230,24 +1243,24 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 	if (!in_window_server() && app_surfaces()) {
 		if (idx == IDX_gldAttachDrawable && b == 0x50 && c &&
 		    bind_surface && display_words) {
-			const unsigned long *r = (const unsigned long *)c;
-			unsigned long sid = r[2];
+			const uint32_t *r = (const uint32_t *)c;
+			uint32_t sid = r[2];
 			const struct rdn_engine_layout *lay = rdn_engine_layout();
+			int leopard = lay && !strncmp(lay->os, "10.5", 4);
 			/*
 			 * 10.5's glcBindSurface takes the address of the
 			 * surface ID (it reads it where it calls
 			 * CGSBindSurface); 10.4's takes the ID.
 			 */
 			long err;
-
 			rdn_mesa_expect_surface((void *)a, sid);
 			err = bind_surface(r[0], r[1],
-						lay && !strcmp(lay->os, "10.5") ? (long)&sid : (long)sid,
+						leopard ? (long)&sid : (long)sid,
 						0x24, display_words[0]);
 
-			if (logf)
-				fprintf(logf, TAG "   surface 0x%lx of window 0x%lx bound -> %lx\n",
-					TAG_ARGS, r[2], r[1], err);
+			if (log_file)
+				fprintf(log_file, TAG "   surface 0x%lx of window 0x%lx bound -> %lx\n",
+					TAG_ARGS, (unsigned long)r[2], (unsigned long)r[1], err);
 			if (!err && rdn_mesa_attach_surface((void *)a, r[0], r[1], r[2]))
 				return 2;
 		} else if (idx == IDX_gldAttachDrawable && b == 0x36) {
@@ -1256,8 +1269,8 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 			 * itself. Mesa draws off-screen and each swap
 			 * copies the whole picture to the screen.
 			 */
-			if (logf) {
-				fprintf(logf, TAG "   the whole screen is attached\n", TAG_ARGS);
+			if (log_file) {
+				fprintf(log_file, TAG "   the whole screen is attached\n", TAG_ARGS);
 				if (c)
 					dump("drawable", c, 0x40);
 			}
@@ -1265,8 +1278,8 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 				return 2;
 		} else if (idx == IDX_gldAttachDrawable &&
 			   rdn_mesa_is_surface((void *)a)) {
-			if (logf)
-				fprintf(logf, TAG "   the context's surface is let go, nothing attached\n",
+			if (log_file)
+				fprintf(log_file, TAG "   the context's surface is let go, nothing attached\n",
 					TAG_ARGS);
 			rdn_mesa_detach((void *)a);
 			return 0;
@@ -1290,12 +1303,12 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 	if (!in_window_server() && pbuffers_on()) {
 		if (idx == IDX_gldAttachDrawable && b == 0x5a && c) {
 			if (!rdn_mesa_attach((void *)a, b, (const void *)c)) {
-				if (logf)
-					fprintf(logf, TAG "   pbuffer refused by us -> kCGLBadAlloc\n", TAG_ARGS);
+				if (log_file)
+					fprintf(log_file, TAG "   pbuffer refused by us -> kCGLBadAlloc\n", TAG_ARGS);
 				return 0x2720;
 			}
-			if (logf)
-				fprintf(logf, TAG "   pbuffer attached by us -> 1\n", TAG_ARGS);
+			if (log_file)
+				fprintf(log_file, TAG "   pbuffer attached by us -> 1\n", TAG_ARGS);
 			return 1;
 		}
 	}
@@ -1307,23 +1320,31 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 	if (rdn_ws_core_image() && idx == IDX_gldAttachDrawable && b == 0x5a && c) {
 		rdn_mesa_pbuffer_layout(1);
 		if (!rdn_mesa_attach((void *)a, b, (const void *)c)) {
-			if (logf)
-				fprintf(logf, TAG "   pbuffer of the window server refused by us -> kCGLBadAlloc\n", TAG_ARGS);
+			if (log_file)
+				fprintf(log_file, TAG "   pbuffer of the window server refused by us -> kCGLBadAlloc\n", TAG_ARGS);
 			return 0x2720;
 		}
-		if (logf)
-			fprintf(logf, TAG "   pbuffer of the window server attached by us -> 2\n", TAG_ARGS);
+		if (log_file)
+			fprintf(log_file, TAG "   pbuffer of the window server attached by us -> 2\n", TAG_ARGS);
 		return 2;
 	}
 	if (in_window_server()) {
 		if (idx == IDX_gldAttachDrawable) {
+			if (!b) {
+				rdn_mesa_detach((void *)a);
+				if (screen_ctx == (void *)a)
+					screen_ctx = NULL;
+				return 1;
+			}
+			if (b != 0x50 || !c)
+				return 0x271d; /* kCGLBadEnumeration */
 			/* The record's third word is the surface ID. */
 			rdn_window_server = 1;
 			ret = rdn_mesa_attach_screen((void *)a,
 				c ? ((const unsigned long *)c)[2] : 0) ? 2 : -1;
 			screen_ctx = ret == 2 ? (void *)a : NULL;
-			if (logf) {
-				fprintf(logf, TAG "   attached by us -> %lx\n", TAG_ARGS, ret);
+			if (log_file) {
+				fprintf(log_file, TAG "   attached by us -> %lx\n", TAG_ARGS, ret);
 				dump("drawable", c, 0x80);
 			}
 			return ret;
@@ -1336,9 +1357,9 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 				table_fill(b);
 			if (b)
 				rdn_mesa_dispatch((void *)a, (void *)b);
-			if (logf) {
-				fprintf(logf, TAG "   dispatch of a pbuffer context set up by us\n", TAG_ARGS);
-				fflush(logf);
+			if (log_file) {
+				fprintf(log_file, TAG "   dispatch of a pbuffer context set up by us\n", TAG_ARGS);
+				fflush(log_file);
 			}
 			return idx == IDX_gldInitDispatch ? 4 : 0;
 		}
@@ -1348,9 +1369,9 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 				table_fill(b);
 			if (b && rdn_mesa_dispatch((void *)a, (void *)b))
 				present_hook((void *)a, b);
-			if (logf) {
-				fprintf(logf, TAG "   dispatch set up by us\n", TAG_ARGS);
-				fflush(logf);
+			if (log_file) {
+				fprintf(log_file, TAG "   dispatch set up by us\n", TAG_ARGS);
+				fflush(log_file);
 			}
 			return idx == IDX_gldInitDispatch ? 4 : 0;
 		}
@@ -1364,8 +1385,8 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 	 */
 	if (idx == IDX_gldChoosePixelFormat && b &&
 	    (RDN_CLAIMS_ACCELERATED || getenv("RDN_GLD_ACCEL"))) {
-		static long filtered[64];
-		const long *in = (const long *)b;
+		static int32_t filtered[64];
+		const int32_t *in = (const int32_t *)b;
 		int n = 0;
 
 		asked_samples = 0;
@@ -1439,14 +1460,14 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 	} else if (real[idx])
 		ret = real[idx](a, b, c, d, e, f, g, h);
 	if (restore_id)
-		*(long *)b = RDN_RENDERER_ID;
+		*(uint32_t *)b = RDN_RENDERER_ID;
 #ifdef RDN_MESA
 	/* No Core Image to report: the engine's own list (rdn_ws_no_core_image). */
 	if (idx == IDX_gldCreateContext && ret == 0 && e && rdn_ws_no_core_image()) {
 		unsigned long *features = (unsigned long *)(e + ENGINE_FEATURES);
 
-		if (logf)
-			fprintf(logf, TAG "   extension bits %08lx: GL_ARB_fragment_program's cleared\n",
+		if (log_file)
+			fprintf(log_file, TAG "   extension bits %08lx: GL_ARB_fragment_program's cleared\n",
 				TAG_ARGS, *features);
 		*features &= ~ENGINE_FEATURE_FRAGMENT_PROGRAM;
 	}
@@ -1466,7 +1487,8 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 		 * on every display. Thirteen words, as the software
 		 * renderer's records are; freed by gldDestroyPixelFormat.
 		 */
-		unsigned long *fmt = calloc(13, sizeof(*fmt));
+		void *record = calloc(1, sizeof(void *) + 12 * sizeof(uint32_t));
+		uint32_t *fmt = record ? record_words(record) : NULL;
 
 		if (fmt) {
 			fmt[1] = RDN_RENDERER_ID;
@@ -1496,19 +1518,19 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 				if (asked_samples > 1)
 					fmt[9] = 0x10000 | (unsigned long)asked_samples;
 			}
-			*(unsigned long **)a = fmt;
-			own_format = fmt;
+			*(void **)a = record;
+			own_format = record;
 		}
-		if (logf) {
-			fprintf(logf, TAG "   made a format of our own -> %lx, %lx\n",
+		if (log_file) {
+			fprintf(log_file, TAG "   made a format of our own -> %lx, %lx\n",
 				TAG_ARGS, ret, *(long *)a);
 			if (ret == 0 && *(long *)a)
 				dump("pixfmt", *(long *)a, 0x80);
 		}
 	}
-	if (logf) {
-		fprintf(logf, TAG "   %s -> %lx\n", TAG_ARGS, names[idx], ret);
-		fflush(logf);
+	if (log_file) {
+		fprintf(log_file, TAG "   %s -> %lx\n", TAG_ARGS, names[idx], ret);
+		fflush(log_file);
 	}
 	/* The attribute list as the software renderer was given it. */
 	args[1] = b;
@@ -1529,7 +1551,7 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 		 * or framebuffer); the callback wants the word of the
 		 * display the surface is on.
 		 */
-		display_words = (const long *)a;
+		display_words = (const uint32_t *)a;
 	}
 	/*
 	 * The sixth argument of gldCreateContext points 0x360 bytes into

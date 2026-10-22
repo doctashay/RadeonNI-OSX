@@ -6636,3 +6636,208 @@ Done unattended on the G5 (input driven with `tools/guest/input.c`; the user asl
   and before any GL call: the binary itself (the patched Universal build from the Tiger
   Desktop) is not usable on 10.5.9; nothing to do with the driver. No timedemo number.
   Not tried: the build from another source, or finding which symbol the initialiser calls.
+
+
+## 2026-10-18: Leopard Portal hang investigation, gate A still open
+
+- Preserved the starting working diff, untracked sources, submission/ring
+  captures and a full 256 MB aperture image under ignored
+  `private/stability-baseline-20261018-150842`. No commit or staging.
+- Added opt-in bounded winsys submission captures with buffer IDs, addresses,
+  sizes, access flags, prior fences and exact submitted words. Pending-fence
+  captures survive slot rotation. Optional MEM_WRITE draw markers report CP
+  progress, not completion. Native `hangwatch` polls progress without mapping
+  the aperture or flushing HDP; it detected the latest five-second stall.
+- Reproduced Portal hangs with the existing `-hl2_launcher` glthread profile
+  and normal asynchronous batching. Recorder-only run: completed fence 0x789f,
+  stalled submission 0x78a0, 209 draws. Marker run: completed fence 0x602e,
+  stalled submission 0x602f, 282 draws, last CP marker 262. The marker does not
+  prove that draw 263 caused the hang. Saved CPU submissions match GPU IB bytes
+  in both runs; their buffer lists contain no foreign surface handles.
+- Saved visible resources, GART buffers, ring/status registers and debugger
+  stacks in `private/capture-hang-20261018` and
+  `private/marker-hang-20261018`. Resource bytes are post-stall snapshots, not
+  immutable snapshots at submission. Hidden VRAM texture contents were not
+  captured. Shader/geometry units remained busy. No causal fix established.
+- Extended the offline decoder to follow simple fetch shaders and check
+  logical attribute ranges, including signed base vertex and format widths.
+  871 and 1,176 supported attribute checks were within their descriptors in
+  the two runs. Seven and nine nonindexed draws respectively were unchecked.
+  This does not validate texture/constant addressing, speculative fetches,
+  descriptor ownership, lifetime or earlier corruption.
+- Fixed the Mesa debug reader's little-endian trace-counter conversion on
+  PowerPC (patch 0014). This corrects diagnostics, not the rendering hang.
+  Updated the Leopard build script to check each patch independently; all
+  fourteen patches match the build tree. Removed the claim that disabling
+  glthread fixes the game from the Leopard notes.
+- Seven Python decoder tests pass. Marker packet tests pass on the Linux host
+  and native Leopard; the GLD cross-build succeeds. Native hangwatch builds
+  with warnings treated as errors except the platform's deprecated IOKit API.
+  `git diff --check` passes. Installed diagnostic GLD MD5:
+  `1c6409087985a0e601de9a0b35761d8c`; kernel unchanged this session:
+  `8cb8580faa77001bbceaf6fa1448f106`. Marker and file recording are enabled only
+  by the diagnostic Portal launcher. Rebooted after preserving the hang.
+- Gate A remains unresolved. Do not call the driver stable or start upstream
+  release preparation on this evidence. Next work is a reduced reproduction
+  with resource lifetime and shader/cache state evidence. Ownership, recovery,
+  multi-display/power and family qualification gates remain unfinished.
+
+
+## 2026-10-18: display interfaces and power management (unqualified)
+
+- Added the high-level DDC capability IODisplay requires before reading EDID.
+  The pre-change live registry identified the Cinema Display as unknown
+  vendor 0x756e6b6e/product 0x717 despite a cached Apple EDID in the framebuffer.
+- Connection power now uses kFBDisplayUsablePowerState. Added explicit
+  framebuffer power states; deep system sleep remains unsupported and all
+  states declare kIOPMPreventSystemSleep, following Apple's doze-only model.
+  This is not GPU/VRAM suspend/resume support.
+- Added connection-index/DDC bounds checks and actual connection availability;
+  detailed timings use the hardware's dual-link decision. Modeset geometry
+  updates follow successful programming. Requested output power is distinct
+  from hardware state; asleep mode changes defer programming and hotplug
+  polling leaves sleeping outputs alone. Callback delivery is outside fLock
+  and retains its target during invocation.
+- Native Leopard build and kextload -n -t passed for the first candidate.
+  Installed binary MD5 5134490a80109c98e2caa05dfc6f7dfa. Previous bundle:
+  /Users/shay/RadeonNI-diagnostics/display-power-20261018/RadeonNI-before.kext.
+  Reboot was requested; the Mac did not return to SSH during verification.
+- Found a startup-order defect in that candidate: power registration was in
+  start(), before IOFramebuffer::open initializes gAllFramebuffers. A power
+  callback can dereference that uninitialized list. Corrected LOCAL source
+  moves registration into enableController(), matching IONDRVFramebuffer,
+  checks its result and registers once. This correction passes SDK syntax
+  checking but is NOT yet built/deployed on the Mac. Actual monitor/panic
+  status is pending; the observed network failure alone does not prove cause.
+- Host board_outputs --links-only passes the 165 MHz threshold, dual-link
+  DVI, single-link DVI and DisplayPort cases. Full VBIOS test was not run
+  because its ROM fixture is absent. git diff --check passes.
+- Recovery and live EDID/mode/display-sleep validation remain outstanding.
+  Multiple displays and full system sleep still need structural implementation.
+  All changes are unstaged; no commits or upstream publication.
+
+
+### Recovery on the X1900
+
+The user confirmed the new Radeon boot froze with rainbow bars at 1280x800,
+then booted Leopard using the X1900. Restored the saved kernel binary
+byte-for-byte (MD5 8cb8580faa77001bbceaf6fa1448f106); kextload -n -t passes.
+Preserved the regressed binary and old mkext in the diagnostic backup folder.
+The panic was saved as private/display-fixes-baseline/failed-power-boot.panic.
+PC 0x0035c564 resolves to IOEventSource::closeGate; DAR is 0x18, with the caller
+inside IOGraphicsFamily. This is an uninitialized event-gate access, preceding
+the framebuffer-list access suspected earlier. Power registration must occur
+in enableController, after IOFramebuffer initializes its shared machinery.
+The corrected candidate builds natively on Leopard but is NOT installed.
+The known-working pre-update driver remains the installed recovery version.
+
+## 2026-10-18: menu recurrence after display rollback (unresolved)
+
+- Installed kernel MD5 remains 8cb8580faa77001bbceaf6fa1448f106 and GLD
+  1c6409087985a0e601de9a0b35761d8c. No candidate was installed in this investigation.
+- WindowServer 103 reported fe_cgls_set_pbuffer 10005 and
+  fe_cgls_texture_pbuffer 10007 repeatedly. Enabled /tmp/rdngld.on and
+  restarted WindowServer. PID 299 registered private pbuffers successfully;
+  a short mouse click produced a visibly correct Apple menu at 1920x1080.
+  Evidence is in private/menu-regression (before.png and windowserver.log).
+- Detached pbuffer diagnostics say no context is bound; that is not by itself
+  evidence of lost rendering. Considered a detach flush, built it locally,
+  then removed the unverified change without deployment. Existing Mesa
+  store/switch flushing needs to be considered before changing that contract.
+  Rebuilt the local dylib after removing the experiment; build passes.
+- Removed /tmp/rdngld.on and terminated WindowServer 299 to test the same
+  installed driver without tracing. The Mac subsequently stopped responding
+  to SSH and ping. Monitor status requested; cause is not established.
+- Menu root cause and operation without tracing remain unverified. The
+  display-power candidate remains uninstalled. Changes remain unstaged.
+- User reports the desktop is responsive. SSH to 10.0.0.98 still times out;
+  requested its current Ethernet address. Network loss is not proof of a hang.
+- Reconnected to .98 successfully; uptime confirms no reboot. WindowServer
+  is now PID 413. Tracing marker is absent. Direct framebuffer capture off.png
+  shows readable Apple menu text; repeat-0.png shows a readable System Profiler
+  application menu. Other repeat captures contain no open menu, so they do not
+  establish repeated-open coverage (foreground apps changed during capture).
+- Both installed binary hashes remain unchanged. No fe_cgls errors appeared
+  in the last 500 system-log lines after these checks. The current menu session
+  recovered after WindowServer restart; the recurrence root cause is unresolved.
+
+## 2026-10-18: reconnect state and EDID synchronization
+
+- Serialized hasDDCConnect/getDDCBlock with the hotplug lock so EDID length,
+  connection status and copied bytes belong to the same snapshot.
+- Failed reconnect modesetting restores the previous mode table/count and
+  does not publish replacement EDID/preferred mode or mark the display
+  connected. The existing polling path can retry the reconnect.
+- Native Leopard candidate build passes. tests/test_display_reconnect.py
+  executes the production reconnect method with mocked hardware: modeset
+  failure, retry success, detection failure and same-EDID reconnect pass.
+- No candidate installed and no reboot requested. Installed recovery kernel
+  remains unchanged. Partial hardware modeset recovery, concurrent mode-list
+  queries, callback unregistration during delivery, live display sleep/wake,
+  full system sleep and multi-display ownership still need qualification or
+  implementation. Changes are unstaged and ready for review.
+
+## 2026-10-18: System Profiler selection corruption and cursor plane
+
+- Direct scanout captures reproduced white rectangular holes within selection
+  highlights and a stray square. Moving the window redrew it without the holes.
+  Pointer-only motion over an unchanged selection did not reproduce the damage.
+  Cursor-hide comparisons were inconclusive; one pair had foreground changes,
+  and a later pair retained the same holes. They are not causal proof.
+- Installed personality had no HWCursor key. Enabled the existing hardware
+  cursor, backed up Info.plist in display-power-review/Info-before-hwcursor.plist,
+  rebuilt caches and rebooted. No kernel or GLD binary was changed for this test.
+- After reboot, HWCursor=Yes and CUR_CONTROL(0x6998)=0x04000201. Three captures
+  of the original Hardware Overview selection drag were clean, including
+  cursor placement over text. Evidence: private/selection-compositing/.
+- Accelerated Leopard installs now enable the hardware cursor by default.
+  The software-cursor restoration/asynchronous screen-update interaction remains
+  a fallback-path defect, not a generally repaired synchronization contract.
+  No claim that unrelated surface failures or Portal hangs are resolved.
+- Changes are unstaged and ready for review.
+
+
+### 2026-10-18: GPU legacy 2D and bounded surface readbacks
+
+Enabled GPU fill/copy for 32-bit GA scanout, removed silent CPU retry on GPU
+submission failure, and propagated synchronization errors. Surface read locks now
+check aperture bounds and wait for GPU completion. Mesa rejects mappings after
+failed producer waits; OSMesa maps damage bounds and preserves gaps between damage
+rectangles. Mapping failures return failure instead of dereferencing null.
+
+Host readback/fault-injection tests and native GPU pixel checks passed. Built and
+installed kernel/GA/GLD with backups in `~/RadeonNI-diagnostics/ga-readback-20261018`.
+Successful 17:59 reboot; native OpenGL FBO/readback checks passed and settled Apple
+menu capture was readable. See `PROGRESS-2026-10-18.md` for hashes and limits.
+
+## 2026-10-19: opt-in modern context bridge
+
+Added exported context-request, context-binding, and function-lookup entry
+points. Modern clients explicitly request a Mesa 4.6 compatibility context;
+the desktop retains its legacy exposure. PPC32 and PPC64 incremental builds
+pass, and the universal candidate exports all three functions. CS:GO's
+launcher detects the bridge and preserves the framebuffer EXT adapters.
+
+Installed candidate MD5 bf0a8af22b1b4ceb1012dc0dca2b7117 with an atomic backup.
+The native test compiled, but execution stalled in Cocoa_RegisterApp before
+creating its SDL window. A WindowServer sample showed rdn_number_wait /
+dev_fence_wait under compositor flush. Stopped the test process; native
+modern/legacy rendering validation remains pending desktop recovery.
+No claim of game stability or complete 4.6 conformance follows from this build.
+
+### Native bridge validation after reboot
+
+The PPC32 native test reports AMD TURKS, OpenGL 4.6 compatibility, and GLSL
+4.60. Modern lookup, immutable-buffer readback and cross-thread context
+handoff pass. A separate legacy invocation reports 2.1 Mesa RadeonNI and
+does not expose the opt-in lookup path.
+
+GLSL 4.60 compute compiles/links but the uint SSBO increment test fails:
+input 00000001/12345678/00000003/ffffffff becomes
+07000001/19345678/07000003/06000000, matching little-endian interpretation
+of the raw buffer. This records a byte-order mismatch, not a conformance
+conclusion about the required client buffer representation.
+
+CS:GO PID 330 rendered the Dust loading screen, then crashed at 10:47:53
+in _mesa_bind_framebuffers+212 on render thread 19, during ToGL presentation.
+Report saved as ../csgo-modern-104753.crash. No game-stability pass.

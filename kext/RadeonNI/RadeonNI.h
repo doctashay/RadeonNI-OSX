@@ -40,6 +40,9 @@ class RadeonNI : public IOFramebuffer
 public:
 	virtual bool start(IOService *provider);
 	virtual void stop(IOService *provider);
+	virtual unsigned long maxCapabilityForDomainState(IOPMPowerFlags state);
+	virtual unsigned long initialPowerStateForDomainState(IOPMPowerFlags state);
+	virtual unsigned long powerStateForDomainState(IOPMPowerFlags state);
 
 	/* IOFramebuffer */
 	virtual IOReturn enableController(void);
@@ -154,11 +157,15 @@ private:
 	 */
 	IOLock *fLock;
 	bool fOutputOn;
+	bool fOutputRequested;
+	bool fDisplayRequested;
+	bool fFramebufferRequested;
 	bool fConnected;
 	bool fHotplug;		/* poll the line (boot-arg rdn_hotplug=0 turns it off) */
 	bool fDpms;		/* act on power requests (boot-arg rdn_dpms=0: no) */
 	bool fCaptured;		/* a program has the display: no notices */
-	UInt32 fPowerMax;
+	UInt32 fPowerState;
+	bool fPowerRegistered;
 	int fSenseLast, fSenseSteady;
 	IOWorkLoop *fPollLoop;
 	IOTimerEventSource *fPollTimer;
@@ -170,11 +177,12 @@ private:
 	bool fConnectOn;
 
 	IOReturn programModeLocked(IODisplayModeID id, IOIndex depth);
-	void setOutputPower(bool on);
+	IOReturn setOutputPower(bool on, bool framebuffer = false);
 	void startHotplug();
 	void stopHotplug();
 	void pollHotplug();
 	void monitorReturned();
+	void notifyConnectionChange();
 	static void pollTimerFired(OSObject *owner, IOTimerEventSource *sender);
 	static void noticeTimerFired(OSObject *owner, IOTimerEventSource *sender);
 

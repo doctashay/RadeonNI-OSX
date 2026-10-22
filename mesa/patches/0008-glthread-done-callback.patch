@@ -55,54 +55,17 @@ diff -ruN a/src/mesa/main/glthread.c b/src/mesa/main/glthread.c
 diff -ruN a/src/mesa/main/glthread.h b/src/mesa/main/glthread.h
 --- a/src/mesa/main/glthread.h
 +++ b/src/mesa/main/glthread.h
-@@ -33,7 +33,7 @@
-  *   chance of experiencing CPU cache thrashing
-  * but it should be high enough so that u_queue overhead remains negligible.
-  */
--#define MARSHAL_MAX_CMD_BUFFER_SIZE (8 * 1024)
-+#define MARSHAL_MAX_CMD_BUFFER_SIZE (64 * 1024)
- 
- /* We need to leave 1 slot at the end to insert the END marker for unmarshal
-  * calls that look ahead to know where the batch ends.
-@@ -92,14 +92,18 @@
- union gl_vertex_format_user {
-    struct {
-       GLenum16 Type;        /**< datatype: GL_FLOAT, GL_INT, etc */
--      bool Bgra;            /**< true if GL_BGRA, else GL_RGBA */
-+      /* uint8_t, not bool: bool has four bytes on 32-bit Darwin PowerPC,
-+       * and "All" must cover every field. */
-+      uint8_t Bgra;         /**< true if GL_BGRA, else GL_RGBA */
-       uint8_t Size:5;       /**< components per element (1,2,3,4) */
--      bool Normalized:1;    /**< GL_ARB_vertex_program */
--      bool Integer:1;       /**< Integer-valued? */
--      bool Doubles:1;       /**< double values are not converted to floats */
-+      uint8_t Normalized:1; /**< GL_ARB_vertex_program */
-+      uint8_t Integer:1;    /**< Integer-valued? */
-+      uint8_t Doubles:1;    /**< double values are not converted to floats */
-    };
-    uint32_t All;
- };
-+static_assert(sizeof(union gl_vertex_format_user) == 4,
-+              "gl_vertex_format_user::All must cover the fields");
- 
- #define MESA_PACK_VFORMAT(type, size, normalized, integer, doubles) \
-    (union gl_vertex_format_user){{ \
-@@ -156,6 +160,14 @@
+@@ -160,6 +160,9 @@
      */
     unsigned used;
  
-+   /**
-+    * osx-gpu: run in the worker thread when every call of the batch has
-+    * been executed (the swap of a double-buffered drawable, after the
-+    * frame's last call). Set while the batch is being filled.
-+    */
 +   void (*done_cb)(void *arg);
 +   void *done_arg;
 +
     /** Data contained in the command buffer. */
     uint64_t buffer[MARSHAL_MAX_CMD_BUFFER_SIZE / 8];
  };
-@@ -328,6 +340,8 @@
+@@ -332,6 +335,8 @@
  void _mesa_glthread_enable(struct gl_context *ctx);
  void _mesa_glthread_disable(struct gl_context *ctx);
  void _mesa_glthread_flush_batch(struct gl_context *ctx);

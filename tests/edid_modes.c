@@ -73,7 +73,7 @@ int main(int argc, char **argv)
 			if (!(m->hdisplay < m->hsync_start && m->hsync_start < m->hsync_end &&
 			      m->hsync_end <= m->htotal && m->vdisplay < m->vsync_start &&
 			      m->vsync_start < m->vsync_end && m->vsync_end <= m->vtotal) ||
-			    m->clock > 165000) {
+			    m->clock > RDN_MODE_MAX_CLOCK) {
 				printf("FAIL: mode %d has odd timings\n", i + 1);
 				failures++;
 			}
