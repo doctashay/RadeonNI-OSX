@@ -43,7 +43,7 @@ static const char *image_of(unsigned long p, unsigned long *off)
 {
 	Dl_info di;
 
-	if (p < 0x1000 || p > 0xf0000000ul || !dladdr((void *)p, &di) || !di.dli_fname)
+	if (p < 0x1000 || !dladdr((void *)p, &di) || !di.dli_fname)
 		return NULL;
 	if (off)
 		*off = p - (unsigned long)di.dli_fbase;
@@ -94,26 +94,26 @@ int main(int argc, char **argv)
 	mem = (unsigned long *)buf;
 
 	puts("-- words equal to &ctx->disp or ctx:");
-	for (i = 0; i < nread / 4; i++)
+	for (i = 0; i < nread / sizeof(*mem); i++)
 		if (mem[i] == disp || mem[i] == (unsigned long)ctx)
-			printf("  rend+%#05lx = %s\n", i * 4, mem[i] == disp ? "&ctx->disp" : "ctx");
+			printf("  rend+%#05lx = %s\n", i * sizeof(*mem), mem[i] == disp ? "&ctx->disp" : "ctx");
 
 	puts("-- runs (>= 6) of words that point into one image:");
-	for (i = 0; i < nread / 4;) {
+	for (i = 0; i < nread / sizeof(*mem);) {
 		const char *im = image_of(mem[i], NULL);
 
 		if (!im) {
 			i++;
 			continue;
 		}
-		for (j = i + 1; j < nread / 4; j++) {
+		for (j = i + 1; j < nread / sizeof(*mem); j++) {
 			const char *jm = image_of(mem[j], NULL);
 
 			if (!jm || strcmp(jm, im))
 				break;
 		}
 		if (j - i >= 6)
-			printf("  rend+%#05lx .. +%#05lx  %3lu words  %s\n", i * 4, j * 4 - 4, j - i, base(im));
+			printf("  rend+%#05lx .. +%#05lx  %3lu words  %s\n", i * sizeof(*mem), (j - 1) * sizeof(*mem), j - i, base(im));
 		i = j;
 	}
 
@@ -126,7 +126,7 @@ int main(int argc, char **argv)
 		for (k = 0; k < 900; k++) {
 			unsigned long v;
 
-			if (!readable(&t[k], 4, &v))
+			if (!readable(&t[k], sizeof(*t), &v))
 				break;
 			w = v;
 			if (k == 0)
@@ -147,7 +147,7 @@ int main(int argc, char **argv)
 		const char *im, *curim = NULL;
 
 		for (k = 0; k <= 800; k++) {
-			if (k == 800 || !readable(&t[k], 4, &v)) {
+			if (k == 800 || !readable(&t[k], sizeof(*t), &v)) {
 				kind = 'X';
 				v = 0;
 			} else {
@@ -165,11 +165,11 @@ int main(int argc, char **argv)
 			if (kind == 'X')
 				break;
 		}
-		if (readable(&t[0], 4, &v)) {
+		if (readable(&t[0], sizeof(*t), &v)) {
 			unsigned long here;
 
 			for (k = 600; k < 800; k++)
-				if (readable(&t[k], 4, &here) && here && !image_of(here, NULL) && here > 0x1000)
+				if (readable(&t[k], sizeof(*t), &here) && here && !image_of(here, NULL) && here > 0x1000)
 					{ printf("  first non-code, non-zero word >= entry 600: entry %lu = %#lx\n", k, here); break; }
 		}
 		printf("  malloc size of ctx: %lu bytes\n", (unsigned long)malloc_size(ctx));

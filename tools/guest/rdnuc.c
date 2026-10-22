@@ -1,6 +1,7 @@
 /*
  * rdnuc: talk to the kext's accelerator user client from Tiger.
  *
+ *   rdnuc dump off bytes file  save aperture bytes for command diagnostics
  *   rdnuc info             print what the accelerator reports
  *   rdnuc probe            read the pixels the drawing self-test colours
  *   rdnuc grab file.ppm    save the screen as the card holds it
@@ -89,6 +90,21 @@ int main(int argc, char **argv)
 		return 1;
 	IOConnectMethodScalarIScalarO(conn, RDN_UC_SYNC_FOR_CPU, 0, 0);
 
+	if (!strcmp(cmd, "dump") && argc == 5) {
+		unsigned long offset = strtoul(argv[2], NULL, 0);
+		unsigned long bytes = strtoul(argv[3], NULL, 0);
+		FILE *f;
+		if (offset > info.aperture_size || bytes > info.aperture_size - offset)
+			return 1;
+		f = fopen(argv[4], "wb");
+		if (!f)
+			return 1;
+		if (fwrite((const char *)aperture + offset, 1, bytes, f) != bytes) {
+			fclose(f);
+			return 1;
+		}
+		return fclose(f) != 0;
+	}
 	if (!strcmp(cmd, "info")) {
 		printf("device %04x, video memory at GPU 0x%x%08x, aperture %u MB\n",
 		       (unsigned)info.pci_device_id, (unsigned)info.vram_gpu_base_hi,
@@ -100,6 +116,42 @@ int main(int argc, char **argv)
 		       (unsigned)info.fb_width, (unsigned)info.fb_height,
 		       (unsigned)info.fb_pitch_pixels, (unsigned)info.fb_bits_per_pixel,
 		       (unsigned)info.fb_offset);
+	} else if (!strcmp(cmd, "surface-buffer") && argc == 7) {
+		kern_return_t kr = IOConnectMethodScalarIScalarO(conn, RDN_UC_SURFACE_BUFFER,
+			5, 0, strtoul(argv[2], NULL, 0), strtoul(argv[3], NULL, 0),
+			strtoul(argv[4], NULL, 0), strtoul(argv[5], NULL, 0), strtoul(argv[6], NULL, 0));
+		printf("surface buffer registration: 0x%x\n", kr);
+		return kr != 0;
+	} else if (!strcmp(cmd, "surfaces")) {
+		struct rdn_user_surfaces list;
+		IOByteCount bytes = sizeof(list);
+		unsigned i;
+		if (IOConnectMethodScalarIStructureO(conn, RDN_UC_SURFACE_LIST, 0, &bytes, &list))
+			return 1;
+		printf("registered surfaces: %u, bytes: %u\n", list.count, (unsigned)bytes);
+		for (i = 0; i < list.count && i < RDN_USER_SURFACES; ++i) {
+			struct rdn_user_region region;
+			uint32_t x, y, hash = 2166136261u, screen_hash = 2166136261u;
+			uint32_t offset = list.surface[i].offset, row = list.surface[i].row_bytes;
+			uint32_t w = list.surface[i].width, h = list.surface[i].height;
+			bytes = sizeof(region);
+			memset(&region, 0, sizeof(region));
+			IOConnectMethodScalarIStructureO(conn, RDN_UC_SURFACE_REGION, 1, &bytes,
+				list.surface[i].id, &region);
+			if (!row || offset >= info.aperture_size || h > (info.aperture_size - offset) / row)
+				return 2;
+			for (y = 0; y < h; y += 8)
+				for (x = 0; x < w; x += 8) {
+					int sx = region.bounds[0] + x, sy = region.bounds[1] + y;
+					hash = (hash ^ aperture[(offset + y * row) / 4 + x]) * 16777619u;
+					if (sx >= 0 && sy >= 0 && sx < info.fb_width && sy < info.fb_height)
+						screen_hash = (screen_hash ^ aperture[info.fb_offset / 4 +
+							sy * info.fb_pitch_pixels + sx]) * 16777619u;
+				}
+			printf("surface %u %ux%u offset=%x row=%u region=%d,%d %dx%d rects=%u store=%08x screen=%08x\n",
+				list.surface[i].id, w, h, offset, row, region.bounds[0], region.bounds[1],
+				region.bounds[2], region.bounds[3], region.count, hash, screen_hash);
+		}
 	} else if (!strcmp(cmd, "probe")) {
 		static const struct { uint32_t x, y; const char *what; } probe[] = {
 			{ 128, 128, "square, red ff0000" }, { 256, 128, "square, green 00ff00" },

@@ -3,10 +3,6 @@
  * interface (IOAccelSurfaceConnect.h) that the window server opens with
  * IOAccelCreateSurface.
  *
- * State of this file: it accepts every call, remembers what it is told
- * and logs it, so that what the window server does with a surface can be
- * learned (docs/QUARTZ-EXTREME.md). It does not put anything on screen.
- *
  * Copyright (c) 2026 kouta-kun and Claude
  * SPDX-License-Identifier: MIT
  */
@@ -15,6 +11,7 @@
 #define RADEONNISURFACE_H
 
 #include <IOKit/IOUserClient.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/graphics/IOAccelSurfaceConnect.h>
 
 class RadeonNIAccel;
@@ -28,6 +25,7 @@ public:
 	virtual bool start(IOService *provider);
 	virtual IOReturn clientClose(void);
 	virtual IOReturn clientDied(void);
+	virtual void free(void);
 	virtual IOExternalMethod *getTargetAndMethodForIndex(IOService **target,
 							     UInt32 index);
 	/* Brings the count properties up to date for whoever reads them. */
@@ -72,6 +70,17 @@ private:
 	/* setIDMode refused it (RadeonNIAccel::surfaceGate): not ours */
 	bool fRefused;
 	IOMemoryMap *fReadMap;
+	bool fBackingMode;
+	IOLock *fBackingLock;
+	IOMemoryDescriptor *fBackingMemory;
+	IOMemoryMap *fBackingMap;
+	UInt32 fBackingAddress, fBackingStride, fBackingWidth, fBackingHeight;
+	IOReturn configureBacking(UInt32 options, UInt32 fbIndex, UInt32 address,
+	                          UInt32 stride, UInt32 length,
+	                          IOAccelDeviceRegion *region, IOByteCount size);
+	IOReturn lockBacking(IOAccelSurfaceInformation *info, IOByteCount *size);
+	IOReturn syncBacking(bool toCPU);
+	void releaseBacking(void);
 
 	IOReturn lockForRead(IOAccelSurfaceInformation *info, IOByteCount *size);
 	void unlockRead(void);

@@ -25,6 +25,7 @@ extern "C" {
 #include "rdn_cursor.h"
 #include "rdn_i2c.h"
 #include "rdn_mc.h"
+#include "rdn_mc_layout.h"
 #include "rdn_mode.h"
 #include "rdn_pattern.h"
 }
@@ -40,6 +41,15 @@ class RadeonNI : public IOFramebuffer
 public:
 	virtual bool start(IOService *provider);
 	virtual void stop(IOService *provider);
+	virtual bool terminate(IOOptionBits options = 0);
+	virtual bool requestTerminate(IOService *provider, IOOptionBits options);
+	virtual IOReturn newUserClient(task_t task, void *security, UInt32 type,
+				     IOUserClient **handler);
+	virtual IOReturn newUserClient(task_t task, void *security, UInt32 type,
+				     OSDictionary *properties, IOUserClient **handler);
+	virtual unsigned long maxCapabilityForDomainState(IOPMPowerFlags state);
+	virtual unsigned long initialPowerStateForDomainState(IOPMPowerFlags state);
+	virtual unsigned long powerStateForDomainState(IOPMPowerFlags state);
 
 	/* IOFramebuffer */
 	virtual IOReturn enableController(void);
@@ -116,6 +126,8 @@ private:
 	bool fCardReady;
 	RadeonNIAccel *fAccel;
 	bool fModeSet;
+	bool fMCRebaseRequested, fMCProviderLocked, fMCProviderOpen;
+	bool fMCConsoleSuspended, fMCRebased, fMCFatal;
 
 	struct rdn_os fOS;
 	struct rdn_card fCard;
@@ -154,11 +166,15 @@ private:
 	 */
 	IOLock *fLock;
 	bool fOutputOn;
+	bool fOutputRequested;
+	bool fDisplayRequested;
+	bool fFramebufferRequested;
 	bool fConnected;
 	bool fHotplug;		/* poll the line (boot-arg rdn_hotplug=0 turns it off) */
 	bool fDpms;		/* act on power requests (boot-arg rdn_dpms=0: no) */
 	bool fCaptured;		/* a program has the display: no notices */
-	UInt32 fPowerMax;
+	UInt32 fPowerState;
+	bool fPowerRegistered;
 	int fSenseLast, fSenseSteady;
 	IOWorkLoop *fPollLoop;
 	IOTimerEventSource *fPollTimer;
@@ -170,11 +186,12 @@ private:
 	bool fConnectOn;
 
 	IOReturn programModeLocked(IODisplayModeID id, IOIndex depth);
-	void setOutputPower(bool on);
+	IOReturn setOutputPower(bool on, bool framebuffer = false);
 	void startHotplug();
 	void stopHotplug();
 	void pollHotplug();
 	void monitorReturned();
+	void notifyConnectionChange();
 	static void pollTimerFired(OSObject *owner, IOTimerEventSource *sender);
 	static void noticeTimerFired(OSObject *owner, IOTimerEventSource *sender);
 
@@ -183,6 +200,10 @@ private:
 	bool biosFromPersonality();
 	void compareWithPersonality();
 	bool bringUp();
+	bool claimColdLayout();
+	bool rebaseColdLayout(int handover, bool unpostedEntry);
+	bool resumeColdConsole(bool newLayout);
+	bool failedColdStart(IOService *provider);
 	void checkFirmwareHook();
 	const struct rdn_mode *modeForID(IODisplayModeID id);
 	void describeFb(const struct rdn_mode *mode, IOIndex depth,

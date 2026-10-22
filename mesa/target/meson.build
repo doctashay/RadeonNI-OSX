@@ -12,6 +12,9 @@ if host_machine.system() == 'darwin'
   # rdn_mem.c: the device divides up its chunks of GART memory itself.
   rdn_device = files('rdn_device_darwin.c', 'hw/rdn_mem.c')
   rdn_device_link_args = ['-framework', 'IOKit', '-framework', 'CoreFoundation']
+  rdn_library_link_args = [
+    '-Wl,-exported_symbols_list,' + meson.current_source_dir() / 'rdn_gl.exports',
+  ]
 else
   rdn_device = files(
     'rdn_device_linux.c',
@@ -22,6 +25,7 @@ else
     'hw/rdn_selftest.c',
   )
   rdn_device_link_args = []
+  rdn_library_link_args = []
 endif
 
 rdn_inc = [
@@ -38,7 +42,7 @@ librdngl = shared_library(
   'rdngl',
   rdn_sources,
   gnu_symbol_visibility : 'hidden',
-  link_args : [ld_args_gc_sections, rdn_device_link_args],
+  link_args : [ld_args_gc_sections, rdn_device_link_args, rdn_library_link_args],
   include_directories : rdn_inc,
   link_whole : rdn_link_whole,
   link_with : rdn_link_with,
@@ -67,6 +71,29 @@ executable(
   c_args : rdn_gltest_args,
   include_directories : rdn_inc,
   link_args : rdn_device_link_args,
+  link_whole : rdn_link_whole,
+  link_with : rdn_link_with,
+  dependencies : rdn_gltest_deps,
+  install : false,
+)
+
+rdn_nv12_test_sources = [rdn_sources, files('tests/rdn_nv12_test.c')]
+rdn_nv12_test_link_args = rdn_device_link_args
+if host_machine.system() == 'darwin'
+  # Keep the static C++ runtime local, as for the Leopard GL bundle.
+  rdn_nv12_test_link_args += [
+    '-Wl,-exported_symbols_list,' + meson.current_source_dir() / 'rdn_nv12_test.exports',
+  ]
+endif
+if host_machine.system() != 'darwin' and with_gallium_softpipe
+  rdn_nv12_test_sources += files('tests/rdn_soft.c')
+endif
+executable(
+  'rdn_nv12_test',
+  rdn_nv12_test_sources,
+  c_args : rdn_gltest_args,
+  include_directories : rdn_inc,
+  link_args : rdn_nv12_test_link_args,
   link_whole : rdn_link_whole,
   link_with : rdn_link_with,
   dependencies : rdn_gltest_deps,
@@ -117,16 +144,15 @@ if host_machine.system() == 'darwin'
     output : 'rdn_dispatch_gen.c',
     command : [
       prog_python, '@INPUT@',
-      '/usr/local/MacOSX10.4u.sdk/System/Library/Frameworks/OpenGL.framework/Headers/gliDispatch.h',
+      meson.get_external_property('rdn_sdk', '/usr/local/MacOSX10.4u.sdk') / 'System/Library/Frameworks/OpenGL.framework/Headers/gliDispatch.h',
       '@OUTPUT@',
     ],
   )
   shared_module(
     'RadeonNIGLDriver',
-    files('gld/RadeonNIGLDriver.c', 'gld/rdn_mesa.c', 'gld/rdn_hook.c', 'gld/rdn_arbtext.c'), rdn_dispatch_c,
+    files('gld/RadeonNIGLDriver.c', 'gld/rdn_mesa.c', 'gld/rdn_hook.c', 'gld/rdn_arbtext.c', 'gld/rdn_video.c'), rdn_dispatch_c,
     rdn_sources,
     c_args : ['-DRDN_MESA'],
-    gnu_symbol_visibility : 'hidden',
     include_directories : [rdn_inc, include_directories('gld')],
     # Only the gld* entry points leave the bundle. The static libstdc++
     # would otherwise export its weak symbols, and on Mac OS X 10.5 dyld

@@ -16,7 +16,8 @@
 # It also installs RadeonNIGLDriver.bundle (OpenGL) and RadeonNIGA.plugin
 # from this package into /System/Library/Extensions; they do nothing
 # without the accelerator. --hwcursor (with --accel) uses the card's
-# hardware cursor. Run the script again without options to go back.
+# hardware cursor; accelerated Leopard installs enable it by default.
+# Run the script again without options to go back.
 #
 # --check only asks the system whether it would load the kext (kextload -t
 # -n: dependencies and undefined symbols) and writes nothing. --try loads
@@ -68,10 +69,12 @@ case "$(sw_vers -productVersion)" in
     [ -f "$here/LEOPARD" ] ||
         fail "this package is built for Mac OS X 10.4; this is $(sw_vers -productVersion). The 10.5 package has a file LEOPARD."
     if [ "$accel" = 1 ]; then
+        # Software cursor restoration can overwrite asynchronous screen updates.
+        hwcursor=1
         [ -f "$here/LEOPARD-ACCEL" ] ||
             fail "--accel on 10.5 needs the package built for it (a file LEOPARD-ACCEL, scripts/leopard.sh package-accel)"
-        echo "Mac OS X $(sw_vers -productVersion): EXPERIMENTAL accelerator. Run on one Power Mac G5 under"
-        echo "10.5.9 only (OpenGL in windows and full screen; Quartz Extreme and Core Image in software)."
+        echo "Mac OS X $(sw_vers -productVersion): EXPERIMENTAL accelerator. Tested on a Power Mac G5"
+        echo "with 10.5.8 and a Radeon HD 7570; keep a recovery display available."
         echo "If the Mac does not finish booting, see the end of this script's output for the way back."
     else
         echo "Mac OS X $(sw_vers -productVersion): framebuffer-only build."
@@ -178,10 +181,9 @@ perl -MMIME::Base64 -e '
             $extra .= "\t\t\t<key>FW_MC</key>\n\t\t\t<data>$blob</data>\n";
         }
         $extra .= "\t\t\t<key>AccelCaps</key>\n\t\t\t<integer>3</integer>\n";
-        $extra .= "\t\t\t<key>AGPShim</key>\n\t\t\t<integer>3</integer>\n";
-        # The window server of 10.5.9 makes a surface of many of its own windows (the
-        # Apple of the menu bar, parts of the Dock) that nothing draws: the gate
-        # leaves it only the surfaces programs announce, their OpenGL windows.
+        $extra .= "\t\t\t<key>AGPShim</key>\n\t\t\t<integer>3</integer>\n"
+            unless -f "$dir/LEOPARD";
+        # Gate unregistered surfaces on Leopard.
         my $gate = -f "$dir/LEOPARD" ? "true" : "false";
         $extra .= "\t\t\t<key>Surfaces</key>\n\t\t\t<true/>\n";
         $extra .= "\t\t\t<key>SurfaceGate</key>\n\t\t\t<$gate/>\n";
@@ -233,6 +235,28 @@ if [ "$accel" = 1 ]; then
         rm -rf "$SLE/$b.old"
         echo "Installed $SLE/$b."
     done
+    support="/Library/Application Support/RadeonNI"
+    mkdir -p "$support"
+    if [ -f "$here/QE-AUTOSTART" ] && [ -d "$here/ActivateQE.app" ] &&
+       [ -f "$here/org.radeonni.activate-qe.plist" ]; then
+        rm -f "$support/nocoreimage"
+        mkdir -p /Library/LaunchAgents
+        rm -rf "$support/ActivateQE.app"
+        cp -R "$here/ActivateQE.app" "$support/"
+        cp "$here/org.radeonni.activate-qe.plist" /Library/LaunchAgents/
+        chown -R root:wheel "$support/ActivateQE.app"
+        chown root:wheel /Library/LaunchAgents/org.radeonni.activate-qe.plist
+        chmod -R go-w "$support/ActivateQE.app"
+        chmod go-w /Library/LaunchAgents/org.radeonni.activate-qe.plist
+        echo "Installed Leopard Quartz Extreme login helper."
+    else
+        touch "$support/nocoreimage"
+        rm -f /Library/LaunchAgents/org.radeonni.activate-qe.plist
+        rm -rf "$support/ActivateQE.app"
+    fi
+else
+    rm -f /Library/LaunchAgents/org.radeonni.activate-qe.plist
+    rm -rf "/Library/Application Support/RadeonNI/ActivateQE.app"
 fi
 
 # Make the system rebuild its extension caches at the next boot.

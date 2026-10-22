@@ -25,7 +25,7 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  *
- * Authors: Alex Deucher, Christian König
+ * Authors: Alex Deucher, Christian KÃ¶nig
  */
 
 #ifndef RDN_UVD_REG_H
@@ -139,5 +139,22 @@
 
 /* Type 0 packet: write `n + 1` registers from `reg` (rdn_cp.h has type 3). */
 #define RDN_UVD_PACKET0(reg, n)	((((reg) >> 2) & 0xFFFF) | (((n) & 0x3FFF) << 16))
+
+#define RLC_CNTL                         0x3f00
+#define RLC_ENABLE                       (1u << 0)
+#define RLC_HB_CNTL                      0x3f0c
+#define RLC_HB_BASE                      0x3f10
+#define RLC_HB_RPTR                      0x3f20
+#define RLC_HB_WPTR                      0x3f1c
+#define RLC_HB_WPTR_LSB_ADDR              0x3f14
+#define RLC_HB_WPTR_MSB_ADDR              0x3f18
+#define RLC_UCODE_ADDR                   0x3f2c
+#define RLC_UCODE_DATA                   0x3f30
+#define RLC_MC_CNTL                      0x3f44
+#define RLC_UCODE_CNTL                   0x3f48
+#define UVD_CGC_STATUS					0xf4ac
+#define UVD_CGC_CTRL					0xf4b0
+#define UVD_LMI_STATUS					0xf59c
+#define UVD_VCPU_CACHE_OFFSET_MASK			0x01ffffffu
 
 #endif /* RDN_UVD_REG_H */

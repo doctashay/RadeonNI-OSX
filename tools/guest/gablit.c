@@ -1,7 +1,7 @@
 /*
  * gablit: the screen filled and copied by the GPU, without the window
  * server (the kext's RDN_UC_SCREEN_FILL and RDN_UC_SCREEN_COPY, which the
- * 2D plug-in uses with /tmp/rdnga.gpu).
+ * 2D plug-in uses for 32-bit scanout).
  *
  *   gablit x y
  *

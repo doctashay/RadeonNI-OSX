@@ -65,3 +65,9 @@ _gldCreateProgram
 _gldDestroyProgram
 _gldObjectPurgeable
 _gldObjectUnpurgeable
+
+_RDNGLRequestCompatibilityContext
+_RDNGLMakeCurrent
+_RDNGLGetProcAddress
+_RDNGLQueryVideoPackingV1
+_RDNGLPackVideoFrameV1

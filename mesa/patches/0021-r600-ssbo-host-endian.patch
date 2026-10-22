@@ -1,0 +1,40 @@
+--- a/src/gallium/drivers/r600/sfn/sfn_instr_fetch.h
++++ b/src/gallium/drivers/r600/sfn/sfn_instr_fetch.h
+@@ -66,6 +66,7 @@
+    void set_num_format(EVFetchNumFormat nf) { m_num_format = nf; }
+    EVFetchNumFormat num_format() const { return m_num_format; }
+    EVFetchEndianSwap endian_swap() const { return m_endian_swap; }
++   void set_endian_swap(EVFetchEndianSwap es) { m_endian_swap = es; }
+ 
+    uint32_t mega_fetch_count() const { return m_mega_fetch_count; }
+    uint32_t array_base() const { return m_array_base; }
+--- a/src/gallium/drivers/r600/sfn/sfn_instr_mem.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_instr_mem.cpp
+@@ -660,6 +660,7 @@
+       dest, dest_swz[comp_idx], addr_temp, 0, res_id, res_offset, formats[comp_idx]);
+    ir->set_fetch_flag(FetchInstr::use_tc);
+    ir->set_num_format(vtx_nf_int);
++   ir->set_endian_swap((EVFetchEndianSwap)r600_endian_swap(32));
+ 
+    shader.emit_instruction(ir);
+    return true;
+--- a/src/gallium/drivers/r600/evergreen_state.c
++++ b/src/gallium/drivers/r600/evergreen_state.c
+@@ -4553,6 +4553,7 @@
+ 		rview->cb_color_base = color.offset;
+ 		rview->cb_color_dim = color.dim;
+ 		rview->cb_color_info = color.info |
++			S_028C70_ENDIAN(r600_endian_swap(32)) |
+ 			S_028C70_RAT(1) |
+ 			S_028C70_RESOURCE_TYPE(res_type);
+ 		rview->cb_color_pitch = color.pitch;
+--- a/src/gallium/drivers/r600/sfn/sfn_instr_mem.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_instr_mem.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "sfn_instr_mem.h"
+ 
++#include "../r600_formats.h"
+ #include "nir_intrinsics.h"
+ #include "nir_intrinsics_indices.h"
+ #include "sfn_alu_defines.h"

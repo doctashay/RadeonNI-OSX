@@ -1,0 +1,66 @@
+{
+  "media/gpu/mac/BUILD.gn": {
+    "before": "fbd8c3f73eee7992b44af7fb2cdfa9acb16246e476f945e25549db442100a9e9",
+    "after": "fe784732b0a91927c9e8a98ea113b45436d8f7eb6197f24ad18786c5f5e8b02e"
+  },
+  "media/mojo/services/gpu_mojo_media_client_mac.cc": {
+    "before": "98170bf6bbb49ef5ed08d72af62eb8c6c5d7e29d1a9ac966c8ea3f7a54301239",
+    "after": "50bb486177afa1739fe008c3cf17f7160a66f4d748c7d99b1983283ed6939117"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_backend.h": {
+    "before": "f0a5cbf93cf609c17307edfd0e5f240c87f182237e7923d3d3c5820fd7dd70de",
+    "after": "aeb6a5345694fc7428fe1a65efb5848c15e4996ad4cbabe4c14a61d1b1b380ce"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_session.h": {
+    "before": "94e8bb3129145fb43a2b68ba4f983370abd435b0587e1091fd2e4323d3828122",
+    "after": "f4a60dbb031770213d0296515ceb63824a04a810b9e96c5881ba2d56dc3a6287"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_session.cc": {
+    "before": "e35c6f7ce8f496364e32094ad8d94abe92f86a63419da6b26afa54dfa71eab4d",
+    "after": "ba8cd1beb9581d5dec701725efd88b758f9dbfa750e4dd1ed0b2c37e245c6f0b"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.h": {
+    "before": "e6b5e310f37c5220a1f9e9811fb544a5e87dffcd0385dd1e5a497eca5744848e",
+    "after": "049e53b7ac693252766e621b8b16b2659b601bd84f23a26d079d04e7e40adb61"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.cc": {
+    "before": "3935c1cf7380beeaf54c1fd3d441387c2519be08ee4432b6ae8da3a31ea5580e",
+    "after": "4d658b4e51504ae08cf994de0640f4f16a752a2ab2d68643ac2e842df77ca144"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_iokit_backend.cc": {
+    "before": "4b84e3a6e7c652c22a78fa28ce6799a56f33ed32c4e196401df1c43cc98d9c0c",
+    "after": "3824b778ea81de4c127730f2ee606a46a0f3b305d8cd9f9bc70954db69e76b2d"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_gl_bridge.h": {
+    "before": null,
+    "after": "8eb84f04f4aed5ed0e863f5035e657c1789ca020275d649c45eece1643c4fc4c"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter.h": {
+    "before": null,
+    "after": "d968450967561689f94154c8fc90cb5338cb0ad90e015e90cf6533a63bd70617"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter.cc": {
+    "before": null,
+    "after": "14be6bd46fe2cb8198ba88b50701b2f636734bfea1a4c2a9606f8a2421a8c73d"
+  },
+  "media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter_unittest.cc": {
+    "before": null,
+    "after": "83b2c97965f53d0989e0649afe0828c0d667c6d26417d56ac563831c87208d3f"
+  },
+  "media/gpu/mac/radeon_uvd/replay_video_decoder.h": {
+    "before": "e73735ea313499d7d0f83e33d801eede2d0bf86e22e425a7b2ab6fc6940d0f50",
+    "after": "ba33956e3a49ec28a35f1b5eddf9c533c12e50f58acb11a467bc77da1a21ea55"
+  },
+  "media/gpu/mac/radeon_uvd/replay_video_decoder.cc": {
+    "before": "6acb7251578cdc7a0c0766857bc781af481930f4358719e1a970ea6849552013",
+    "after": "1158812c9c5c50aabd472ecd3202e1a62bfba2e6d1da897ca4a64c66298e3e66"
+  },
+  "media/gpu/mac/radeon_uvd/rdn_video.h": {
+    "before": "61ae2ed3d858f7dc72152b67a085537404f08229c8cf69327a20e450c226421b",
+    "after": "43b148a5b9c63112bc3fcdfc286e25824217080e05187d1839ecea136d858117"
+  },
+  "content/browser/gpu/gpu_process_host.cc": {
+    "before": "c074b53b81dc1c5bed44a00f2710ee572d3568c4c82be322c0485f1450893e19",
+    "after": "b6777e693d6e8e0c7206987b0f1fbb0d5fefde85caaeac99a67951be43e4ff20"
+  }
+}
