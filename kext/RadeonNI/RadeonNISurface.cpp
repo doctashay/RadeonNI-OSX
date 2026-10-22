@@ -447,10 +447,17 @@ IOReturn RadeonNISurfaceClient::setShapeBacking(UInt32 options, UInt32 fbIndex,
 
 IOReturn RadeonNISurfaceClient::setIDMode(UInt32 wid, UInt32 mode)
 {
-	/* Surface 1 is the window server's screen compositor, not an app buffer. */
-	if (fAccel->surfaceGate() && wid != 1 && !fAccel->isGLSurface(wid)) {
-		if (mode != (kIOAccelSurfaceModeWindowedBit | kIOAccelSurfaceModeColorDepth8888) ||
-		    fAccel->getProperty("BackingSurfaces") != kOSBooleanTrue) {
+	bool backing = fAccel->getProperty("BackingSurfaces") == kOSBooleanTrue;
+
+	/*
+	 * Surface 1 is the window server's screen compositor, not an app buffer; it is let through
+	 * the gate only with BackingSurfaces. Without that key (the installers' default) the gate
+	 * refuses every surface that is not a GL one, surface 1 included, as it always did: letting
+	 * it through alone made the window server composite GL windows (QuickTime Player's video)
+	 * from the wrong data on 10.5, bisected on the G5 (2026-10-22).
+	 */
+	if (fAccel->surfaceGate() && (wid != 1 || !backing) && !fAccel->isGLSurface(wid)) {
+		if (mode != (kIOAccelSurfaceModeWindowedBit | kIOAccelSurfaceModeColorDepth8888) || !backing) {
 			fRefused = true;
 			note(kIOAccelSurfaceSetIDMode, wid, mode, 1, 0);
 			return kIOReturnUnsupported;
