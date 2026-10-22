@@ -1,0 +1,198 @@
+{
+  "status": "WIP; 1080p60 hardware throughput remains unresolved",
+  "date": "2026-10-22",
+  "driver_base": "c6857794f02acf49abd5d9ef80b39c97a038e8f6",
+  "driver_baseline_commit": "ee5370aadae79fedf5a2302098a6bb015b37c303",
+  "upstream_main_at_publication": "cc3b94397cf807dd799d590583d7d3ddb715641a",
+  "integration_limit": "Exact tested snapshot, not rebased onto the newer upstream UVD work.",
+  "driver_files_sha256": {
+    "Makefile": "769d78c4e02d8c05a173c957fabd5a6768508399def44244610db6bf5e8d5426",
+    "docs/JOURNAL.md": "a82748a8e725f7aa77803b352cba3115f590feddf49d0b2144939ef28e1468f6",
+    "hw/rdn_accel.h": "db4a0acd0e28c805a6aa7478ce91a9866278d418f7f96e6c32df3a862fb2abb2",
+    "hw/rdn_cp.c": "d9aa9d11b1e8c22c8d0bf8268a3eae38c99b2887eb75c431d19aa75ee44cfa13",
+    "hw/rdn_gart.c": "b16e13afc2a28aac5d185ab6a00aa0b212aa5b08cd220a64d87d8ed77731c8a2",
+    "hw/rdn_gart.h": "1a0c2c8726c7f49208ee4d24e9ecf7e37178f5415d53dd88738ded66df1697d9",
+    "hw/rdn_mem.c": "10b9abb0560c6eff2f5850c26fa85285c4f7437d61bce3c9c52aae31ea7400d7",
+    "hw/rdn_mem.h": "2b91ef6b2a1351e2953da8b53bce6f657ac0a123e3f0da3f8f15bd5105bab2d7",
+    "hw/rdn_user.h": "1fb066e2f0b14834eda2a24607011a59a61080b518fdc71645a70899ece7bc18",
+    "kext/RadeonNI/Makefile": "bac4d9227a4ad826c37105dd940044d65b7e3a61659fca8a944265ce3f9061f6",
+    "kext/RadeonNI/RadeonNI.cpp": "a031b3136a9de7c160de80da004bf4e220443f5d1ef9a3b0bcfe56cd03c3e060",
+    "kext/RadeonNI/RadeonNI.h": "8cc2754f640fd68fa27fe93d45ba9cc74669cee09976e3d49b0a8bb7eae72179",
+    "kext/RadeonNI/RadeonNIAccel.cpp": "2e8d9949c8b94e103fe1f4db976ba04acf0e550214ae30eaf7c39d57c08ade3c",
+    "kext/RadeonNI/RadeonNIAccel.h": "a9f4053e5457b6644bcebd28ed270a8d0f12284f95dff8ad1160e604014a8d4e",
+    "hw/rdn_cp_dma_readback.c": "d8b945b24c933f0102aec74083e9823af98583e304ccab0d51bb7ce684dd5120",
+    "hw/rdn_cp_dma_readback.h": "41eca25fa5b42fe15227f24f231e1fdcc5d9ac55c6f3f3938e52433e97f97cbf",
+    "hw/rdn_mc_layout.c": "2784a8ff5ac58b8836948059c4d7865eb841a715f20fc0bceeca696b06e13a09",
+    "hw/rdn_mc_layout.h": "cad70c31493d040e01d453c6628146b956a16ef73e698c6fd6288a7c5e8892f1",
+    "hw/rdn_uvd.c": "0a0f1af1006adbfe1adff5089fb0b9e984f340ac46e3fa1f228df766596eb667",
+    "hw/rdn_uvd.h": "64cf29d306d677ec86ed016d081661fabb74bfdc3359d49d7fa3804334f89844",
+    "hw/rdn_uvd_h264.c": "6dd5a55baa3f6a1d58e4bd6b2d8d4ea69efad1b05dd414056b3faa82413c1f72",
+    "hw/rdn_uvd_h264.h": "2deaaf5db5823598bd7034dacf3b09f74cea14585e35c26027168416c94144e8",
+    "hw/rdn_uvd_reg.h": "12e87a98e2baa61361e45e6d6221c451ff86c56cf2fc8196c07d187d0c0d3998",
+    "hw/rdn_video.h": "93751f9541f974971bf5af49ad8862baae69d27cb38a9d28f8da68c145e6bfeb",
+    "kext/RadeonNI/RadeonNIUvdFixture.cpp": "291433e3ba7ba434947237c4afd98cf5c4323e8e7d7ddbd9ed6d1021ded90812",
+    "kext/RadeonNI/RadeonNIUvdSession.cpp": "de6d4fd79f9099be6c146bab7fe1b5a365fd1a34de40de3d88b29423aeb09266",
+    "kext/RadeonNI/RadeonNIVideo.cpp": "43f90a4b2107fd6eb1a9ce4c0004ca376b9cefa9d76a4e33951ef101576b7b0a",
+    "kext/RadeonNI/RadeonNIVideo.h": "734a036a1f429eb1ccfe3eb1ddf7aad07554be57d36494c1e1857d0be3ec6c2f",
+    "kext/RadeonNI/RadeonNIVideoMemory.cpp": "9485f2becc9c3b69c1f51abcf340acbe4639fb39683a2ecf85af669fbabe9b13",
+    "kext/RadeonNI/RadeonNIVideoMemory.h": "719d37104e11c5305e1573638297d513b7d193e8c5d06cf03bd1acb4bd130a45",
+    "tests/accel_init_hook.c": "931466832766e84a1dfe3a3ec568d3bfa0bd0ac1524e2fa4977fcac9581d89c3",
+    "tests/cp_dma_fill_model.c": "bf27987707a81b7e93c552af78fc3368a1133ab56ad2261da82201c7e746b8e2",
+    "tests/cp_dma_readback_model.c": "748ff84b96a6e849755757ad75b22217195eabb90a2e6d08e4e169ad5de74987",
+    "tests/cp_try_submit.c": "eeba1cdba7cf2c029bacb46ba2e48f9b0303550102c522e2775db3424dc948ae",
+    "tests/gart_scratch.c": "d372a67b8f22a5f7f73f8c4c228d29a100960795c55efcea0c8abbc210aa6164",
+    "tests/mc_layout_model.c": "6a242e18712169e647407546be9689cf9f8717ec3dfbda87273444831f7e5fdc",
+    "tests/mem_segment.c": "eba9c52dc5937fb9f44166974d2813148a85c3bb30b3319d5dad11ebd6f994e6",
+    "tests/test_mc_layout_caller.py": "173517c43685c0e0304b7cb962ac8886113c4bc11476ccbf096b4622cc658931",
+    "tests/test_uvd_diagnostic.py": "b426a2beec86a34206bbf07f849035bb08ccaa826a9d396d077f04ef4f41036c",
+    "tests/test_uvd_fixture.py": "e06abebed16bc33f128ae09546f196ac7c8683a4fd9b8897e620f5dedb1a3126",
+    "tests/test_uvd_fixture_boundary.py": "8cd6714eb323cbde35b85dfaae848ca0a77220f810b684a7306e15b8e5e6ee07",
+    "tests/test_uvd_session.py": "8d5e03d06f8b1056504b287b769020cbd6f9c4a0f0f3494783d27b0f3a5f7e95",
+    "tests/uvd_decode_fixture.c": "e5d0f918e1864e9001f1bd6d803b048728dd6c57eef60f60d80bc1d6b8c294e7",
+    "tests/uvd_decode_fixture.h": "f761a19f52b40fe42f64e2f7303accd27be654dd6d9b4aca2ea3962489c7f97f",
+    "tests/uvd_h264_model.c": "76d0f4fddfd3e99ad3b12b103870c2040fa173e1baabd2299b9d681b9bdd262a",
+    "tests/uvd_model.c": "edc17afd900e759b4ea244097f50d5b624dc3e8580838ad27485ba508a8c3e80",
+    "tools/guest/uvdfetchprobe.c": "6ab83b7de8c51b5b3816c5b715a682a5767b43e84b9497fd28c5ae1cc500396c",
+    "tools/guest/uvdfixtureprobe.c": "397866e6c1f2489d2b3e281cd1c4a0171ac30fe00c4e6b5c33051d2d6eb2a1db",
+    "tools/guest/uvdprobe.c": "d3723c1e693c6e24fd6673a86f6f19585f6fd22412c51ba7df622d464bcdb459"
+  },
+  "browser": {
+    "base_commit": "c4dce24b5180a1e722c7b1431b50ccaa8fc2357e",
+    "patch_sha256": "d1c53ab080a4d935eb17288b1dafbf5ee77affd3b67db305a1dc051a0ba05093",
+    "applicability": "Applies to the preserved pre-task dirty snapshot. Earlier local Leopard/native-presentation changes are prerequisites; clean-base applicability is not claimed.",
+    "framework_sha256": "8fb45eb262ee8652a016dd775db0170f86e08e514cd61e172e1cf016d4ee74a7",
+    "separate_gpu_process": true
+  },
+  "allocation": {
+    "visible_before_bytes": 87764992,
+    "visible_after_bytes": 4239360,
+    "dpb_images": 17,
+    "dpb_and_target_hidden_first": true
+  },
+  "validation": {
+    "session_test_groups": 23,
+    "modes": [
+      "host",
+      "big-endian QEMU",
+      "ASan+UBSan"
+    ],
+    "allocator_tests_passed": true,
+    "native_leopard_build_passed": true,
+    "relocation_checks": 14627,
+    "decoded_nv12_frames_matching_cpu_reference": 180,
+    "installed_and_rebooted": true,
+    "kernel_sha256": "4d9c89de6fdd3faeb3f20ed9db23e4bed659edca8d715bbd0ad6ee1d5c5cfbe5"
+  },
+  "benchmark": {
+    "machine": "Power Mac G5 Quad, 12 GB RAM, Radeon HD 7570/TURKS, Leopard 10.5.8",
+    "method": "Matched synthetic H.264 1080p30/60 clips; same package; separate GPU; 1600x900 window; fresh profiles; 3 s warmup then 10 s measurement; two sequential trials per mode/rate. Only software decode-disable flag differs. Jak absent; no UI interaction during timing.",
+    "groups": {
+      "uvd_30": {
+        "trials": 2,
+        "stable_cpu_trials": 1,
+        "frame_deltas": {
+          "frames": 598,
+          "total": 600,
+          "dropped": 0,
+          "corrupted": 0
+        },
+        "drop_fraction": 0.0,
+        "wall_seconds": 20.003199999999953,
+        "media_seconds": 20.003196,
+        "median_media_advance_per_wall": 0.9999998005358349,
+        "median_callbacks_per_second": 29.895216911757316,
+        "median_quality_nondropped_per_second": 29.995200914806674,
+        "stable_cpu_median_cores": {
+          "browser": 0.0428563673134416,
+          "renderer": 0.4295603328393794,
+          "gpu": 0.7275615846235421,
+          "windowserver": 0.08172609580702808,
+          "owned": 1.1999782847763631,
+          "owned_plus_windowserver": 1.2817043805833912
+        }
+      },
+      "uvd_60": {
+        "trials": 2,
+        "stable_cpu_trials": 2,
+        "frame_deltas": {
+          "frames": 571,
+          "total": 607,
+          "dropped": 43,
+          "corrupted": 0
+        },
+        "drop_fraction": 0.07084019769357495,
+        "wall_seconds": 20.002499999999998,
+        "media_seconds": 10.297184,
+        "median_media_advance_per_wall": 0.5147949745819299,
+        "median_callbacks_per_second": 28.54642796481238,
+        "median_quality_nondropped_per_second": 28.19648045693856,
+        "stable_cpu_median_cores": {
+          "browser": 0.0513246281582372,
+          "renderer": 0.4798627477802959,
+          "gpu": 0.7439609358794864,
+          "windowserver": 0.09268386101730054,
+          "owned": 1.2751483118180196,
+          "owned_plus_windowserver": 1.36783217283532
+        }
+      },
+      "software_30": {
+        "trials": 2,
+        "stable_cpu_trials": 1,
+        "frame_deltas": {
+          "frames": 600,
+          "total": 600,
+          "dropped": 0,
+          "corrupted": 0
+        },
+        "drop_fraction": 0.0,
+        "wall_seconds": 20.00340000000014,
+        "media_seconds": 20.003322,
+        "median_media_advance_per_wall": 0.9999961006768741,
+        "median_callbacks_per_second": 29.99490087884631,
+        "median_quality_nondropped_per_second": 29.99490087884631,
+        "stable_cpu_median_cores": {
+          "browser": 0.03986598173196908,
+          "renderer": 1.0424954222909921,
+          "gpu": 0.3338775970052413,
+          "windowserver": 0.07574536529074115,
+          "owned": 1.4162390010282024,
+          "owned_plus_windowserver": 1.4919843663189436
+        }
+      },
+      "software_60": {
+        "trials": 2,
+        "stable_cpu_trials": 2,
+        "frame_deltas": {
+          "frames": 1098,
+          "total": 1200,
+          "dropped": 7,
+          "corrupted": 0
+        },
+        "drop_fraction": 0.005833333333333334,
+        "wall_seconds": 20.002700000000186,
+        "media_seconds": 20.002726000000003,
+        "median_media_advance_per_wall": 1.0000012998285133,
+        "median_callbacks_per_second": 54.892601498549546,
+        "median_quality_nondropped_per_second": 59.64194858839711,
+        "stable_cpu_median_cores": {
+          "browser": 0.07321450618865467,
+          "renderer": 2.072931115798923,
+          "gpu": 0.6424987520947365,
+          "windowserver": 0.16236803545352124,
+          "owned": 2.788644374082314,
+          "owned_plus_windowserver": 2.951012409535835
+        }
+      }
+    },
+    "cpu_30fps": "One stable matched pair: 1.200 UVD versus 1.416 software Aurora CPU core equivalents (15.27% less). First pair excluded for utility-process exits.",
+    "throughput_60fps": "UVD 0.515x real time versus software 1.000x; hardware is slower. Lower UVD CPU is not equal-work efficiency.",
+    "limitations": [
+      "Only two sequential 10-second trials per mode/rate; the first 30 fps CPU trial in each mode is excluded for process churn. No statistical significance or all-content claim.",
+      "Raw ps endpoints cannot rule out short-lived processes between samples; remaining stable background CPU is reported separately.",
+      "GPU-process CPU is not GPU-engine utilization. The CPU endpoint interval slightly exceeds the video measurement.",
+      "Earlier partial hardware rows and the old Jak-active software baseline were not pooled."
+    ],
+    "independent_review_sha256": "4a0740f9dba6d5d87754a59ba6cb1b72ac95a1e6a0ea1fa01b42a3ece5a229ff"
+  },
+  "deployment_limit": "Source review snapshot; firmware blobs and production activation properties are external deployment artifacts. This branch is not a turnkey installer."
+}

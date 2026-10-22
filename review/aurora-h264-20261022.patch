@@ -1,0 +1,3176 @@
+--- a/media/base/decoder.cc
++++ b/media/base/decoder.cc
+@@ -54,6 +54,8 @@
+       return "Testing or Mock Video decoder";
+     case VideoDecoderType::kOutOfProcess:
+       return "OOPVideoDecoder";
++    case VideoDecoderType::kRadeonUvd:
++      return "RadeonUvdVideoDecoder";
+     case VideoDecoderType::kVideoToolbox:
+       return "VideoTooboxVideoDecoder";
+   }
+--- a/media/base/decoder.h
++++ b/media/base/decoder.h
+@@ -56,8 +56,10 @@
+   kOutOfProcess = 18,  // OOPVideoDecoder (Linux and ChromeOS)
+   kVideoToolbox = 19,  // VideoToolboxVideoDecoder (Mac)
+ 
++  kRadeonUvd = 20,  // Radeon UVD (PowerPC Mac)
++
+   // Keep this at the end and equal to the last entry.
+-  kMaxValue = kVideoToolbox
++  kMaxValue = kRadeonUvd
+ };
+ 
+ MEDIA_EXPORT std::string GetDecoderName(AudioDecoderType type);
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -829,6 +829,15 @@
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ #if BUILDFLAG(IS_APPLE)
++#if BUILDFLAG(IS_MAC) && defined(ARCH_CPU_PPC_FAMILY)
++BASE_FEATURE(kRadeonUvdVideoDecoder,
++             "RadeonUvdVideoDecoder",
++             base::FEATURE_ENABLED_BY_DEFAULT);
++#else
++BASE_FEATURE(kRadeonUvdVideoDecoder,
++             "RadeonUvdVideoDecoder",
++             base::FEATURE_DISABLED_BY_DEFAULT);
++#endif
+ // Use the new VideoToolboxVideoDecoder for hardware decoding.
+ BASE_FEATURE(kVideoToolboxVideoDecoder,
+              "VideoToolboxVideoDecoder",
+--- a/media/base/media_switches.h
++++ b/media/base/media_switches.h
+@@ -326,6 +326,7 @@
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kVideoBlitColorAccuracy);
+ #if BUILDFLAG(IS_APPLE)
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kVideoToolboxVideoDecoder);
++MEDIA_EXPORT BASE_DECLARE_FEATURE(kRadeonUvdVideoDecoder);
+ #endif  // BUILDFLAG(IS_APPLE)
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kWebRTCColorAccuracy);
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kVp9kSVCHWDecoding);
+--- a/media/gpu/mac/BUILD.gn
++++ b/media/gpu/mac/BUILD.gn
+@@ -17,6 +17,35 @@
+   visibility = [ "//media/gpu" ]
+ 
+   sources = []
++  if ((current_cpu == "ppc" || current_cpu == "ppc64") &&
++      enable_ffmpeg_video_decoders) {
++    sources += [
++      "radeon_uvd/worker_ffmpeg_decoder.cc",
++      "radeon_uvd/replay_video_decoder.h",
++      "radeon_uvd/replay_video_decoder.cc",
++      "radeon_uvd/annex_b_replay.h",
++      "radeon_uvd/annex_b_replay.cc",
++      "radeon_uvd/radeon_uvd_backend.h",
++      "radeon_uvd/radeon_uvd_iokit_backend.cc",
++      "radeon_uvd/radeon_uvd_iokit_backend.h",
++      "radeon_uvd/radeon_uvd_session.cc",
++      "radeon_uvd/radeon_uvd_session.h",
++      "radeon_uvd/radeon_uvd_video_decoder.cc",
++      "radeon_uvd/radeon_uvd_video_decoder.h",
++      "radeon_uvd/radeon_uvd_wire_validation.h",
++      "radeon_uvd/rdn_uvd_h264.c",
++      "radeon_uvd/rdn_uvd_h264.h",
++      "radeon_uvd/rdn_video.h",
++      "radeon_uvd/uvd_metadata_adapter.h",
++    ]
++    deps = [
++      "//base",
++      "//media",
++      "//media/gpu:common",
++      "//ui/gfx/geometry",
++    ]
++    frameworks = [ "IOKit.framework" ]
++  }
+   if ((current_cpu != "ppc" && current_cpu != "ppc64")) {
+     sources += [
+     "video_toolbox_decode_metadata.cc",
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/annex_b_replay.cc
+@@ -0,0 +1,164 @@
++#include "annex_b_replay.h"
++#include "media/base/timestamp_constants.h"
++#include "media/video/h264_bit_reader.h"
++
++namespace aurora_uvd {
++namespace {
++bool ReadUE(media::H264BitReader* bits, int* value) {
++  int bit, zeros = 0, suffix = 0;
++  while (bits->ReadBits(1, &bit)) {
++    if (bit) {
++      if (zeros && !bits->ReadBits(zeros, &suffix)) return false;
++      *value = int((uint32_t(1) << zeros) - 1 + uint32_t(suffix));
++      return true;
++    }
++    if (++zeros > 30) return false;
++  }
++  return false;
++}
++bool ReadSE(media::H264BitReader* bits, int* value) {
++  int code;
++  if (!ReadUE(bits, &code)) return false;
++  *value = (code & 1) ? code / 2 + 1 : -(code / 2);
++  return true;
++}
++// Chromium rejects PAFF; read only the picture identity and let FFmpeg decode it.
++bool ReadFieldIdentity(media::H264Parser* parser, const media::H264NALU& nalu,
++                       media::H264SliceHeader* slice) {
++  media::H264BitReader bits;
++  if (nalu.size <= 1 || !bits.Initialize(nalu.data + 1, nalu.size - 1) ||
++      !ReadUE(&bits, &slice->first_mb_in_slice) ||
++      !ReadUE(&bits, &slice->slice_type) || slice->slice_type >= 10 ||
++      !ReadUE(&bits, &slice->pic_parameter_set_id)) return false;
++  const auto* pps = parser->GetPPS(slice->pic_parameter_set_id);
++  const auto* sps = pps ? parser->GetSPS(pps->seq_parameter_set_id) : nullptr;
++  if (!sps || sps->separate_colour_plane_flag || sps->frame_mbs_only_flag ||
++      sps->log2_max_frame_num_minus4 < 0 || sps->log2_max_frame_num_minus4 > 12)
++    return false;
++  int field, bottom;
++  if (!bits.ReadBits(sps->log2_max_frame_num_minus4 + 4, &slice->frame_num) ||
++      !bits.ReadBits(1, &field) || !field || !bits.ReadBits(1, &bottom)) return false;
++  slice->field_pic_flag = true;
++  slice->bottom_field_flag = bottom;
++  if (slice->idr_pic_flag && !ReadUE(&bits, &slice->idr_pic_id)) return false;
++  if (sps->pic_order_cnt_type == 0) {
++    if (sps->log2_max_pic_order_cnt_lsb_minus4 < 0 ||
++        sps->log2_max_pic_order_cnt_lsb_minus4 > 12 ||
++        !bits.ReadBits(sps->log2_max_pic_order_cnt_lsb_minus4 + 4,
++                       &slice->pic_order_cnt_lsb)) return false;
++  } else if (sps->pic_order_cnt_type == 1 && !sps->delta_pic_order_always_zero_flag) {
++    if (!ReadSE(&bits, &slice->delta_pic_order_cnt0)) return false;
++  }
++  return true;
++}
++bool NewPicture(const media::H264SliceHeader& a,
++                const media::H264SliceHeader& b) {
++  return a.frame_num != b.frame_num ||
++      a.pic_parameter_set_id != b.pic_parameter_set_id ||
++      a.field_pic_flag != b.field_pic_flag ||
++      (a.field_pic_flag && a.bottom_field_flag != b.bottom_field_flag) ||
++      ((a.nal_ref_idc == 0) != (b.nal_ref_idc == 0)) ||
++      a.idr_pic_flag != b.idr_pic_flag ||
++      (b.idr_pic_flag && (a.idr_pic_id != b.idr_pic_id || !b.first_mb_in_slice)) ||
++      a.pic_order_cnt_lsb != b.pic_order_cnt_lsb ||
++      a.delta_pic_order_cnt_bottom != b.delta_pic_order_cnt_bottom ||
++      a.delta_pic_order_cnt0 != b.delta_pic_order_cnt0 ||
++      a.delta_pic_order_cnt1 != b.delta_pic_order_cnt1;
++}
++void Append(std::vector<uint8_t>* bytes, const media::H264NALU& nalu) {
++  bytes->insert(bytes->end(), {0, 0, 0, 1});
++  bytes->insert(bytes->end(), nalu.data, nalu.data + nalu.size);
++}
++}  // namespace
++void AnnexBReplay::Clear() {
++  parser_ = std::make_unique<media::H264Parser>();
++  parameters_.clear();
++  parameter_bytes_ = 0;
++}
++bool AnnexBReplay::Save(int type, int id, const media::H264NALU& nalu) {
++  if (id < 0 || id >= (type == media::H264NALU::kSPS ? 32 : 256)) return false;
++  auto key = std::make_pair(type, id);
++  auto found = parameters_.find(key);
++  size_t previous = found == parameters_.end() ? 0 : found->second.size();
++  if (size_t(nalu.size) + 4 > 65536 - (parameter_bytes_ - previous)) return false;
++  auto& saved = parameters_[key];
++  saved.clear();
++  Append(&saved, nalu);
++  parameter_bytes_ += saved.size();
++  parameter_bytes_ -= previous;
++  return true;
++}
++std::vector<uint8_t> AnnexBReplay::Parameters() const {
++  std::vector<uint8_t> result;
++  for (const auto& item : parameters_)
++    result.insert(result.end(), item.second.begin(), item.second.end());
++  return result;
++}
++bool AnnexBReplay::Split(const media::DecoderBuffer& input,
++                        std::vector<ReplayAccessUnit>* output) {
++  output->clear();
++  if (input.end_of_stream() || input.decrypt_config() || !input.data_size() ||
++      input.data_size() > 64u * 1024u * 1024u ||
++      input.timestamp() == media::kNoTimestamp) return false;
++  parser_->SetStream(input.data(), input.data_size());
++  std::vector<uint8_t> bytes, parameters;
++  bool picture = false, idr = false;
++  media::H264SliceHeader previous;
++  auto emit = [&]() {
++    if (bytes.empty()) return true;
++    if (output->size() == 512) return false;
++    ReplayAccessUnit unit;
++    unit.buffer = media::DecoderBuffer::CopyFrom(bytes.data(), bytes.size());
++    unit.buffer->set_timestamp(input.timestamp());
++    unit.buffer->set_duration(input.duration());
++    unit.buffer->set_is_key_frame(idr);
++    unit.idr = idr;
++    unit.picture = picture;
++    if (picture) {
++      unit.field = previous.field_pic_flag;
++      unit.bottom = previous.bottom_field_flag;
++      unit.frame_num = previous.frame_num;
++      unit.pps_id = previous.pic_parameter_set_id;
++      unit.reference = previous.nal_ref_idc != 0;
++    }
++    unit.parameters = std::move(parameters);
++    output->push_back(std::move(unit));
++    bytes.clear();
++    picture = idr = false;
++    return true;
++  };
++  media::H264NALU nalu;
++  media::H264Parser::Result result;
++  while ((result = parser_->AdvanceToNextNALU(&nalu)) == media::H264Parser::kOk) {
++    const int type = nalu.nal_unit_type;
++    if (picture && (type == media::H264NALU::kAUD ||
++                    type == media::H264NALU::kSEIMessage ||
++                    type == media::H264NALU::kSPS || type == media::H264NALU::kPPS))
++      if (!emit()) return false;
++    if (type == media::H264NALU::kSPS || type == media::H264NALU::kPPS) {
++      int id;
++      auto parsed = type == media::H264NALU::kSPS ? parser_->ParseSPS(&id) : parser_->ParsePPS(&id);
++      if (parsed != media::H264Parser::kOk || !Save(type, id, nalu)) return false;
++    } else if (type == media::H264NALU::kNonIDRSlice || type == media::H264NALU::kIDRSlice) {
++      media::H264SliceHeader slice;
++      auto parsed = parser_->ParseSliceHeader(nalu, &slice);
++      if (parsed != media::H264Parser::kOk &&
++          !(parsed == media::H264Parser::kUnsupportedStream && slice.field_pic_flag &&
++            ReadFieldIdentity(parser_.get(), nalu, &slice))) return false;
++      if (picture && NewPicture(previous, slice) && !emit()) return false;
++      if (!picture) {
++        picture = true;
++        idr = slice.idr_pic_flag;
++        if (idr) parameters = Parameters();
++      }
++      previous = slice;
++    } else if (type == media::H264NALU::kSliceDataA ||
++               type == media::H264NALU::kSliceDataB ||
++               type == media::H264NALU::kSliceDataC || type >= media::H264NALU::kSPSExt) {
++      return false;
++    }
++    Append(&bytes, nalu);
++  }
++  return result == media::H264Parser::kEOStream && emit() && !output->empty();
++}
++}  // namespace aurora_uvd
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/annex_b_replay.h
+@@ -0,0 +1,32 @@
++#ifndef AURORA_ANNEX_B_REPLAY_H_
++#define AURORA_ANNEX_B_REPLAY_H_
++#include <map>
++#include <memory>
++#include <vector>
++#include "base/memory/scoped_refptr.h"
++#include "media/base/decoder_buffer.h"
++#include "media/video/h264_parser.h"
++
++namespace aurora_uvd {
++struct ReplayAccessUnit {
++  scoped_refptr<media::DecoderBuffer> buffer;
++  std::vector<uint8_t> parameters;
++  bool idr = false;
++  bool picture = false;
++  bool field = false, bottom = false, reference = false;
++  int frame_num = 0, pps_id = 0;
++};
++// Complete Annex-B packets are normalized to one primary picture per buffer.
++class AnnexBReplay {
++ public:
++  bool Split(const media::DecoderBuffer&, std::vector<ReplayAccessUnit>*);
++  void Clear();
++ private:
++  bool Save(int type, int id, const media::H264NALU&);
++  std::vector<uint8_t> Parameters() const;
++  std::unique_ptr<media::H264Parser> parser_ = std::make_unique<media::H264Parser>();
++  std::map<std::pair<int, int>, std::vector<uint8_t>> parameters_;
++  size_t parameter_bytes_ = 0;
++};
++}  // namespace aurora_uvd
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_backend.h
+@@ -0,0 +1,38 @@
++#ifndef AURORA_UVD_BACKEND_H_
++#define AURORA_UVD_BACKEND_H_
++#include <stdint.h>
++#include <stddef.h>
++#include <vector>
++#include "uvd_metadata_adapter.h"
++
++namespace aurora_uvd {
++enum class BackendStatus { kOk, kUnsupported, kFailure, kTimeout };
++struct Capabilities {
++  bool ready = false;
++  uint32_t profile_mask = 0;  // Baseline=1, Main=2, High=4; not a wire format.
++  uint32_t max_width = 0, max_height = 0, max_bitstream_bytes = 0;
++};
++struct LinearNV12 {
++  uint32_t width = 0, height = 0, y_stride = 0, uv_stride = 0;
++  size_t y_offset = 0, uv_offset = 0;
++  std::vector<uint8_t> bytes;
++};
++
++// All calls and destruction run on the decoder worker. No GPU pointers escape.
++class Backend {
++ public:
++  virtual ~Backend() = default;
++  virtual BackendStatus Query(Capabilities* actual) = 0;
++  virtual BackendStatus Create(const rdn_uvd_h264_config& config) = 0;
++  virtual BackendStatus Decode(const Metadata& metadata,
++                               const std::vector<uint8_t>& annex_b,
++                               LinearNV12* completed_copy) = 0;
++  // Destination is caller-owned compact NV12; it is never retained.
++  virtual BackendStatus DecodeInto(const Metadata& metadata,
++                                   const std::vector<uint8_t>& annex_b,
++                                   uint8_t* destination, size_t capacity);
++  // Failure must retain/quarantine uncertain GPU storage, including on destruction.
++  virtual BackendStatus Destroy() = 0;
++};
++}  // namespace aurora_uvd
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_iokit_backend.cc
+@@ -0,0 +1,248 @@
++#include "radeon_uvd_iokit_backend.h"
++#include "radeon_uvd_wire_validation.h"
++#include <IOKit/IOKitLib.h>
++#include <mach/mach.h>
++#include <string.h>
++#include <utility>
++
++namespace aurora_uvd {
++namespace {
++static_assert(sizeof(rdn_video_query) == 128);
++static_assert(sizeof(rdn_video_create) == 96);
++static_assert(sizeof(rdn_video_session) == 128);
++static_assert(sizeof(rdn_video_decode) == 548);
++static_assert(sizeof(rdn_video_output) == 128);
++static_assert(sizeof(rdn_video_release) == 32);
++static_assert(sizeof(rdn_video_destroy) == 32);
++
++BackendStatus Status(kern_return_t result) {
++  if (result == KERN_SUCCESS) return BackendStatus::kOk;
++  if (result == kIOReturnTimeout) return BackendStatus::kTimeout;
++  if (result == kIOReturnUnsupported || result == kIOReturnNotReady ||
++      result == kIOReturnExclusiveAccess || result == kIOReturnBusy ||
++      result == kIOReturnNotPrivileged)
++    return BackendStatus::kUnsupported;
++  return BackendStatus::kFailure;
++}
++
++class IOKitBackend final : public Backend {
++ public:
++  explicit IOKitBackend(bool validation) : validation_(validation) {}
++  ~IOKitBackend() override { Destroy(); }
++
++  BackendStatus Query(Capabilities* actual) override {
++    if (!actual) return BackendStatus::kFailure;
++    *actual = {};
++    if (!connection_) {
++      io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
++          IOServiceMatching("RadeonNIAccel"));
++      if (!service) return BackendStatus::kUnsupported;
++      kern_return_t result = IOServiceOpen(service, mach_task_self(),
++          RDN_VIDEO_UC_TYPE, &connection_);
++      IOObjectRelease(service);
++      if (result) return Status(result);
++    }
++    rdn_video_query response = {};
++    size_t bytes = sizeof(response);
++    kern_return_t result = IOConnectCallStructMethod(connection_, RDN_VIDEO_QUERY,
++        nullptr, 0, &response, &bytes);
++    if (result) return Status(result);
++    if (!ValidHeader(response, bytes) || (response.flags & ~15u))
++      return BackendStatus::kFailure;
++    const uint32_t allowed = validation_ ? RDN_VIDEO_CAP_VALIDATION :
++                                          RDN_VIDEO_CAP_PRODUCTION;
++    if (!(response.flags & RDN_VIDEO_CAP_READY) || !(response.flags & allowed) ||
++        ((response.flags & RDN_VIDEO_CAP_BUSY) && !created_))
++      return BackendStatus::kUnsupported;
++    if (!response.max_width || response.max_width > 1920 ||
++        !response.max_height || response.max_height > 1088 ||
++        !response.profile_mask || (response.profile_mask & ~7u) ||
++        !response.max_upload_bytes ||
++        response.max_upload_bytes > RDN_VIDEO_MAX_UPLOAD_BYTES ||
++        response.max_sessions != 1 || response.max_inflight != 1 ||
++        response.output_slots != RDN_VIDEO_OUTPUT_SLOTS)
++      return BackendStatus::kFailure;
++    actual->ready = true;
++    actual->profile_mask = response.profile_mask;
++    actual->max_width = response.max_width;
++    actual->max_height = response.max_height;
++    actual->max_bitstream_bytes = response.max_upload_bytes;
++    return BackendStatus::kOk;
++  }
++
++  BackendStatus Create(const rdn_uvd_h264_config& config) override {
++    if (created_) return BackendStatus::kFailure;
++    Capabilities caps;
++    BackendStatus status = Query(&caps);
++    if (status != BackendStatus::kOk) return status;
++    rdn_video_create request = {};
++    request.version = RDN_VIDEO_API_VERSION;
++    request.bytes = sizeof(request);
++    request.config = config;
++    request.flags = validation_ ? RDN_VIDEO_CREATE_VALIDATION : 0;
++    size_t bytes = sizeof(session_);
++    kern_return_t result = IOConnectCallStructMethod(connection_, RDN_VIDEO_CREATE,
++        &request, sizeof(request), &session_, &bytes);
++    if (result) return Fail(Status(result));
++    created_ = true;
++    if (!ValidSession(session_, bytes, config)) return Fail(BackendStatus::kFailure);
++    config_ = config;
++    if (!Map(0, RDN_VIDEO_MEMORY_UPLOAD, session_.upload_bytes, false) ||
++        !Map(1, RDN_VIDEO_MEMORY_OUTPUT0, session_.output_bytes, true) ||
++        !Map(2, RDN_VIDEO_MEMORY_OUTPUT1, session_.output_bytes, true))
++      return Fail(BackendStatus::kFailure);
++    next_request_ = next_output_ = 1;
++    return BackendStatus::kOk;
++  }
++
++  BackendStatus Decode(const Metadata& metadata,
++                       const std::vector<uint8_t>& annex_b,
++                       LinearNV12* completed_copy) override {
++    if (!completed_copy) return BackendStatus::kFailure;
++    return DecodeFrame(metadata, annex_b, completed_copy, nullptr, 0);
++  }
++  BackendStatus DecodeInto(const Metadata& metadata,
++                           const std::vector<uint8_t>& annex_b,
++                           uint8_t* destination, size_t capacity) override {
++    const auto& c = metadata.config;
++    const uintptr_t start = reinterpret_cast<uintptr_t>(destination);
++    if (!destination || !c.coded_width || !c.coded_height ||
++        (c.coded_width & 1) || (c.coded_height & 1) ||
++        c.coded_width > 1920 || c.coded_height > 1088 ||
++        capacity != uint64_t(c.coded_width) * c.coded_height * 3 / 2 ||
++        start > UINTPTR_MAX - capacity)
++      return BackendStatus::kFailure;
++    for (const auto& map : maps_)
++      if (map.address && start < map.address + map.bytes &&
++          map.address < start + capacity)
++        return BackendStatus::kFailure;
++    return DecodeFrame(metadata, annex_b, nullptr, destination, capacity);
++  }
++  BackendStatus DecodeFrame(const Metadata& metadata,
++                            const std::vector<uint8_t>& annex_b,
++                            LinearNV12* completed_copy, uint8_t* destination,
++                            size_t capacity) {
++    if (!created_ || annex_b.empty() ||
++        annex_b.size() > session_.upload_bytes ||
++        next_request_ == UINT32_MAX || next_output_ == UINT32_MAX ||
++        memcmp(&metadata.config, &config_, sizeof(config_)))
++      return BackendStatus::kFailure;
++    rdn_video_decode request = {};
++    request.version = RDN_VIDEO_API_VERSION;
++    request.bytes = sizeof(request);
++    request.session = session_.session;
++    request.request_sequence = next_request_;
++    request.bitstream_bytes = static_cast<uint32_t>(annex_b.size());
++    request.picture = metadata.picture;
++    memcpy(reinterpret_cast<void*>(maps_[0].address), annex_b.data(), annex_b.size());
++    rdn_video_output response = {};
++    size_t bytes = sizeof(response);
++    kern_return_t result = IOConnectCallStructMethod(connection_, RDN_VIDEO_DECODE,
++        &request, sizeof(request), &response, &bytes);
++    if (result) return Fail(Status(result));
++    if (!ValidOutput(response, bytes, session_, next_request_, next_output_))
++      return Fail(BackendStatus::kFailure);
++    LinearNV12 copy;
++    const auto* source = reinterpret_cast<const uint8_t*>(maps_[1 + response.slot].address);
++    if (destination) {
++      const size_t y_bytes = size_t(response.coded_width) * response.coded_height;
++      if (response.y_offset == 0 && response.uv_offset == y_bytes &&
++          response.y_stride == response.coded_width &&
++          response.uv_stride == response.coded_width) {
++        memcpy(destination, source, capacity);
++      } else {
++        for (uint32_t y = 0; y < response.coded_height; ++y)
++          memcpy(destination + size_t(y) * response.coded_width,
++                 source + response.y_offset + size_t(y) * response.y_stride,
++                 response.coded_width);
++        for (uint32_t y = 0; y < response.coded_height / 2; ++y)
++          memcpy(destination + y_bytes + size_t(y) * response.coded_width,
++                 source + response.uv_offset + size_t(y) * response.uv_stride,
++                 response.coded_width);
++      }
++    } else {
++      copy.width = response.coded_width;
++      copy.height = response.coded_height;
++      copy.y_stride = response.y_stride;
++      copy.uv_stride = response.uv_stride;
++      copy.y_offset = response.y_offset;
++      copy.uv_offset = response.uv_offset;
++      copy.bytes.resize(response.output_bytes);
++      memcpy(copy.bytes.data(), source, copy.bytes.size());
++    }
++    rdn_video_release release = {};
++    release.version = RDN_VIDEO_API_VERSION;
++    release.bytes = sizeof(release);
++    release.session = response.session;
++    release.output_sequence = response.output_sequence;
++    release.slot = response.slot;
++    size_t no_output = 0;
++    result = IOConnectCallStructMethod(connection_, RDN_VIDEO_RELEASE,
++        &release, sizeof(release), nullptr, &no_output);
++    if (result || no_output) return Fail(result ? Status(result) : BackendStatus::kFailure);
++    ++next_request_;
++    ++next_output_;
++    if (completed_copy) *completed_copy = std::move(copy);
++    return BackendStatus::kOk;
++  }
++
++  BackendStatus Destroy() override {
++    kern_return_t result = KERN_SUCCESS;
++    // Leopard resolves memory type through the live user-client session.
++    for (auto& map : maps_) {
++      if (connection_ && map.address) {
++        const kern_return_t unmapped = IOConnectUnmapMemory(
++            connection_, map.type, mach_task_self(), map.address);
++        if (!result) result = unmapped;
++      }
++      map = {};
++    }
++    if (connection_ && created_ && (session_.session.high || session_.session.low)) {
++      rdn_video_destroy request = {};
++      request.version = RDN_VIDEO_API_VERSION;
++      request.bytes = sizeof(request);
++      request.session = session_.session;
++      size_t no_output = 0;
++      const kern_return_t destroyed = IOConnectCallStructMethod(
++          connection_, RDN_VIDEO_DESTROY, &request, sizeof(request), nullptr,
++          &no_output);
++      if (!result) result = destroyed ? destroyed :
++          no_output ? kIOReturnError : KERN_SUCCESS;
++    }
++    created_ = false;
++    if (connection_) {
++      kern_return_t closed = IOServiceClose(connection_);
++      if (!result) result = closed;
++      connection_ = IO_OBJECT_NULL;
++    }
++    session_ = {};
++    config_ = {};
++    return Status(result);
++  }
++
++ private:
++  struct Mapping { mach_vm_address_t address = 0; mach_vm_size_t bytes = 0; uint32_t type = 0; };
++  bool Map(size_t slot, uint32_t type, uint32_t bytes, bool read_only) {
++    auto& map = maps_[slot];
++    map.type = type;
++    kern_return_t result = IOConnectMapMemory(connection_, type, mach_task_self(),
++        &map.address, &map.bytes, kIOMapAnywhere | (read_only ? kIOMapReadOnly : 0));
++    const uint64_t rounded = (uint64_t(bytes) + 4095) & ~uint64_t(4095);
++    return !result && map.address && !(map.address & 4095) &&
++        map.bytes >= bytes && map.bytes <= rounded &&
++        map.address <= UINTPTR_MAX && map.bytes <= UINTPTR_MAX - map.address;
++  }
++  BackendStatus Fail(BackendStatus status) { Destroy(); return status; }
++  const bool validation_;
++  io_connect_t connection_ = IO_OBJECT_NULL;
++  bool created_ = false;
++  Mapping maps_[3];
++  rdn_video_session session_ = {};
++  rdn_uvd_h264_config config_ = {};
++  uint32_t next_request_ = 1, next_output_ = 1;
++};
++}
++std::unique_ptr<Backend> CreateIOKitBackend() {
++  return std::make_unique<IOKitBackend>(false);
++}
++}
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_iokit_backend.h
+@@ -0,0 +1,9 @@
++#ifndef AURORA_UVD_IOKIT_BACKEND_H_
++#define AURORA_UVD_IOKIT_BACKEND_H_
++#include <memory>
++#include "radeon_uvd_backend.h"
++namespace aurora_uvd {
++std::unique_ptr<Backend> CreateDiagnosticBackend(bool allow_unvalidated);
++std::unique_ptr<Backend> CreateIOKitBackend();
++}
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_session.cc
+@@ -0,0 +1,161 @@
++#include "radeon_uvd_session.h"
++#include <algorithm>
++#include <string.h>
++#include <utility>
++
++namespace aurora_uvd {
++uint32_t ProfileBit(uint32_t profile) {
++  return profile == 66 ? 1u : profile == 77 ? 2u : profile == 100 ? 4u : 0u;
++}
++bool AppendSlice(const uint8_t* data, size_t bytes, size_t limit,
++                 std::vector<uint8_t>* output) {
++  if (!output || !data || !bytes || (data[0] & 0x80) ||
++      ((data[0] & 31) != 1 && (data[0] & 31) != 5) ||
++      limit > RDN_UVD_H264_MAX_BITSTREAM_BYTES || output->size() > limit ||
++      limit - output->size() < 4 || bytes > limit - output->size() - 4)
++    return false;
++  const uint8_t prefix[] = {0, 0, 0, 1};
++  output->insert(output->end(), prefix, prefix + 4);
++  output->insert(output->end(), data, data + bytes);
++  return true;
++}
++bool ValidateNV12(const LinearNV12& s, uint32_t width, uint32_t height,
++                  size_t* packed_bytes) {
++  if (!packed_bytes || !width || !height || (width & 1) || (height & 1) ||
++      width > RDN_UVD_H264_MAX_WIDTH || height > RDN_UVD_H264_MAX_HEIGHT ||
++      s.width != width || s.height != height ||
++      s.y_stride < width || s.uv_stride < width ||
++      s.bytes.size() > 64u * 1024u * 1024u ||
++      s.y_offset > s.bytes.size() || s.uv_offset > s.bytes.size())
++    return false;
++  const uint64_t y_end = uint64_t(s.y_offset) + uint64_t(s.y_stride) * (height - 1) + width;
++  const uint64_t uv_end = uint64_t(s.uv_offset) + uint64_t(s.uv_stride) * (height / 2 - 1) + width;
++  if (y_end > s.bytes.size() || uv_end > s.bytes.size() ||
++      !(y_end <= s.uv_offset || uv_end <= s.y_offset))
++    return false;
++  *packed_bytes = size_t(width) * height * 3 / 2;
++  return true;
++}
++bool CopyNV12(const LinearNV12& s, uint32_t width, uint32_t height,
++              uint8_t* output, size_t capacity) {
++  size_t packed;
++  if (!output || !ValidateNV12(s, width, height, &packed) || capacity < packed)
++    return false;
++  for (uint32_t row = 0; row < height; ++row)
++    memcpy(output + size_t(row) * width,
++           s.bytes.data() + s.y_offset + size_t(row) * s.y_stride, width);
++  output += size_t(width) * height;
++  for (uint32_t row = 0; row < height / 2; ++row)
++    memcpy(output + size_t(row) * width,
++           s.bytes.data() + s.uv_offset + size_t(row) * s.uv_stride, width);
++  return true;
++}
++namespace {
++bool ValidDestination(const Metadata& metadata, uint8_t* destination, size_t capacity) {
++  const auto& c = metadata.config;
++  return destination && c.coded_width && c.coded_height &&
++      !(c.coded_width & 1) && !(c.coded_height & 1) &&
++      c.coded_width <= 1920 && c.coded_height <= 1088 &&
++      capacity == uint64_t(c.coded_width) * c.coded_height * 3 / 2 &&
++      reinterpret_cast<uintptr_t>(destination) <= UINTPTR_MAX - capacity;
++}
++}
++BackendStatus Backend::DecodeInto(const Metadata& metadata,
++                                  const std::vector<uint8_t>& bytes,
++                                  uint8_t* destination, size_t capacity) {
++  if (!ValidDestination(metadata, destination, capacity)) return BackendStatus::kFailure;
++  LinearNV12 pixels;
++  const auto status = Decode(metadata, bytes, &pixels);
++  if (status != BackendStatus::kOk) return status;
++  return CopyNV12(pixels, metadata.config.coded_width, metadata.config.coded_height,
++                  destination, capacity) ? BackendStatus::kOk : BackendStatus::kFailure;
++}
++Session::Session(std::unique_ptr<Backend> backend) : backend_(std::move(backend)) {}
++Session::~Session() { Reset(); }
++BackendStatus Session::Query(Capabilities* actual) {
++  if (!backend_ || faulted_ || !actual) return BackendStatus::kFailure;
++  Capabilities candidate;
++  BackendStatus status = backend_->Query(&candidate);
++  if (status != BackendStatus::kOk) return status;
++  if (!candidate.ready || !(candidate.profile_mask & 7) ||
++      (candidate.profile_mask & ~7u) || !candidate.max_width ||
++      !candidate.max_height || !candidate.max_bitstream_bytes ||
++      candidate.max_width > RDN_UVD_H264_MAX_WIDTH ||
++      candidate.max_height > RDN_UVD_H264_MAX_HEIGHT ||
++      candidate.max_bitstream_bytes > RDN_UVD_H264_MAX_BITSTREAM_BYTES)
++    return BackendStatus::kUnsupported;
++  *actual = candidate;
++  return BackendStatus::kOk;
++}
++BackendStatus Session::Reset() {
++  if (opened_) {
++    opened_ = false;
++    BackendStatus status = backend_->Destroy();
++    if (status != BackendStatus::kOk) {
++      faulted_ = true;
++      return status;
++    }
++  }
++  return faulted_ ? BackendStatus::kFailure : BackendStatus::kOk;
++}
++BackendStatus Session::Decode(const Metadata& metadata, bool idr,
++                               const std::vector<uint8_t>& bytes, LinearNV12* output) {
++  if (!output) return BackendStatus::kFailure;
++  return DecodeCommon(metadata, idr, bytes, output, nullptr, 0);
++}
++BackendStatus Session::DecodeInto(const Metadata& metadata, bool idr,
++                                  const std::vector<uint8_t>& bytes,
++                                  uint8_t* destination, size_t capacity) {
++  if (!ValidDestination(metadata, destination, capacity)) return BackendStatus::kFailure;
++  return DecodeCommon(metadata, idr, bytes, nullptr, destination, capacity);
++}
++BackendStatus Session::DecodeCommon(const Metadata& metadata, bool idr,
++                                    const std::vector<uint8_t>& bytes,
++                                    LinearNV12* output, uint8_t* destination,
++                                    size_t capacity) {
++  if (faulted_ || bytes.empty()) return BackendStatus::kFailure;
++  Capabilities caps;
++  BackendStatus status = Query(&caps);
++  if (status != BackendStatus::kOk) return status;
++  const auto& c = metadata.config;
++  rdn_uvd_h264_layout layout;
++  uint8_t message[RDN_UVD_H264_MESSAGE_BYTES];
++  if (!(caps.profile_mask & ProfileBit(c.profile_idc)) ||
++      c.coded_width > caps.max_width || c.coded_height > caps.max_height ||
++      bytes.size() > caps.max_bitstream_bytes ||
++      rdn_uvd_h264_layout_init(&c, RDN_UVD_H264_TARGET_LINEAR, &layout) ||
++      rdn_uvd_h264_pack_decode(&c, &metadata.picture, &layout, 1, 1,
++                              static_cast<uint32_t>(bytes.size()), message, sizeof(message)))
++    return BackendStatus::kUnsupported;
++  // A changed firmware DPB cannot retain references from the previous session.
++  const bool changed = !opened_ || memcmp(&config_, &c, sizeof(c)) != 0;
++  if (changed) {
++    if (!idr || metadata.picture.reference_count) return BackendStatus::kUnsupported;
++    status = Reset();
++    if (status != BackendStatus::kOk) return status;
++    status = backend_->Create(c);
++    if (status != BackendStatus::kOk) {
++      // Create owns cleanup for partial allocation/submission; uncertain failure is terminal.
++      faulted_ = status != BackendStatus::kUnsupported;
++      return status;
++    }
++    opened_ = true;
++    config_ = c;
++  }
++  if (destination) {
++    status = backend_->DecodeInto(metadata, bytes, destination, capacity);
++    if (status != BackendStatus::kOk) faulted_ = true;
++    return status;
++  }
++  LinearNV12 candidate;
++  status = backend_->Decode(metadata, bytes, &candidate);
++  size_t packed;
++  if (status != BackendStatus::kOk ||
++      !ValidateNV12(candidate, c.coded_width, c.coded_height, &packed)) {
++    faulted_ = true;
++    return status == BackendStatus::kOk ? BackendStatus::kFailure : status;
++  }
++  *output = std::move(candidate);
++  return BackendStatus::kOk;
++}
++}  // namespace aurora_uvd
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_session.h
+@@ -0,0 +1,51 @@
++#ifndef AURORA_UVD_SESSION_H_
++#define AURORA_UVD_SESSION_H_
++#include <memory>
++#include "radeon_uvd_backend.h"
++
++namespace aurora_uvd {
++uint32_t ProfileBit(uint32_t profile);
++// Chromium describes an unencrypted NAL with a clear-only subsample.
++template <class Entry>
++bool ClearSubsamples(const std::vector<Entry>& entries, size_t bytes) {
++  if (entries.empty()) return true;
++  size_t remaining = bytes;
++  for (const auto& entry : entries) {
++    if (entry.cypher_bytes || entry.clear_bytes > remaining) return false;
++    remaining -= entry.clear_bytes;
++  }
++  return remaining == 0;
++}
++bool AppendSlice(const uint8_t* data, size_t bytes, size_t limit,
++                 std::vector<uint8_t>* annex_b);
++bool ValidateNV12(const LinearNV12& source, uint32_t width, uint32_t height,
++                  size_t* packed_bytes);
++// Destination must not alias source.
++bool CopyNV12(const LinearNV12& source, uint32_t width, uint32_t height,
++              uint8_t* destination, size_t capacity);
++
++class Session {
++ public:
++  explicit Session(std::unique_ptr<Backend> backend);
++  ~Session();
++  BackendStatus Query(Capabilities* actual);
++  BackendStatus Decode(const Metadata& metadata, bool idr,
++                       const std::vector<uint8_t>& annex_b, LinearNV12* output);
++  BackendStatus DecodeInto(const Metadata& metadata, bool idr,
++                           const std::vector<uint8_t>& annex_b,
++                           uint8_t* destination, size_t capacity);
++  BackendStatus Reset();
++  bool faulted() const { return faulted_; }
++
++ private:
++  BackendStatus DecodeCommon(const Metadata& metadata, bool idr,
++                             const std::vector<uint8_t>& annex_b,
++                             LinearNV12* output, uint8_t* destination,
++                             size_t capacity);
++  std::unique_ptr<Backend> backend_;
++  rdn_uvd_h264_config config_ = {};
++  bool opened_ = false;
++  bool faulted_ = false;
++};
++}  // namespace aurora_uvd
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.cc
+@@ -0,0 +1,366 @@
++#include "radeon_uvd_video_decoder.h"
++#include <limits.h>
++#if defined(AURORA_UVD_DIAGNOSTICS)
++#include <stdio.h>
++#endif
++#include <utility>
++#include "base/functional/bind.h"
++#include "base/memory/read_only_shared_memory_region.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "media/base/video_aspect_ratio.h"
++#include "media/base/timestamp_constants.h"
++#include "media/base/video_decoder_config.h"
++#include "media/base/video_frame.h"
++#include "media/gpu/h264_decoder.h"
++#include "radeon_uvd_session.h"
++
++namespace aurora_uvd {
++namespace {
++using Status = media::DecoderStatus;
++using Code = media::DecoderStatus::Codes;
++using AccelStatus = media::H264Decoder::H264Accelerator::Status;
++void Diagnostic(const char* stage, int value) {
++#if defined(AURORA_UVD_DIAGNOSTICS)
++  fprintf(stderr, "uvd_decoder stage=%s value=%d\n", stage, value);
++#else
++  (void)stage;
++  (void)value;
++#endif
++}
++uint32_t ProfileId(media::VideoCodecProfile p) {
++  switch (p) {
++    case media::H264PROFILE_BASELINE: return 66;
++    case media::H264PROFILE_MAIN: return 77;
++    case media::H264PROFILE_HIGH: return 100;
++    default: return 0;
++  }
++}
++Status ToStatus(BackendStatus status) {
++  return status == BackendStatus::kOk ? Status(Code::kOk) :
++         status == BackendStatus::kUnsupported ? Status(Code::kUnsupportedConfig) :
++                                               Status(Code::kPlatformDecodeFailure);
++}
++class Picture final : public media::H264Picture {
++ public:
++  base::TimeDelta timestamp, duration;
++  gfx::Size natural_size;
++  scoped_refptr<media::VideoFrame> frame;
++ private:
++  ~Picture() override = default;
++};
++scoped_refptr<media::VideoFrame> SharedFrame(base::MappedReadOnlyRegion memory,
++                                           uint32_t width, uint32_t height,
++                                           const Picture& picture) {
++  const size_t bytes = size_t(width) * height * 3 / 2;
++  if (!memory.IsValid() || memory.mapping.size() != bytes) return nullptr;
++  memory.mapping = base::WritableSharedMemoryMapping();
++  auto readonly = memory.region.Map();
++  if (!readonly.IsValid()) return nullptr;
++  const auto* data = static_cast<const uint8_t*>(readonly.memory());
++  auto frame = media::VideoFrame::WrapExternalYuvData(
++      media::PIXEL_FORMAT_NV12, gfx::Size(width, height),
++      picture.visible_rect(), picture.natural_size, width, width,
++      data, data + size_t(width) * height, picture.timestamp);
++  if (!frame) return nullptr;
++  frame->BackWithOwnedSharedMemory(std::move(memory.region), std::move(readonly));
++  frame->metadata().power_efficient = true;
++  if (picture.duration.is_positive()) frame->metadata().frame_duration = picture.duration;
++  frame->set_hdr_metadata(picture.hdr_metadata());
++  return frame;
++}
++}  // namespace
++
++class RadeonUvdVideoDecoder::Core {
++ public:
++  explicit Core(std::unique_ptr<Backend> backend) : session_(std::move(backend)) {}
++  ~Core() {
++    decoder_.reset();
++    session_.Reset();
++  }
++  Status Initialize(media::VideoDecoderConfig config, OutputCB output) {
++    decoder_.reset();
++    Status status = ToStatus(session_.Reset());
++    if (!status.is_ok()) return status;
++    output_ = std::move(output);
++    config_ = std::move(config);
++    status = ToStatus(session_.Query(&caps_));
++    const auto size = config_.coded_size();
++    if (!status.is_ok()) return status;
++    if (!(caps_.profile_mask & ProfileBit(ProfileId(config_.profile()))) ||
++        size.width() < 64 || size.height() < 64 ||
++        size.width() > static_cast<int>(caps_.max_width) ||
++        size.height() > static_cast<int>(caps_.max_height))
++      return Code::kUnsupportedConfig;
++    failed_ = false;
++    last_error_ = Code::kOk;
++    stream_id_ = 0;
++    decoder_ = std::make_unique<media::H264Decoder>(
++        std::make_unique<Accelerator>(this), config_.profile(),
++        config_.color_space_info());
++    return Code::kOk;
++  }
++  Status Decode(scoped_refptr<media::DecoderBuffer> buffer) {
++    if (!decoder_) return Code::kNotInitialized;
++    if (failed_ || session_.faulted()) return Code::kPlatformDecodeFailure;
++    last_error_ = Code::kOk;
++    if (buffer->end_of_stream()) {
++      if (decoder_->Flush()) return Code::kOk;
++      failed_ = true;
++      return Error();
++    }
++    if (buffer->decrypt_config()) return Fail(Code::kUnsupportedEncryptionMode);
++    if (buffer->timestamp() == media::kNoTimestamp)
++      return Fail(Code::kMissingTimestamp);
++    if (!buffer->data_size() || buffer->data_size() > 64u * 1024u * 1024u ||
++        stream_id_ == INT_MAX)
++      return Fail(Code::kUnsupportedConfig);
++    timestamp_ = buffer->timestamp();
++    duration_ = buffer->duration();
++    decoder_->SetStream(++stream_id_, *buffer);
++    // Parsing and blocking backend calls stay on this dedicated worker.
++    for (unsigned changes = 0; changes < 256; ++changes) {
++      const auto result = decoder_->Decode();
++      Diagnostic("parser", static_cast<int>(result));
++      switch (result) {
++        case media::AcceleratedVideoDecoder::kRanOutOfStreamData:
++          return Code::kOk;
++        case media::AcceleratedVideoDecoder::kConfigChange:
++        case media::AcceleratedVideoDecoder::kColorSpaceChange:
++          if (decoder_->GetBitDepth() != 8 ||
++              decoder_->GetChromaSampling() != media::VideoChromaSampling::k420)
++            return Fail(Code::kUnsupportedConfig);
++          continue;
++        default:
++          // This synchronous backend never requests resource/context retries.
++          failed_ = true;
++          return Error();
++      }
++    }
++    return Fail(Code::kUnsupportedConfig);
++  }
++  void Reset(OutputCB output) {
++    output_ = std::move(output);
++    if (decoder_) decoder_->Reset();
++    else session_.Reset();
++    failed_ = session_.faulted();
++    last_error_ = Code::kOk;
++    stream_id_ = 0;
++  }
++
++ private:
++  class Accelerator final : public media::H264Decoder::H264Accelerator {
++   public:
++    explicit Accelerator(Core* core) : core_(core) {}
++    scoped_refptr<media::H264Picture> CreateH264Picture() override {
++      auto picture = base::MakeRefCounted<Picture>();
++      picture->timestamp = core_->timestamp_;
++      picture->duration = core_->duration_;
++      return picture;
++    }
++    bool RequiresRefLists() override { return true; }
++    AccelStatus SubmitFrameMetadata(
++        const media::H264SPS* sps, const media::H264PPS* pps,
++        const media::H264DPB&, const media::H264Picture::Vector& p0,
++        const media::H264Picture::Vector&, const media::H264Picture::Vector&,
++        scoped_refptr<media::H264Picture> picture) override {
++      Clear();
++      if (!sps || !pps || !picture || picture->decrypt_config() || p0.size() > 16)
++        return Reject(Code::kUnsupportedConfig);
++      sps_ = *sps;
++      pps_ = *pps;
++      current_ = std::move(picture);
++      refs_ = p0;
++      auto* target = static_cast<Picture*>(current_.get());
++      auto aspect = core_->config_.aspect_ratio();
++      if (!aspect.IsValid())
++        aspect = media::VideoAspectRatio::PAR(sps->sar_width, sps->sar_height);
++      target->natural_size = aspect.GetNaturalSize(target->visible_rect());
++      return AccelStatus::kOk;
++    }
++    AccelStatus SubmitSlice(
++        const media::H264PPS*, const media::H264SliceHeader* slice,
++        const media::H264Picture::Vector&, const media::H264Picture::Vector&,
++        scoped_refptr<media::H264Picture> picture, const uint8_t* data, size_t size,
++        const std::vector<media::SubsampleEntry>& subsamples) override {
++      if (!current_ || current_ != picture || !slice || slices_ == 4096)
++        return Reject(Code::kUnsupportedConfig, "slice_state");
++      if (!ClearSubsamples(subsamples, size))
++        return Reject(Code::kUnsupportedEncryptionMode, "slice_subsamples");
++      if (!slices_) {
++        const media::H264Picture* refs[16] = {};
++        for (size_t i = 0; i < refs_.size(); ++i) refs[i] = refs_[i].get();
++        Result result = MapPicture(sps_, pps_, *current_, *slice, refs,
++                                   refs_.size(), &metadata_);
++        Diagnostic("map_picture", static_cast<int>(result));
++        if (result != Result::kOk)
++          return Reject(result == Result::kInvalid ? Code::kMalformedBitstream :
++                                                    Code::kUnsupportedConfig, "map_picture");
++        first_slice_ = *slice;
++      } else if (!CompatibleSlice(first_slice_, *slice)) {
++        return Reject(Code::kUnsupportedConfig, "slice_compatibility");
++      }
++      if (!AppendSlice(data, size, core_->caps_.max_bitstream_bytes, &bitstream_))
++        return Reject(Code::kUnsupportedConfig, "annex_b_capacity");
++      ++slices_;
++      return AccelStatus::kOk;
++    }
++    AccelStatus SubmitDecode(scoped_refptr<media::H264Picture> picture) override {
++      if (!current_ || current_ != picture || !slices_)
++        return Reject(Code::kMalformedBitstream);
++      const uint32_t width = metadata_.config.coded_width;
++      const uint32_t height = metadata_.config.coded_height;
++      const size_t bytes = size_t(width) * height * 3 / 2;
++      auto memory = base::ReadOnlySharedMemoryRegion::Create(bytes);
++      if (!memory.IsValid()) return Reject(Code::kFailedToGetVideoFrame);
++      Diagnostic("submit_decode_slices", slices_);
++      media::DecoderStatus status = ToStatus(core_->session_.DecodeInto(
++          metadata_, current_->idr, bitstream_,
++          static_cast<uint8_t*>(memory.mapping.memory()), bytes));
++      Diagnostic("session_decode", static_cast<int>(status.code()));
++      if (!status.is_ok()) {
++        core_->last_error_ = status;
++        Clear();
++        return AccelStatus::kFail;
++      }
++      auto* target = static_cast<Picture*>(picture.get());
++      target->frame = SharedFrame(std::move(memory), width, height, *target);
++      Clear();
++      return target->frame ? AccelStatus::kOk : Reject(Code::kFailedToGetVideoFrame);
++    }
++    bool OutputPicture(scoped_refptr<media::H264Picture> picture) override {
++      auto* target = static_cast<Picture*>(picture.get());
++      if (!target->frame) {
++        Reject(Code::kFailedToGetVideoFrame);
++        return false;
++      }
++      target->frame->set_color_space(picture->get_colorspace().ToGfxColorSpace());
++      core_->output_.Run(target->frame);
++      return true;
++    }
++    void Reset() override {
++      Clear();
++      core_->session_.Reset();
++    }
++    AccelStatus SetStream(base::span<const uint8_t>,
++                          const media::DecryptConfig* decrypt) override {
++      return decrypt ? Reject(Code::kUnsupportedEncryptionMode) : AccelStatus::kOk;
++    }
++   private:
++    AccelStatus Reject(Code code, const char* stage = "accelerator") {
++      Diagnostic(stage, static_cast<int>(code));
++      core_->last_error_ = code;
++      return AccelStatus::kFail;
++    }
++    void Clear() {
++      current_ = nullptr;
++      refs_.clear();
++      bitstream_.clear();
++      slices_ = 0;
++    }
++    Core* const core_;
++    media::H264SPS sps_;
++    media::H264PPS pps_;
++    media::H264SliceHeader first_slice_;
++    scoped_refptr<media::H264Picture> current_;
++    media::H264Picture::Vector refs_;
++    Metadata metadata_ = {};
++    std::vector<uint8_t> bitstream_;
++    unsigned slices_ = 0;
++  };
++  Status Fail(Code code) { failed_ = true; return Status(code); }
++  Status Error() {
++    return last_error_.is_ok() ? Status(Code::kMalformedBitstream) : last_error_;
++  }
++  Session session_;
++  media::VideoDecoderConfig config_;
++  Capabilities caps_;
++  OutputCB output_;
++  base::TimeDelta timestamp_, duration_;
++  Status last_error_ = Code::kOk;
++  int32_t stream_id_ = 0;
++  bool failed_ = false;
++  std::unique_ptr<media::H264Decoder> decoder_;
++};
++
++RadeonUvdVideoDecoder::RadeonUvdVideoDecoder(std::unique_ptr<Backend> backend)
++    : initial_backend_(std::move(backend)) {}
++RadeonUvdVideoDecoder::~RadeonUvdVideoDecoder() = default;
++void RadeonUvdVideoDecoder::Initialize(
++    const media::VideoDecoderConfig& config, bool low_delay, media::CdmContext*,
++    InitCB callback, const OutputCB& output, const media::WaitingCB&) {
++  ++generation_;
++  initialized_ = false;
++  output_ = output;
++  if (!config.IsValidConfig() || low_delay ||
++      config.codec() != media::VideoCodec::kH264 || config.is_encrypted() ||
++      !ProfileId(config.profile())) {
++    if (core_) {
++      core_->AsyncCall(&Core::Reset).WithArgs(WorkerOutput()).Then(
++          base::BindOnce(&RadeonUvdVideoDecoder::Initialized,
++                         weak_factory_.GetWeakPtr(), generation_, std::move(callback),
++                         Status(Code::kUnsupportedConfig)));
++    } else {
++      std::move(callback).Run(Code::kUnsupportedConfig);
++    }
++    return;
++  }
++  if (!core_) {
++    auto worker = base::ThreadPool::CreateSingleThreadTaskRunner(
++        {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++         base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
++        base::SingleThreadTaskRunnerThreadMode::DEDICATED);
++    core_ = std::make_unique<base::SequenceBound<Core>>(
++        worker, std::move(initial_backend_));
++  }
++  core_->AsyncCall(&Core::Initialize).WithArgs(config, WorkerOutput()).Then(
++      base::BindOnce(&RadeonUvdVideoDecoder::Initialized,
++                     weak_factory_.GetWeakPtr(), generation_, std::move(callback)));
++}
++void RadeonUvdVideoDecoder::Initialized(
++    uint64_t generation, InitCB callback, Status status) {
++  if (generation != generation_) return;
++  initialized_ = status.is_ok();
++  std::move(callback).Run(status);
++}
++RadeonUvdVideoDecoder::OutputCB RadeonUvdVideoDecoder::WorkerOutput() {
++  return base::BindPostTaskToCurrentDefault(base::BindRepeating(
++      &RadeonUvdVideoDecoder::Output, weak_factory_.GetWeakPtr(), generation_));
++}
++void RadeonUvdVideoDecoder::Output(
++    uint64_t generation, scoped_refptr<media::VideoFrame> frame) {
++  if (generation == generation_ && initialized_) output_.Run(std::move(frame));
++}
++void RadeonUvdVideoDecoder::Decode(
++    scoped_refptr<media::DecoderBuffer> buffer, DecodeCB callback) {
++  if (!initialized_ || !buffer || pending_decode_) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(callback), Code::kNotInitialized));
++    return;
++  }
++  pending_decode_ = std::move(callback);
++  core_->AsyncCall(&Core::Decode).WithArgs(std::move(buffer)).Then(
++      base::BindOnce(&RadeonUvdVideoDecoder::Decoded,
++                     weak_factory_.GetWeakPtr(), generation_));
++}
++void RadeonUvdVideoDecoder::Decoded(uint64_t generation, Status status) {
++  if (generation == generation_ && pending_decode_)
++    std::move(pending_decode_).Run(status);
++}
++void RadeonUvdVideoDecoder::Reset(base::OnceClosure closure) {
++  ++generation_;
++  auto alive = weak_factory_.GetWeakPtr();
++  if (pending_decode_) std::move(pending_decode_).Run(Code::kAborted);
++  if (!alive) return;
++  if (!core_) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE, std::move(closure));
++    return;
++  }
++  core_->AsyncCall(&Core::Reset).WithArgs(WorkerOutput()).Then(
++      base::BindOnce(
++          [](base::WeakPtr<RadeonUvdVideoDecoder> self, base::OnceClosure done) {
++            if (self) std::move(done).Run();
++          }, weak_factory_.GetWeakPtr(), std::move(closure)));
++}
++}  // namespace aurora_uvd
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.h
+@@ -0,0 +1,42 @@
++#ifndef AURORA_UVD_VIDEO_DECODER_H_
++#define AURORA_UVD_VIDEO_DECODER_H_
++#include <memory>
++#include "base/memory/weak_ptr.h"
++#include "base/threading/sequence_bound.h"
++#include "media/base/video_decoder.h"
++#include "radeon_uvd_backend.h"
++
++namespace aurora_uvd {
++class RadeonUvdVideoDecoder final : public media::VideoDecoder {
++ public:
++  explicit RadeonUvdVideoDecoder(std::unique_ptr<Backend> backend);
++  ~RadeonUvdVideoDecoder() override;
++  void Initialize(const media::VideoDecoderConfig&, bool low_delay,
++                  media::CdmContext*, InitCB, const OutputCB&,
++                  const media::WaitingCB&) override;
++  void Decode(scoped_refptr<media::DecoderBuffer>, DecodeCB) override;
++  void Reset(base::OnceClosure) override;
++  bool NeedsBitstreamConversion() const override { return true; }
++  int GetMaxDecodeRequests() const override { return 1; }
++  bool FramesHoldExternalResources() const override { return false; }
++  bool IsPlatformDecoder() const override { return true; }
++  media::VideoDecoderType GetDecoderType() const override {
++    return media::VideoDecoderType::kRadeonUvd;
++  }
++
++ private:
++  class Core;
++  void Initialized(uint64_t generation, InitCB callback, media::DecoderStatus status);
++  void Decoded(uint64_t generation, media::DecoderStatus status);
++  void Output(uint64_t generation, scoped_refptr<media::VideoFrame> frame);
++  OutputCB WorkerOutput();
++  std::unique_ptr<Backend> initial_backend_;
++  std::unique_ptr<base::SequenceBound<Core>> core_;
++  OutputCB output_;
++  DecodeCB pending_decode_;
++  uint64_t generation_ = 0;
++  bool initialized_ = false;
++  base::WeakPtrFactory<RadeonUvdVideoDecoder> weak_factory_{this};
++};
++}  // namespace aurora_uvd
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_wire_validation.h
+@@ -0,0 +1,53 @@
++#ifndef AURORA_UVD_WIRE_VALIDATION_H_
++#define AURORA_UVD_WIRE_VALIDATION_H_
++#include <stdint.h>
++#include <stddef.h>
++#include "rdn_video.h"
++namespace aurora_uvd {
++template<size_t N> inline bool ZeroWords(const uint32_t (&v)[N]) {
++  for (auto word : v) if (word) return false;
++  return true;
++}
++inline bool SameToken(rdn_video_token a, rdn_video_token b) {
++  return (a.high || a.low) && a.high == b.high && a.low == b.low;
++}
++template<class T> inline bool ValidHeader(const T& v, size_t received) {
++  return received == sizeof(T) && v.version == RDN_VIDEO_API_VERSION &&
++         v.bytes == sizeof(T) && ZeroWords(v.reserved);
++}
++inline bool ValidPlanes(uint32_t w, uint32_t h, uint32_t format,
++                        uint32_t ys, uint32_t us, uint32_t yo, uint32_t uo,
++                        uint32_t bytes) {
++  if (!w || !h || (w & 15) || (h & 15) || w > 1920 || h > 1088 ||
++      format != RDN_VIDEO_FORMAT_NV12 || ys < w || us < w ||
++      ys > 8192 || us > 8192 || !bytes || bytes > 4u * 1024 * 1024)
++    return false;
++  const uint64_t ye = uint64_t(yo) + uint64_t(ys) * (h - 1) + w;
++  const uint64_t ue = uint64_t(uo) + uint64_t(us) * (h / 2 - 1) + w;
++  return ye <= bytes && ue <= bytes && (ye <= uo || ue <= yo);
++}
++inline bool ValidSession(const rdn_video_session& v, size_t received,
++                         const rdn_uvd_h264_config& config) {
++  return ValidHeader(v, received) && (v.session.high || v.session.low) &&
++      v.coded_width == config.coded_width && v.coded_height == config.coded_height &&
++      v.upload_bytes && v.upload_bytes <= RDN_VIDEO_MAX_UPLOAD_BYTES &&
++      v.output_slots == RDN_VIDEO_OUTPUT_SLOTS &&
++      v.upload_memory_type == RDN_VIDEO_MEMORY_UPLOAD &&
++      v.output0_memory_type == RDN_VIDEO_MEMORY_OUTPUT0 &&
++      v.output1_memory_type == RDN_VIDEO_MEMORY_OUTPUT1 &&
++      ValidPlanes(v.coded_width, v.coded_height, v.format, v.y_stride,
++                  v.uv_stride, v.y_offset, v.uv_offset, v.output_bytes);
++}
++inline bool ValidOutput(const rdn_video_output& v, size_t received,
++                        const rdn_video_session& s, uint32_t request,
++                        uint32_t sequence) {
++  return ValidHeader(v, received) && SameToken(v.session, s.session) &&
++      v.request_sequence == request && v.output_sequence == sequence &&
++      v.slot < RDN_VIDEO_OUTPUT_SLOTS && !v.flags &&
++      v.coded_width == s.coded_width && v.coded_height == s.coded_height &&
++      v.format == s.format && v.y_stride == s.y_stride &&
++      v.uv_stride == s.uv_stride && v.y_offset == s.y_offset &&
++      v.uv_offset == s.uv_offset && v.output_bytes == s.output_bytes;
++}
++}
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/rdn_uvd_h264.c
+@@ -0,0 +1,390 @@
++/*
++ * Message layout and legacy DPB sizing: Mesa 26.2.4 radeon_uvd.{c,h}.
++ * Copyright 2011 Advanced Micro Devices, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++#include "rdn_uvd_h264.h"
++#include <string.h>
++
++/* Firmware offsets are explicit: compiler padding and CPU endian are irrelevant. */
++enum {
++	MSG_CODEC = 224,
++	MSG_EXTENSION = 3296,
++	H264_SCALING4 = 36,
++	H264_SCALING8 = 132,
++	H264_FRAME_NUM = 260,
++	H264_FRAME_NUM_LIST = 264,
++	H264_CURR_POC = 328,
++	H264_REF_POC = 336,
++	H264_DECODED_PIC = 464
++};
++
++static void put_le32(uint8_t *out, uint32_t value)
++{
++	out[0] = (uint8_t)value;
++	out[1] = (uint8_t)(value >> 8);
++	out[2] = (uint8_t)(value >> 16);
++	out[3] = (uint8_t)(value >> 24);
++}
++
++static uint64_t align_up(uint64_t value, uint32_t alignment)
++{
++	return (value + alignment - 1) & ~((uint64_t)alignment - 1);
++}
++
++static int zero_words(const uint32_t *p, unsigned count)
++{
++	unsigned i;
++	for (i = 0; i < count; i++)
++		if (p[i])
++			return 0;
++	return 1;
++}
++
++static int ranges_overlap(const void *a, size_t an, const void *b, size_t bn)
++{
++	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
++	if (x > UINTPTR_MAX - an || y > UINTPTR_MAX - bn)
++		return 1;
++	return x < y + bn && y < x + an;
++}
++
++static int valid_config(const struct rdn_uvd_h264_config *c)
++{
++	uint32_t fs, dpb_mbs;
++	uint64_t width_mbs, height_mbs, mbs;
++	if (!c || c->version != RDN_UVD_H264_VERSION ||
++	    (c->profile_idc != 66 && c->profile_idc != 77 && c->profile_idc != 100) ||
++	    !c->coded_width || c->coded_width > RDN_UVD_H264_MAX_WIDTH ||
++	    !c->coded_height || c->coded_height > RDN_UVD_H264_MAX_HEIGHT ||
++	    (c->coded_width & 15) || (c->coded_height & 15) ||
++	    c->max_num_ref_frames > RDN_UVD_H264_MAX_REFS ||
++	    c->chroma_format_idc != 1 || c->bit_depth_luma_minus8 ||
++	    c->bit_depth_chroma_minus8 || c->frame_mbs_only_flag != 1 ||
++	    c->mb_adaptive_frame_field_flag || !zero_words(c->reserved, 3))
++		return 0;
++	/* H.264 table A-1: MaxFS and MaxDpbMbs. Frame rate/bitrate need stream timing. */
++	switch (c->level_idc) {
++	case 10: fs = 99; dpb_mbs = 396; break;
++	case 11: fs = 396; dpb_mbs = 900; break;
++	case 12: case 13: case 20: fs = 396; dpb_mbs = 2376; break;
++	case 21: fs = 792; dpb_mbs = 4752; break;
++	case 22: case 30: fs = 1620; dpb_mbs = 8100; break;
++	case 31: fs = 3600; dpb_mbs = 18000; break;
++	case 32: fs = 5120; dpb_mbs = 20480; break;
++	case 40: case 41: fs = 8192; dpb_mbs = 32768; break;
++	case 42: fs = 8704; dpb_mbs = 34816; break;
++	default: return 0;
++	}
++	width_mbs = c->coded_width / 16;
++	height_mbs = c->coded_height / 16;
++	mbs = width_mbs * height_mbs;
++	return mbs <= fs && width_mbs * width_mbs <= 8u * fs &&
++	       height_mbs * height_mbs <= 8u * fs &&
++	       mbs * c->max_num_ref_frames <= dpb_mbs;
++}
++
++int rdn_uvd_h264_layout_init(const struct rdn_uvd_h264_config *c,
++	uint32_t field_mode, struct rdn_uvd_h264_layout *output)
++{
++	struct rdn_uvd_h264_layout l;
++	uint64_t image, mbs, dpb, pitch, rows, target, packed;
++	if (!output || !valid_config(c) || field_mode > RDN_UVD_H264_TARGET_FIELDS ||
++	    ranges_overlap(output, sizeof(*output), c, sizeof(*c)))
++		return -1;
++	memset(&l, 0, sizeof(l));
++	/* Legacy UVD always reserves 17 reference images, regardless of SPS count. */
++	image = align_up((uint64_t)c->coded_width * c->coded_height * 3 / 2, 1024);
++	mbs = (c->coded_width / 16) * align_up(c->coded_height / 16, 2);
++	dpb = image * 17 + mbs * 17 * 192 + mbs * 32;
++	pitch = align_up(c->coded_width, 256);
++	rows = field_mode ? 2 * align_up(c->coded_height / 2, 16) : c->coded_height;
++	target = pitch * rows * 3 / 2;
++	packed = (uint64_t)c->coded_width * c->coded_height * 3 / 2;
++	if (align_up(dpb, 4096) > UINT32_MAX ||
++	    align_up(target, 4096) > UINT32_MAX || packed > UINT32_MAX)
++		return -1;
++	l.target_field_mode = field_mode;
++	l.db_pitch = c->coded_width;
++	l.dpb_bytes = (uint32_t)dpb;
++	l.dpb_allocation_bytes = (uint32_t)align_up(dpb, 4096);
++	l.target_pitch = (uint32_t)pitch;
++	l.target_rows = (uint32_t)rows;
++	l.chroma_top_offset = (uint32_t)(pitch * rows);
++	l.luma_bottom_offset = field_mode ? (uint32_t)(pitch * rows / 2) : 0;
++	l.chroma_bottom_offset = l.chroma_top_offset +
++		(field_mode ? (uint32_t)(pitch * rows / 4) : 0);
++	l.target_bytes = (uint32_t)target;
++	l.target_allocation_bytes = (uint32_t)align_up(target, 4096);
++	l.packed_nv12_bytes = (uint32_t)packed;
++	l.message_feedback_bytes = 4096 + 2048;
++	*output = l;
++	return 0;
++}
++
++int rdn_uvd_h264_bitstream_size(uint32_t bytes, uint32_t *padded)
++{
++	if (!padded || !bytes || bytes > RDN_UVD_H264_MAX_BITSTREAM_BYTES)
++		return -1;
++	*padded = (uint32_t)align_up(bytes, 128);
++	return 0;
++}
++
++static int valid_layout(const struct rdn_uvd_h264_config *c,
++	const struct rdn_uvd_h264_layout *l)
++{
++	struct rdn_uvd_h264_layout expected;
++	return l && !rdn_uvd_h264_layout_init(c, l->target_field_mode, &expected) &&
++	       !memcmp(l, &expected, sizeof(expected));
++}
++
++static int valid_picture(const struct rdn_uvd_h264_config *c,
++	const struct rdn_uvd_h264_picture *p)
++{
++	uint32_t max_frame_num;
++	unsigned i, j;
++	if (!p || p->version != RDN_UVD_H264_VERSION ||
++	    (p->sps_info_flags & ~13u) || !(p->sps_info_flags & 4) ||
++	    (p->pps_info_flags & ~511u) || ((p->pps_info_flags >> 4) & 3) == 3 ||
++	    (c->profile_idc != 100 && (p->pps_info_flags & 1)) ||
++	    (c->profile_idc == 66 && (p->pps_info_flags & 256)) ||
++	    p->log2_max_frame_num_minus4 > 12 || p->pic_order_cnt_type > 2 ||
++	    p->log2_max_pic_order_cnt_lsb_minus4 > 12 ||
++	    p->pic_init_qp_minus26 < -26 || p->pic_init_qp_minus26 > 25 ||
++	    p->pic_init_qs_minus26 < -26 || p->pic_init_qs_minus26 > 25 ||
++	    p->chroma_qp_index_offset < -12 || p->chroma_qp_index_offset > 12 ||
++	    p->second_chroma_qp_index_offset < -12 || p->second_chroma_qp_index_offset > 12 ||
++	    p->num_slice_groups_minus1 || p->slice_group_map_type ||
++	    p->slice_group_change_rate_minus1 || p->num_ref_idx_l0_active_minus1 > 15 ||
++	    p->num_ref_idx_l1_active_minus1 > 15 || p->field_pic_flag ||
++	    p->bottom_field_flag || p->reference_count > c->max_num_ref_frames ||
++	    !zero_words(p->reserved, 4))
++		return 0;
++	max_frame_num = 1u << (p->log2_max_frame_num_minus4 + 4);
++	if (p->frame_num >= max_frame_num)
++		return 0;
++	for (i = 0; i < RDN_UVD_H264_MAX_REFS; i++) {
++		if (p->frame_num_list[i] >= max_frame_num)
++			return 0;
++		if (i >= p->reference_count &&
++		    (p->frame_num_list[i] || p->field_order_cnt_list[i][0] ||
++		     p->field_order_cnt_list[i][1]))
++			return 0;
++	}
++	for (i = 0; i < 6; i++)
++		for (j = 0; j < 16; j++)
++			if (!p->scaling_list_4x4[i][j])
++				return 0;
++	for (i = 0; i < 2; i++)
++		for (j = 0; j < 64; j++)
++			if (!p->scaling_list_8x8[i][j])
++				return 0;
++	return 1;
++}
++
++static int valid_output(uint32_t handle, void *out, size_t capacity)
++{
++	return handle && out && capacity >= RDN_UVD_H264_MESSAGE_BYTES &&
++	       (uintptr_t)out <= UINTPTR_MAX - RDN_UVD_H264_MESSAGE_BYTES;
++}
++
++static void message_init(uint8_t *out, uint32_t type, uint32_t handle)
++{
++	memset(out, 0, RDN_UVD_H264_MESSAGE_BYTES);
++	put_le32(out, RDN_UVD_H264_MESSAGE_SIZE);
++	put_le32(out + 4, type);
++	put_le32(out + 8, handle);
++}
++
++int rdn_uvd_h264_pack_create(const struct rdn_uvd_h264_config *c,
++	const struct rdn_uvd_h264_layout *l, uint32_t handle, void *output, size_t capacity)
++{
++	uint8_t *out = (uint8_t *)output;
++	if (!valid_output(handle, out, capacity) || !valid_layout(c, l) ||
++	    ranges_overlap(out, RDN_UVD_H264_MESSAGE_BYTES, c, sizeof(*c)) ||
++	    ranges_overlap(out, RDN_UVD_H264_MESSAGE_BYTES, l, sizeof(*l)))
++		return -1;
++	message_init(out, 0, handle);
++	put_le32(out + 28, c->coded_width);
++	put_le32(out + 32, c->coded_height);
++	put_le32(out + 40, l->dpb_bytes);
++	return 0;
++}
++
++int rdn_uvd_h264_pack_decode(const struct rdn_uvd_h264_config *c,
++	const struct rdn_uvd_h264_picture *p, const struct rdn_uvd_h264_layout *l,
++	uint32_t handle, uint32_t feedback, uint32_t bitstream_bytes,
++	void *output, size_t capacity)
++{
++	uint8_t *out = (uint8_t *)output, *h;
++	uint32_t padded;
++	unsigned i;
++	if (!valid_output(handle, out, capacity) || !feedback || !valid_layout(c, l) ||
++	    !valid_picture(c, p) || rdn_uvd_h264_bitstream_size(bitstream_bytes, &padded) ||
++	    ranges_overlap(out, RDN_UVD_H264_MESSAGE_BYTES, c, sizeof(*c)) ||
++	    ranges_overlap(out, RDN_UVD_H264_MESSAGE_BYTES, p, sizeof(*p)) ||
++	    ranges_overlap(out, RDN_UVD_H264_MESSAGE_BYTES, l, sizeof(*l)))
++		return -1;
++	message_init(out, 1, handle);
++	put_le32(out + 12, feedback);
++	put_le32(out + 20, 1);
++	put_le32(out + 24, c->coded_width);
++	put_le32(out + 28, c->coded_height);
++	put_le32(out + 36, l->dpb_bytes);
++	put_le32(out + 52, l->db_pitch);
++	put_le32(out + 88, padded);
++	put_le32(out + 112, l->target_pitch);
++	put_le32(out + 124, l->target_field_mode);
++	put_le32(out + 128, l->luma_top_offset);
++	put_le32(out + 132, l->luma_bottom_offset);
++	put_le32(out + 136, l->chroma_top_offset);
++	put_le32(out + 140, l->chroma_bottom_offset);
++	h = out + MSG_CODEC;
++	put_le32(h, c->profile_idc == 66 ? 0 : c->profile_idc == 77 ? 1 : 2);
++	put_le32(h + 4, c->level_idc);
++	put_le32(h + 8, p->sps_info_flags);
++	put_le32(h + 12, p->pps_info_flags);
++	h[16] = 1;
++	h[19] = (uint8_t)p->log2_max_frame_num_minus4;
++	h[20] = (uint8_t)p->pic_order_cnt_type;
++	h[21] = (uint8_t)p->log2_max_pic_order_cnt_lsb_minus4;
++	h[22] = (uint8_t)c->max_num_ref_frames;
++	h[24] = (uint8_t)p->pic_init_qp_minus26;
++	h[25] = (uint8_t)p->pic_init_qs_minus26;
++	h[26] = (uint8_t)p->chroma_qp_index_offset;
++	h[27] = (uint8_t)p->second_chroma_qp_index_offset;
++	h[30] = (uint8_t)p->num_ref_idx_l0_active_minus1;
++	h[31] = (uint8_t)p->num_ref_idx_l1_active_minus1;
++	memcpy(h + H264_SCALING4, p->scaling_list_4x4, sizeof(p->scaling_list_4x4));
++	memcpy(h + H264_SCALING8, p->scaling_list_8x8, sizeof(p->scaling_list_8x8));
++	put_le32(h + H264_FRAME_NUM, p->frame_num);
++	put_le32(h + H264_DECODED_PIC, p->frame_num);
++	for (i = 0; i < 16; i++) {
++		put_le32(h + H264_FRAME_NUM_LIST + i * 4, p->frame_num_list[i]);
++		put_le32(h + H264_REF_POC + i * 8, (uint32_t)p->field_order_cnt_list[i][0]);
++		put_le32(h + H264_REF_POC + i * 8 + 4, (uint32_t)p->field_order_cnt_list[i][1]);
++	}
++	put_le32(h + H264_CURR_POC, (uint32_t)p->field_order_cnt[0]);
++	put_le32(h + H264_CURR_POC + 4, (uint32_t)p->field_order_cnt[1]);
++	out[MSG_EXTENSION] = 1;
++	return 0;
++}
++
++int rdn_uvd_h264_pack_destroy(uint32_t handle, void *output, size_t capacity)
++{
++	if (!valid_output(handle, output, capacity))
++		return -1;
++	message_init((uint8_t *)output, 2, handle);
++	return 0;
++}
++
++/* Legacy UVD packets and placement checks: Linux v6.12 radeon_uvd.c. */
++static int valid_gpu_range(const struct rdn_uvd_h264_gpu_range *r, uint32_t minimum)
++{
++	const uint64_t limit = UINT64_C(1) << 40;
++	return !r->reserved && r->bytes >= minimum && r->bytes &&
++	       !(r->address & 3) && r->address < limit &&
++	       r->bytes <= limit - r->address &&
++	       (r->address >> 28) == ((r->address + r->bytes - 1) >> 28);
++}
++
++static void ib_reg(uint32_t *words, unsigned *count, uint32_t reg, uint32_t value)
++{
++	words[(*count)++] = reg >> 2;
++	words[(*count)++] = value;
++}
++
++static void ib_command(uint32_t *words, unsigned *count, uint32_t command,
++	uint64_t address)
++{
++	ib_reg(words, count, 0xef10, (uint32_t)address);
++	ib_reg(words, count, 0xef14, (uint32_t)(address >> 32));
++	ib_reg(words, count, 0xef0c, command << 1);
++}
++
++int rdn_uvd_h264_build_ib(const struct rdn_uvd_h264_config *c,
++	const struct rdn_uvd_h264_layout *l, uint32_t type, uint32_t order,
++	uint32_t bitstream_bytes, const struct rdn_uvd_h264_ib_buffers *b,
++	void *output, size_t capacity, uint32_t *word_count)
++{
++	const struct rdn_uvd_h264_gpu_range *ranges[8];
++	uint32_t minimum[8] = {4, 4, 64, RDN_UVD_H264_MESSAGE_BYTES, 0, 0, 0, 0};
++	uint32_t words[32], padded;
++	unsigned i, j, count = 0, used = 4, bytes = 64;
++	uint8_t *out = (uint8_t *)output;
++	if (!b || !out || !word_count || type > RDN_UVD_H264_MSG_DESTROY ||
++	    order > RDN_UVD_H264_IB_BE)
++		return -1;
++	if (type == RDN_UVD_H264_MSG_DECODE) {
++		if (!valid_layout(c, l) || rdn_uvd_h264_bitstream_size(bitstream_bytes, &padded))
++			return -1;
++		used = 8;
++		bytes = minimum[2] = 128;
++		minimum[4] = l->dpb_bytes;
++		minimum[5] = padded;
++		minimum[6] = l->target_bytes;
++		minimum[7] = RDN_UVD_H264_FEEDBACK_BYTES;
++	} else if (bitstream_bytes) {
++		return -1;
++	}
++	if (capacity < bytes || (uintptr_t)out > UINTPTR_MAX - bytes ||
++	    (uintptr_t)word_count > UINTPTR_MAX - sizeof(*word_count) ||
++	    ranges_overlap(out, bytes, b, sizeof(*b)) ||
++	    ranges_overlap(out, bytes, word_count, sizeof(*word_count)) ||
++	    ranges_overlap(word_count, sizeof(*word_count), b, sizeof(*b)) ||
++	    (c && (ranges_overlap(out, bytes, c, sizeof(*c)) ||
++	           ranges_overlap(word_count, sizeof(*word_count), c, sizeof(*c)))) ||
++	    (l && (ranges_overlap(out, bytes, l, sizeof(*l)) ||
++	           ranges_overlap(word_count, sizeof(*word_count), l, sizeof(*l)))))
++		return -1;
++	ranges[0] = &b->vcpu;
++	ranges[1] = &b->ring;
++	ranges[2] = &b->ib;
++	ranges[3] = &b->message;
++	ranges[4] = &b->dpb;
++	ranges[5] = &b->bitstream;
++	ranges[6] = &b->target;
++	ranges[7] = &b->feedback;
++	for (i = 0; i < 8; i++) {
++		if (i >= used) {
++			if (ranges[i]->address || ranges[i]->bytes || ranges[i]->reserved)
++				return -1;
++		} else if (!valid_gpu_range(ranges[i], minimum[i])) {
++			return -1;
++		}
++	}
++	if ((b->ib.address & 63) || (b->message.address & 63) ||
++	    (b->ib.address >> 32) != (b->ring.address >> 32) ||
++	    (b->message.address >> 28) != (b->vcpu.address >> 28) ||
++	    (used == 8 && (b->feedback.address >> 28) != (b->vcpu.address >> 28)))
++		return -1;
++	for (i = 0; i < used; i++) {
++		for (j = i + 1; j < used; j++) {
++			if (ranges[i]->address < ranges[j]->address + ranges[j]->bytes &&
++			    ranges[j]->address < ranges[i]->address + ranges[i]->bytes)
++				return -1;
++		}
++	}
++	ib_command(words, &count, 0, b->message.address);
++	if (type == RDN_UVD_H264_MSG_DECODE) {
++		ib_command(words, &count, 1, b->dpb.address);
++		ib_command(words, &count, 0x100, b->bitstream.address);
++		ib_command(words, &count, 2, b->target.address);
++		ib_command(words, &count, 3, b->feedback.address);
++		ib_reg(words, &count, 0xef18, 1);
++	}
++	while (count & 15)
++		ib_reg(words, &count, 0xeffc, 0);
++	for (i = 0; i < count; i++) {
++		if (order == RDN_UVD_H264_IB_LE) {
++			put_le32(out + 4 * i, words[i]);
++		} else {
++			out[4 * i] = (uint8_t)(words[i] >> 24);
++			out[4 * i + 1] = (uint8_t)(words[i] >> 16);
++			out[4 * i + 2] = (uint8_t)(words[i] >> 8);
++			out[4 * i + 3] = (uint8_t)words[i];
++		}
++	}
++	*word_count = count;
++	return 0;
++}
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/rdn_uvd_h264.h
+@@ -0,0 +1,151 @@
++/* Legacy UVD H.264 message packing; no hardware access.
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef RDN_UVD_H264_H
++#define RDN_UVD_H264_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define RDN_UVD_H264_VERSION 1u
++#define RDN_UVD_H264_MESSAGE_SIZE 3556u
++#define RDN_UVD_H264_MESSAGE_BYTES 3568u
++#define RDN_UVD_H264_MAX_WIDTH 1920u
++#define RDN_UVD_H264_MAX_HEIGHT 1088u
++#define RDN_UVD_H264_MAX_REFS 16u
++#define RDN_UVD_H264_MAX_BITSTREAM_BYTES (16u * 1024u * 1024u)
++#define RDN_UVD_H264_TARGET_LINEAR 0u
++#define RDN_UVD_H264_TARGET_FIELDS 1u
++
++/* Host-order metadata, not firmware structs or capability claims.
++ * Map Baseline/Main level_idc 11 with constraint_set3_flag to level 9 before validation.
++ */
++struct rdn_uvd_h264_config {
++	uint32_t version;
++	uint32_t profile_idc; /* 66, 77 or 100. */
++	uint32_t level_idc;   /* Normalize SPS level 1b to 9; it is unsupported. */
++	uint32_t coded_width;
++	uint32_t coded_height;
++	uint32_t max_num_ref_frames;
++	uint32_t chroma_format_idc;
++	uint32_t bit_depth_luma_minus8;
++	uint32_t bit_depth_chroma_minus8;
++	uint32_t frame_mbs_only_flag;
++	uint32_t mb_adaptive_frame_field_flag;
++	uint32_t reserved[3];
++};
++
++struct rdn_uvd_h264_picture {
++	uint32_t version;
++	uint32_t sps_info_flags; /* UVD bits: direct8x8, MBAFF, frame-only, delta-POC-zero. */
++	uint32_t pps_info_flags; /* UVD bits 0..8; weighted_bipred_idc occupies 4..5. */
++	uint32_t log2_max_frame_num_minus4;
++	uint32_t pic_order_cnt_type;
++	uint32_t log2_max_pic_order_cnt_lsb_minus4;
++	int32_t pic_init_qp_minus26;
++	int32_t pic_init_qs_minus26;
++	int32_t chroma_qp_index_offset;
++	int32_t second_chroma_qp_index_offset;
++	uint32_t num_slice_groups_minus1;
++	uint32_t slice_group_map_type;
++	uint32_t slice_group_change_rate_minus1;
++	uint32_t num_ref_idx_l0_active_minus1;
++	uint32_t num_ref_idx_l1_active_minus1;
++	uint32_t field_pic_flag;
++	uint32_t bottom_field_flag;
++	uint32_t frame_num;
++	uint32_t reference_count;
++	uint32_t frame_num_list[16];
++	int32_t field_order_cnt[2];
++	int32_t field_order_cnt_list[16][2];
++	/* Resolved, nonzero scaling weights in raster order, not H.264 scan order. */
++	uint8_t scaling_list_4x4[6][16];
++	uint8_t scaling_list_8x8[2][64];
++	uint32_t reserved[4];
++};
++
++/* Kernel-owned layout, derived by layout_init; never accept a client layout. */
++struct rdn_uvd_h264_layout {
++	uint32_t target_field_mode;
++	uint32_t db_pitch;
++	uint32_t dpb_bytes;
++	uint32_t dpb_allocation_bytes;
++	uint32_t target_pitch;
++	uint32_t target_rows;
++	uint32_t luma_top_offset;
++	uint32_t luma_bottom_offset;
++	uint32_t chroma_top_offset;
++	uint32_t chroma_bottom_offset;
++	uint32_t target_bytes;
++	uint32_t target_allocation_bytes;
++	uint32_t packed_nv12_bytes;
++	uint32_t message_feedback_bytes;
++};
++
++#define RDN_UVD_H264_MSG_CREATE 0u
++#define RDN_UVD_H264_MSG_DECODE 1u
++#define RDN_UVD_H264_MSG_DESTROY 2u
++#define RDN_UVD_H264_IB_LE 0u
++#define RDN_UVD_H264_IB_BE 1u
++#define RDN_UVD_H264_IB_MAX_BYTES 128u
++#define RDN_UVD_H264_FEEDBACK_BYTES 2048u
++
++/* Dedicated kernel-owned usable spans; not a user-client ABI. */
++struct rdn_uvd_h264_gpu_range {
++	uint64_t address;
++	uint32_t bytes;
++	uint32_t reserved;
++};
++
++struct rdn_uvd_h264_ib_buffers {
++	struct rdn_uvd_h264_gpu_range vcpu;
++	struct rdn_uvd_h264_gpu_range ring;
++	struct rdn_uvd_h264_gpu_range ib;
++	struct rdn_uvd_h264_gpu_range message;
++	struct rdn_uvd_h264_gpu_range dpb;
++	struct rdn_uvd_h264_gpu_range bitstream;
++	struct rdn_uvd_h264_gpu_range target;
++	struct rdn_uvd_h264_gpu_range feedback;
++};
++
++/* Coded dimensions must be multiples of 16. Field storage also accepts progressive input. */
++int rdn_uvd_h264_layout_init(const struct rdn_uvd_h264_config *config,
++	uint32_t target_field_mode, struct rdn_uvd_h264_layout *layout);
++
++/* Returns the 128-byte aligned size; the caller must zero the trailing bytes. */
++int rdn_uvd_h264_bitstream_size(uint32_t bytes, uint32_t *padded_bytes);
++
++/* On failure, outputs are unchanged. Output may be unaligned, but cannot alias inputs.
++ * Handles and feedback serials are nonzero kernel-owned values. These functions
++ * do not validate bitstream syntax, allocate buffers, submit work or prove completion.
++ */
++int rdn_uvd_h264_pack_create(const struct rdn_uvd_h264_config *config,
++	const struct rdn_uvd_h264_layout *layout, uint32_t handle,
++	void *output, size_t capacity);
++int rdn_uvd_h264_pack_decode(const struct rdn_uvd_h264_config *config,
++	const struct rdn_uvd_h264_picture *picture,
++	const struct rdn_uvd_h264_layout *layout, uint32_t handle,
++	uint32_t feedback, uint32_t bitstream_bytes, void *output, size_t capacity);
++int rdn_uvd_h264_pack_destroy(uint32_t handle, void *output, size_t capacity);
++
++/* All GPU spans must be disjoint, including VCPU/ring; unused decode spans are zero.
++ * Message contents must come from the matching pack_* call. Decode also needs its
++ * validated config/layout, zero-padded bitstream and LE feedback[0] = 2048.
++ * IB byte order must match LMI's IB swap mode, independently of the LE messages.
++ * word_count receives 16 or 32; output may be unaligned and cannot alias inputs/count.
++ * On failure output/count are unchanged. No allocation, submission or fence is done.
++ */
++int rdn_uvd_h264_build_ib(const struct rdn_uvd_h264_config *config,
++	const struct rdn_uvd_h264_layout *layout, uint32_t message_type,
++	uint32_t word_order, uint32_t bitstream_bytes,
++	const struct rdn_uvd_h264_ib_buffers *buffers,
++	void *output, size_t capacity, uint32_t *word_count);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/rdn_video.h
+@@ -0,0 +1,68 @@
++/* Bounded H.264 video user-client interface. */
++#ifndef RDN_VIDEO_API_H
++#define RDN_VIDEO_API_H
++#include <stdint.h>
++#include "rdn_uvd_h264.h"
++#define RDN_VIDEO_UC_TYPE 0x72646e76u /* rdnv */
++#define RDN_VIDEO_API_VERSION 1u
++#define RDN_VIDEO_MEMORY_UPLOAD 0x100u
++#define RDN_VIDEO_MEMORY_OUTPUT0 0x101u
++#define RDN_VIDEO_MEMORY_OUTPUT1 0x102u
++#define RDN_VIDEO_MAX_UPLOAD_BYTES (4u * 1024u * 1024u)
++#define RDN_VIDEO_OUTPUT_SLOTS 2u
++#define RDN_VIDEO_CREATE_VALIDATION 1u
++#define RDN_VIDEO_CAP_READY 1u
++#define RDN_VIDEO_CAP_PRODUCTION 2u
++#define RDN_VIDEO_CAP_VALIDATION 4u
++#define RDN_VIDEO_CAP_BUSY 8u
++#define RDN_VIDEO_FORMAT_NV12 1u
++#define RDN_VIDEO_PROFILE_BASELINE 1u
++#define RDN_VIDEO_PROFILE_MAIN 2u
++#define RDN_VIDEO_PROFILE_HIGH 4u
++enum { RDN_VIDEO_QUERY, RDN_VIDEO_CREATE, RDN_VIDEO_DECODE,
++       RDN_VIDEO_RELEASE, RDN_VIDEO_DESTROY, RDN_VIDEO_METHOD_COUNT };
++/* All fields use CPU byte order; no pointers, size_t or compiler bool. */
++struct rdn_video_token { uint32_t high, low; };
++struct rdn_video_query {
++ uint32_t version, bytes, flags, unavailable_reason;
++ uint32_t max_width, max_height, max_refs, profile_mask, level_mask;
++ uint32_t max_upload_bytes, max_sessions, max_inflight, output_slots;
++ uint32_t max_vram_bytes, max_cpu_bytes, reserved[17];
++};
++struct rdn_video_create {
++ uint32_t version, bytes;
++ struct rdn_uvd_h264_config config;
++ uint32_t flags, reserved[7];
++};
++struct rdn_video_session {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t coded_width, coded_height, format, y_stride, uv_stride;
++ uint32_t y_offset, uv_offset, output_bytes, upload_bytes;
++ uint32_t output_slots, upload_memory_type, output0_memory_type;
++ uint32_t output1_memory_type, reserved[15];
++};
++struct rdn_video_decode {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t request_sequence, bitstream_bytes, reserved[2];
++ struct rdn_uvd_h264_picture picture;
++};
++struct rdn_video_output {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t request_sequence, output_sequence, slot, flags;
++ uint32_t coded_width, coded_height, format, y_stride, uv_stride;
++ uint32_t y_offset, uv_offset, output_bytes, reserved[16];
++};
++struct rdn_video_release {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t output_sequence, slot, reserved[2];
++};
++struct rdn_video_destroy {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t reserved[4];
++};
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/replay_video_decoder.cc
+@@ -0,0 +1,278 @@
++#include "replay_video_decoder.h"
++#include <utility>
++#include "base/functional/bind.h"
++#include "base/task/sequenced_task_runner.h"
++#include "media/base/media_log.h"
++#include "media/base/video_frame.h"
++
++namespace aurora_uvd {
++namespace {
++using Code = media::DecoderStatus::Codes;
++constexpr size_t kHistoryBytes = 8u * 1024u * 1024u;
++constexpr size_t kHistoryPictures = 256;
++}  // namespace
++ReplayVideoDecoder::ReplayVideoDecoder(std::unique_ptr<media::VideoDecoder> hardware,
++                                       Factory software)
++    : ReplayVideoDecoder(std::move(hardware), std::move(software), nullptr) {}
++ReplayVideoDecoder::ReplayVideoDecoder(std::unique_ptr<media::VideoDecoder> hardware,
++                                       Factory software,
++                                       std::unique_ptr<media::MediaLog> media_log)
++    : decoder_(std::move(hardware)), software_factory_(std::move(software)),
++      media_log_(std::move(media_log)),
++      platform_decoder_(decoder_ && decoder_->IsPlatformDecoder()) {}
++ReplayVideoDecoder::~ReplayVideoDecoder() = default;
++media::VideoDecoderType ReplayVideoDecoder::GetDecoderType() const {
++  return decoder_ ? decoder_->GetDecoderType() : media::VideoDecoderType::kUnknown;
++}
++void ReplayVideoDecoder::Initialize(const media::VideoDecoderConfig& config,
++    bool low_delay, media::CdmContext* cdm, InitCB done, const OutputCB& output,
++    const media::WaitingCB& waiting) {
++  ++generation_;
++  initialized_ = failed_ = false;
++  input_.clear(); replay_.clear(); entries_.clear(); parser_.Clear();
++  history_bytes_ = 0;
++  next_id_ = 1;
++  checkpoint_ = last_picture_id_ = 0;
++  config_ = config; low_delay_ = low_delay; output_ = output; waiting_ = waiting;
++  eos_ = replaying_ = false;
++  if (!decoder_) { std::move(done).Run(Code::kUnsupportedConfig); return; }
++  decoder_->Initialize(config, low_delay, cdm,
++      base::BindOnce(&ReplayVideoDecoder::Initialized, weak_.GetWeakPtr(),
++                     generation_, std::move(done)), BoundOutput(), waiting);
++}
++void ReplayVideoDecoder::Initialized(uint64_t generation, InitCB done,
++                                    media::DecoderStatus status) {
++  if (generation != generation_) return;
++  initialized_ = status.is_ok();
++  if (initialized_) ReportSoftwareDecoder();
++  std::move(done).Run(status);
++}
++media::VideoDecoder::OutputCB ReplayVideoDecoder::BoundOutput() {
++  return base::BindRepeating(&ReplayVideoDecoder::Output, weak_.GetWeakPtr(), generation_);
++}
++void ReplayVideoDecoder::Decode(scoped_refptr<media::DecoderBuffer> buffer,
++                                DecodeCB done) {
++  if (!initialized_ || failed_ || pending_ || !buffer) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++        base::BindOnce(std::move(done), Code::kNotInitialized));
++    return;
++  }
++  pending_ = std::move(done);
++  eos_ = buffer->end_of_stream();
++  if (!eos_) {
++    std::vector<ReplayAccessUnit> units;
++    if (!parser_.Split(*buffer, &units)) {
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++          base::BindOnce(&ReplayVideoDecoder::Finish, weak_.GetWeakPtr(),
++                         media::DecoderStatus(Code::kMalformedBitstream)));
++      return;
++    }
++    for (auto& unit : units) input_.push_back(std::move(unit));
++  }
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++      base::BindOnce(&ReplayVideoDecoder::Pump, weak_.GetWeakPtr()));
++}
++void ReplayVideoDecoder::Pump() {
++  if (!pending_) return;
++  if (!replay_.empty()) {
++    int64_t id = replay_.front();
++    replay_.pop_front();
++    decoder_->Decode(entries_.at(id).buffer,
++        base::BindOnce(&ReplayVideoDecoder::Completed, weak_.GetWeakPtr(), generation_, id));
++    return;
++  }
++  if (replaying_) {
++    replaying_ = false;
++    for (auto it = entries_.begin(); it != entries_.end();) {
++      if ((it->second.delivered && !it->second.suppress) || !it->second.picture ||
++          it->second.no_output)
++        it = entries_.erase(it);
++      else { it->second.buffer = nullptr; ++it; }
++    }
++    history_bytes_ = 0;
++  }
++  if (input_.empty()) {
++    if (eos_) {
++      eos_ = false;
++      decoder_->Decode(media::DecoderBuffer::CreateEOSBuffer(),
++          base::BindOnce(&ReplayVideoDecoder::Completed, weak_.GetWeakPtr(), generation_, int64_t(0)));
++    } else Finish(Code::kOk);
++    return;
++  }
++  auto& unit = input_.front();
++  const size_t bytes_needed = unit.buffer->data_size() + unit.parameters.size();
++  if (!software_ && (entries_.size() >= kHistoryPictures ||
++      bytes_needed > kHistoryBytes - history_bytes_)) {
++    FallBack();
++    return;
++  }
++  if (entries_.size() >= 512 || next_id_ == INT64_MAX) {
++    Finish(Code::kUnsupportedConfig);
++    return;
++  }
++  int64_t id = next_id_++;
++  Entry entry;
++  entry.timestamp = unit.buffer->timestamp();
++  entry.duration = unit.buffer->duration();
++  entry.buffer = unit.buffer;
++  // An individual IDR field is not an independently replayable checkpoint.
++  entry.idr = unit.idr && !unit.field; entry.picture = unit.picture;
++  entry.field = unit.field; entry.bottom = unit.bottom;
++  entry.reference = unit.reference; entry.frame_num = unit.frame_num;
++  entry.pps_id = unit.pps_id;
++  auto previous = entries_.find(last_picture_id_);
++  if (entry.picture) last_picture_id_ = id;
++  if (entry.field && !unit.idr && previous != entries_.end()) {
++    auto& first = previous->second;
++    if (first.field && !first.paired_id && !first.delivered && !first.no_output &&
++        first.bottom != entry.bottom && first.frame_num == entry.frame_num &&
++        first.pps_id == entry.pps_id && first.reference == entry.reference) {
++      first.paired_id = id;
++      entry.paired_id = previous->first;
++    }
++  }
++  if (!unit.parameters.empty()) {
++    auto bytes = std::move(unit.parameters);
++    bytes.insert(bytes.end(), entry.buffer->data(), entry.buffer->data() + entry.buffer->data_size());
++    entry.buffer = media::DecoderBuffer::CopyFrom(bytes.data(), bytes.size());
++    entry.buffer->set_duration(entry.duration);
++    entry.buffer->set_is_key_frame(true);
++  }
++  entry.buffer->set_timestamp(base::Microseconds(id));
++  auto tagged = entry.buffer;
++  if (!software_) history_bytes_ += tagged->data_size();
++  entries_.emplace(id, std::move(entry));
++  input_.pop_front();
++  decoder_->Decode(std::move(tagged),
++      base::BindOnce(&ReplayVideoDecoder::Completed, weak_.GetWeakPtr(), generation_, id));
++}
++void ReplayVideoDecoder::Completed(uint64_t generation, int64_t id,
++                                  media::DecoderStatus status) {
++  if (generation != generation_ || !pending_) return;
++  if (!status.is_ok()) {
++    if (!software_ && status.code() != Code::kAborted) {
++      if (!id) eos_ = true;
++      FallBack(); return;
++    }
++    Finish(status); return;
++  }
++  auto found = entries_.find(id);
++  if (!software_ && found != entries_.end() && found->second.idr) {
++    checkpoint_ = id;
++    PruneCheckpoint();
++  } else if (software_ && !replaying_ && found != entries_.end()) {
++    found->second.buffer = nullptr;
++    if (!found->second.picture || found->second.delivered || found->second.no_output)
++      entries_.erase(found);
++  }
++  Pump();
++}
++void ReplayVideoDecoder::PruneCheckpoint() {
++  if (software_ || !checkpoint_) return;
++  auto checkpoint = entries_.find(checkpoint_);
++  if (checkpoint == entries_.end()) return;
++  // Do not retire replay IDs before delayed pre-IDR output reaches this sequence.
++  for (auto it = entries_.begin(); it != checkpoint; ++it)
++    if (it->second.picture && !it->second.delivered && !it->second.no_output) return;
++  for (auto it = entries_.begin(); it != checkpoint;) {
++    history_bytes_ -= it->second.buffer->data_size();
++    it = entries_.erase(it);
++  }
++}
++void ReplayVideoDecoder::Output(uint64_t generation,
++                               scoped_refptr<media::VideoFrame> frame) {
++  if (generation != generation_ || !initialized_ || failed_) return;
++  auto found = entries_.find(frame->timestamp().InMicroseconds());
++  if (found == entries_.end()) { failed_ = true; return; }
++  auto& entry = found->second;
++  // FFmpeg emits one complete frame for two complementary field packets.
++  auto partner = entries_.find(entry.paired_id);
++  if (partner != entries_.end()) {
++    partner->second.no_output = true;
++    if (software_ && !replaying_ && !partner->second.buffer) entries_.erase(partner);
++  }
++  if (entry.suppress) {
++    --entry.suppress;
++    if (!replaying_ && !entry.buffer && !entry.suppress) entries_.erase(found);
++    return;
++  }
++  ++entry.delivered;
++  frame->set_timestamp(entry.timestamp);
++  if (entry.duration.is_positive()) frame->metadata().frame_duration = entry.duration;
++  if (software_ && !replaying_ && !entry.buffer) entries_.erase(found);
++  PruneCheckpoint();
++  output_.Run(std::move(frame));
++}
++void ReplayVideoDecoder::FallBack() {
++  // Destruction retires hardware asynchronously; quarantined storage stays owned.
++  ++generation_;
++  decoder_.reset();
++  decoder_ = software_factory_.Run();
++  software_ = replaying_ = true;
++  replay_.clear();
++  for (auto& item : entries_) {
++    item.second.suppress = item.second.delivered;
++    replay_.push_back(item.first);
++  }
++  if (!decoder_) { initialized_ = false; Finish(Code::kUnsupportedConfig); return; }
++  decoder_->Initialize(config_, low_delay_, nullptr,
++      base::BindOnce(&ReplayVideoDecoder::SoftwareReady, weak_.GetWeakPtr(), generation_),
++      BoundOutput(), waiting_);
++}
++void ReplayVideoDecoder::SoftwareReady(uint64_t generation, media::DecoderStatus status) {
++  if (generation != generation_ || !pending_) return;
++  if (!status.is_ok()) { Finish(status); return; }
++  ReportSoftwareDecoder();
++  Pump();
++}
++void ReplayVideoDecoder::ReportSoftwareDecoder() {
++  if (software_ && media_log_ && decoder_ &&
++      decoder_->GetDecoderType() == media::VideoDecoderType::kFFmpeg) {
++    media_log_->SetProperty<media::MediaLogProperty::kVideoDecoderName>(
++        media::VideoDecoderType::kFFmpeg);
++    media_log_->SetProperty<media::MediaLogProperty::kIsPlatformVideoDecoder>(false);
++  }
++}
++void ReplayVideoDecoder::Finish(media::DecoderStatus status) {
++  if (!pending_) return;
++  if (failed_ && status.is_ok()) status = Code::kFailed;
++  failed_ = !status.is_ok();
++  std::move(pending_).Run(status);
++}
++void ReplayVideoDecoder::Reset(base::OnceClosure done) {
++  ++generation_;
++  auto alive = weak_.GetWeakPtr();
++  if (pending_) std::move(pending_).Run(Code::kAborted);
++  if (!alive) return;
++  input_.clear(); replay_.clear(); entries_.clear();
++  history_bytes_ = 0; eos_ = replaying_ = failed_ = false;
++  checkpoint_ = last_picture_id_ = 0;
++  if (!decoder_) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE, std::move(done));
++    return;
++  }
++  decoder_->Reset(base::BindOnce(&ReplayVideoDecoder::ReinitializeAfterReset,
++      weak_.GetWeakPtr(), generation_, std::move(done)));
++}
++void ReplayVideoDecoder::ReinitializeAfterReset(uint64_t generation,
++                                               base::OnceClosure done) {
++  if (generation != generation_) return;
++  // Rebind callbacks after cancellation; parameter state survives seek.
++  decoder_->Initialize(config_, low_delay_, nullptr,
++      base::BindOnce(&ReplayVideoDecoder::ResetReady, weak_.GetWeakPtr(),
++                     generation_, std::move(done)), BoundOutput(), waiting_);
++}
++void ReplayVideoDecoder::ResetReady(uint64_t generation, base::OnceClosure done,
++                                   media::DecoderStatus status) {
++  if (generation != generation_) return;
++  if (!status.is_ok() && !software_) {
++    decoder_.reset();
++    decoder_ = software_factory_.Run();
++    software_ = true;
++    if (decoder_) { ReinitializeAfterReset(generation, std::move(done)); return; }
++  }
++  initialized_ = status.is_ok();
++  if (initialized_) ReportSoftwareDecoder();
++  std::move(done).Run();
++}
++}  // namespace aurora_uvd
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/replay_video_decoder.h
+@@ -0,0 +1,78 @@
++#ifndef AURORA_REPLAY_VIDEO_DECODER_H_
++#define AURORA_REPLAY_VIDEO_DECODER_H_
++#include <deque>
++#include <map>
++#include <memory>
++#include "annex_b_replay.h"
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "media/base/video_decoder.h"
++#include "media/base/video_decoder_config.h"
++
++namespace media { class MediaLog; }
++
++namespace aurora_uvd {
++class ReplayVideoDecoder final : public media::VideoDecoder {
++ public:
++  using Factory = base::RepeatingCallback<std::unique_ptr<media::VideoDecoder>()>;
++  ReplayVideoDecoder(std::unique_ptr<media::VideoDecoder>, Factory software);
++  ReplayVideoDecoder(std::unique_ptr<media::VideoDecoder>, Factory software,
++                     std::unique_ptr<media::MediaLog> media_log);
++  ~ReplayVideoDecoder() override;
++  void Initialize(const media::VideoDecoderConfig&, bool, media::CdmContext*,
++                  InitCB, const OutputCB&, const media::WaitingCB&) override;
++  void Decode(scoped_refptr<media::DecoderBuffer>, DecodeCB) override;
++  void Reset(base::OnceClosure) override;
++  bool NeedsBitstreamConversion() const override { return true; }
++  int GetMaxDecodeRequests() const override { return 1; }
++  bool FramesHoldExternalResources() const override { return false; }
++  bool IsPlatformDecoder() const override {
++    return platform_decoder_;
++  }
++  media::VideoDecoderType GetDecoderType() const override;
++ private:
++  struct Entry {
++    scoped_refptr<media::DecoderBuffer> buffer;
++    base::TimeDelta timestamp, duration;
++    size_t delivered = 0, suppress = 0;
++    bool idr = false, picture = false;
++    bool field = false, bottom = false, reference = false, no_output = false;
++    int frame_num = 0, pps_id = 0;
++    int64_t paired_id = 0;
++  };
++  void Initialized(uint64_t, InitCB, media::DecoderStatus);
++  void Pump();
++  void Completed(uint64_t, int64_t, media::DecoderStatus);
++  void Output(uint64_t, scoped_refptr<media::VideoFrame>);
++  void FallBack();
++  void SoftwareReady(uint64_t, media::DecoderStatus);
++  void ResetReady(uint64_t, base::OnceClosure, media::DecoderStatus);
++  void ReinitializeAfterReset(uint64_t, base::OnceClosure);
++  void PruneCheckpoint();
++  void ReportSoftwareDecoder();
++  void Finish(media::DecoderStatus);
++  OutputCB BoundOutput();
++  std::unique_ptr<media::VideoDecoder> decoder_;
++  Factory software_factory_;
++  std::unique_ptr<media::MediaLog> media_log_;
++  const bool platform_decoder_;
++  AnnexBReplay parser_;
++  media::VideoDecoderConfig config_;
++  media::WaitingCB waiting_;
++  OutputCB output_;
++  DecodeCB pending_;
++  std::deque<ReplayAccessUnit> input_;
++  std::deque<int64_t> replay_;
++  std::map<int64_t, Entry> entries_;
++  size_t history_bytes_ = 0;
++  int64_t next_id_ = 1;
++  int64_t checkpoint_ = 0;
++  int64_t last_picture_id_ = 0;
++  uint64_t generation_ = 0;
++  bool initialized_ = false, software_ = false, replaying_ = false;
++  bool eos_ = false, low_delay_ = false, failed_ = false;
++  base::WeakPtrFactory<ReplayVideoDecoder> weak_{this};
++};
++std::unique_ptr<media::VideoDecoder> CreateWorkerFFmpegDecoder();
++}  // namespace aurora_uvd
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/uvd_metadata_adapter.h
+@@ -0,0 +1,192 @@
++// Scratch prototype; no device access or capability enablement.
++#ifndef AURORA_UVD_METADATA_ADAPTER_H_
++#define AURORA_UVD_METADATA_ADAPTER_H_
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include "rdn_uvd_h264.h"
++
++namespace aurora_uvd {
++enum class Result {
++  kOk, kInvalid, kUnsupportedFormat, kUnsupportedReference,
++  kUnsupportedSlice, kPackerRejected
++};
++struct Metadata {
++  rdn_uvd_h264_config config;
++  rdn_uvd_h264_picture picture;
++};
++
++static constexpr uint8_t kScan4[16] =
++    {0,1,4,8,5,2,3,6,9,12,13,10,7,11,14,15};
++static constexpr uint8_t kScan8[64] = {
++    0,1,8,16,9,2,3,10,17,24,32,25,18,11,4,5,
++    12,19,26,33,40,48,41,34,27,20,13,6,7,14,21,28,
++    35,42,49,56,57,50,43,36,29,22,15,23,30,37,44,51,
++    58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63};
++
++// Inputs use Chromium's parsed/resolved fields. No input or output changes on failure.
++template<class Sps>
++Result MapConfig(const Sps& s, rdn_uvd_h264_config* output) {
++  if (!output) return Result::kInvalid;
++  if (s.pic_width_in_mbs_minus1 < 3 || s.pic_width_in_mbs_minus1 >= 120 ||
++      s.pic_height_in_map_units_minus1 < 3 ||
++      s.pic_height_in_map_units_minus1 >= 68 ||
++      !s.frame_mbs_only_flag || s.mb_adaptive_frame_field_flag ||
++      s.separate_colour_plane_flag || s.qpprime_y_zero_transform_bypass_flag)
++    return Result::kUnsupportedFormat;
++  rdn_uvd_h264_config c = {};
++  c.version = RDN_UVD_H264_VERSION;
++  c.profile_idc = s.profile_idc;
++  c.level_idc = ((s.profile_idc == 66 || s.profile_idc == 77) &&
++                s.level_idc == 11 && s.constraint_set3_flag) ? 9 : s.level_idc;
++  c.coded_width = (s.pic_width_in_mbs_minus1 + 1) * 16;
++  c.coded_height = (s.pic_height_in_map_units_minus1 + 1) * 16;
++  c.max_num_ref_frames = s.max_num_ref_frames;
++  c.chroma_format_idc = s.chroma_format_idc;
++  c.bit_depth_luma_minus8 = s.bit_depth_luma_minus8;
++  c.bit_depth_chroma_minus8 = s.bit_depth_chroma_minus8;
++  c.frame_mbs_only_flag = s.frame_mbs_only_flag;
++  c.mb_adaptive_frame_field_flag = s.mb_adaptive_frame_field_flag;
++  rdn_uvd_h264_layout layout;
++  if (rdn_uvd_h264_layout_init(&c, RDN_UVD_H264_TARGET_LINEAR, &layout))
++    return Result::kUnsupportedFormat;
++  *output = c;
++  return Result::kOk;
++}
++
++template<class Slice>
++Result ActiveCounts(const Slice& slice, uint32_t* l0, uint32_t* l1) {
++  if (slice.slice_type < 0 || slice.slice_type > 9 ||
++      slice.slice_type % 5 > 2 || slice.field_pic_flag ||
++      slice.bottom_field_flag || slice.redundant_pic_cnt)
++    return Result::kUnsupportedSlice;
++  *l0 = *l1 = 0;
++  if (slice.slice_type % 5 != 2) {
++    if (slice.num_ref_idx_l0_active_minus1 < 0 ||
++        slice.num_ref_idx_l0_active_minus1 > 15)
++      return Result::kUnsupportedSlice;
++    *l0 = slice.num_ref_idx_l0_active_minus1;
++  }
++  if (slice.slice_type % 5 == 1) {
++    if (slice.num_ref_idx_l1_active_minus1 < 0 ||
++        slice.num_ref_idx_l1_active_minus1 > 15)
++      return Result::kUnsupportedSlice;
++    *l1 = slice.num_ref_idx_l1_active_minus1;
++  }
++  return Result::kOk;
++}
++
++// UVD has one active-count pair per message; mixed pairs need separate validation.
++template<class Slice>
++bool CompatibleSlice(const Slice& first, const Slice& next) {
++  uint32_t a0, a1, b0, b1;
++  return ActiveCounts(first, &a0, &a1) == Result::kOk &&
++         ActiveCounts(next, &b0, &b1) == Result::kOk &&
++         first.pic_parameter_set_id == next.pic_parameter_set_id &&
++         first.frame_num == next.frame_num &&
++         first.slice_type % 5 == next.slice_type % 5 &&
++         a0 == b0 && a1 == b1;
++}
++
++// Chromium applies short-term removals after decoding this picture.
++template<class Picture>
++bool ShortTermMarking(const Picture& picture, uint32_t max_frame_num) {
++  if (!picture.adaptive_ref_pic_marking_mode_flag) return true;
++  for (const auto& marking : picture.ref_pic_marking) {
++    if (marking.memory_mgmnt_control_operation == 0) return true;
++    if (marking.memory_mgmnt_control_operation != 1 ||
++        marking.difference_of_pic_nums_minus1 < 0 ||
++        static_cast<uint32_t>(marking.difference_of_pic_nums_minus1) >= max_frame_num)
++      return false;
++  }
++  return false;
++}
++
++// refs is SubmitFrameMetadata's ref_pic_listp0, not a slice's reordered L0/L1.
++template<class Sps, class Pps, class Picture, class Slice>
++Result MapPicture(const Sps& s, const Pps& p, const Picture& current,
++                  const Slice& first_slice, const Picture* const* refs,
++                  size_t ref_count, Metadata* output) {
++  if (!output || (ref_count && !refs) || ref_count > 16 ||
++      p.seq_parameter_set_id != s.seq_parameter_set_id ||
++      first_slice.pic_parameter_set_id != p.pic_parameter_set_id ||
++      first_slice.frame_num != current.frame_num ||
++      current.pic_order_cnt_type != s.pic_order_cnt_type)
++    return Result::kInvalid;
++  Metadata m = {};
++  Result status = MapConfig(s, &m.config);
++  if (status != Result::kOk) return status;
++  if (current.field != 0 || current.nonexisting || current.long_term ||
++      current.long_term_reference_flag || current.mem_mgmt_5)
++    return Result::kUnsupportedReference;
++  if (ref_count > m.config.max_num_ref_frames || p.num_slice_groups_minus1 ||
++      s.log2_max_frame_num_minus4 < 0 || s.log2_max_frame_num_minus4 > 12 ||
++      p.weighted_bipred_idc < 0 || p.weighted_bipred_idc > 2)
++    return Result::kUnsupportedFormat;
++  const uint32_t max_frame_num = 1u << (s.log2_max_frame_num_minus4 + 4);
++  if (current.frame_num < 0 || static_cast<uint32_t>(current.frame_num) >= max_frame_num)
++    return Result::kInvalid;
++  if (!ShortTermMarking(current, max_frame_num))
++    return Result::kUnsupportedReference;
++  auto& q = m.picture;
++  q.version = RDN_UVD_H264_VERSION;
++  q.sps_info_flags = (s.direct_8x8_inference_flag ? 1u : 0u) |
++                    (s.frame_mbs_only_flag ? 4u : 0u) |
++                    (s.delta_pic_order_always_zero_flag ? 8u : 0u);
++  q.pps_info_flags = (p.transform_8x8_mode_flag ? 1u : 0u) |
++                    (p.redundant_pic_cnt_present_flag ? 2u : 0u) |
++                    (p.constrained_intra_pred_flag ? 4u : 0u) |
++                    (p.deblocking_filter_control_present_flag ? 8u : 0u) |
++                    (static_cast<uint32_t>(p.weighted_bipred_idc) << 4) |
++                    (p.weighted_pred_flag ? 64u : 0u) |
++                    (p.bottom_field_pic_order_in_frame_present_flag ? 128u : 0u) |
++                    (p.entropy_coding_mode_flag ? 256u : 0u);
++  q.log2_max_frame_num_minus4 = s.log2_max_frame_num_minus4;
++  q.pic_order_cnt_type = s.pic_order_cnt_type;
++  q.log2_max_pic_order_cnt_lsb_minus4 =
++      s.pic_order_cnt_type == 0 ? s.log2_max_pic_order_cnt_lsb_minus4 : 0;
++  q.pic_init_qp_minus26 = p.pic_init_qp_minus26;
++  q.pic_init_qs_minus26 = p.pic_init_qs_minus26;
++  q.chroma_qp_index_offset = p.chroma_qp_index_offset;
++  q.second_chroma_qp_index_offset = p.second_chroma_qp_index_offset;
++  status = ActiveCounts(first_slice, &q.num_ref_idx_l0_active_minus1,
++                        &q.num_ref_idx_l1_active_minus1);
++  if (status != Result::kOk) return status;
++  q.frame_num = current.frame_num;
++  q.field_order_cnt[0] = current.top_field_order_cnt;
++  q.field_order_cnt[1] = current.bottom_field_order_cnt;
++  q.reference_count = static_cast<uint32_t>(ref_count);
++  for (size_t i = 0; i < ref_count; ++i) {
++    const Picture* ref = refs[i];
++    if (!ref || !ref->ref || ref->field != 0 || ref->nonexisting || ref->long_term)
++      return Result::kUnsupportedReference;
++    if (ref->frame_num < 0 || static_cast<uint32_t>(ref->frame_num) >= max_frame_num)
++      return Result::kInvalid;
++    for (size_t j = 0; j < i; ++j)
++      if (refs[j] == ref) return Result::kInvalid;
++    // Chromium VA -> Mesa UVD uses raw frame_num, never FrameNumWrap or DPB slot.
++    q.frame_num_list[i] = ref->frame_num;
++    q.field_order_cnt_list[i][0] = ref->top_field_order_cnt;
++    q.field_order_cnt_list[i][1] = ref->bottom_field_order_cnt;
++  }
++  const auto& scaling4 = p.pic_scaling_matrix_present_flag ?
++      p.scaling_list4x4 : s.scaling_list4x4;
++  const auto& scaling8 = p.pic_scaling_matrix_present_flag ?
++      p.scaling_list8x8 : s.scaling_list8x8;
++  for (size_t i = 0; i < 6; ++i)
++    for (size_t j = 0; j < 16; ++j)
++      q.scaling_list_4x4[i][kScan4[j]] = scaling4[i][j];
++  for (size_t i = 0; i < 2; ++i)
++    for (size_t j = 0; j < 64; ++j)
++      q.scaling_list_8x8[i][kScan8[j]] = scaling8[i][j];
++  rdn_uvd_h264_layout layout;
++  uint8_t message[RDN_UVD_H264_MESSAGE_BYTES];
++  if (rdn_uvd_h264_layout_init(&m.config, RDN_UVD_H264_TARGET_LINEAR, &layout) ||
++      rdn_uvd_h264_pack_decode(&m.config, &q, &layout, 1, 1, 1,
++                               message, sizeof(message)))
++    return Result::kPackerRejected;
++  *output = m;
++  return Result::kOk;
++}
++}  // namespace aurora_uvd
++#endif
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/worker_ffmpeg_decoder.cc
+@@ -0,0 +1,60 @@
++#include "replay_video_decoder.h"
++#include "base/functional/bind.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/thread_pool.h"
++#include "base/threading/sequence_bound.h"
++#include "media/base/media_util.h"
++#include "media/base/video_frame.h"
++#include "media/filters/ffmpeg_video_decoder.h"
++
++namespace aurora_uvd {
++namespace {
++class WorkerFFmpegDecoder final : public media::VideoDecoder {
++ public:
++  WorkerFFmpegDecoder()
++      : core_(base::ThreadPool::CreateSingleThreadTaskRunner(
++            {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++             base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
++            base::SingleThreadTaskRunnerThreadMode::DEDICATED)) {}
++  ~WorkerFFmpegDecoder() override = default;
++  void Initialize(const media::VideoDecoderConfig& config, bool low_delay,
++      media::CdmContext* cdm, InitCB done, const OutputCB& output,
++      const media::WaitingCB& waiting) override {
++    core_.AsyncCall(&Core::Initialize).WithArgs(config, low_delay, cdm,
++        base::BindPostTaskToCurrentDefault(std::move(done)),
++        base::BindPostTaskToCurrentDefault(output),
++        waiting ? base::BindPostTaskToCurrentDefault(waiting) : media::WaitingCB());
++  }
++  void Decode(scoped_refptr<media::DecoderBuffer> buffer, DecodeCB done) override {
++    core_.AsyncCall(&Core::Decode).WithArgs(std::move(buffer),
++        base::BindPostTaskToCurrentDefault(std::move(done)));
++  }
++  void Reset(base::OnceClosure done) override {
++    core_.AsyncCall(&Core::Reset).WithArgs(base::BindPostTaskToCurrentDefault(std::move(done)));
++  }
++  media::VideoDecoderType GetDecoderType() const override {
++    return media::VideoDecoderType::kFFmpeg;
++  }
++ private:
++  class Core {
++   public:
++    Core() : decoder_(&log_) {}
++    void Initialize(media::VideoDecoderConfig config, bool low_delay,
++        media::CdmContext* cdm, InitCB done, OutputCB output, media::WaitingCB waiting) {
++      decoder_.Initialize(config, low_delay, cdm, std::move(done), output, waiting);
++    }
++    void Decode(scoped_refptr<media::DecoderBuffer> buffer, DecodeCB done) {
++      decoder_.Decode(std::move(buffer), std::move(done));
++    }
++    void Reset(base::OnceClosure done) { decoder_.Reset(std::move(done)); }
++   private:
++    media::NullMediaLog log_;
++    media::FFmpegVideoDecoder decoder_;
++  };
++  base::SequenceBound<Core> core_;
++};
++}  // namespace
++std::unique_ptr<media::VideoDecoder> CreateWorkerFFmpegDecoder() {
++  return std::make_unique<WorkerFFmpegDecoder>();
++}
++}  // namespace aurora_uvd
+--- a/media/mojo/mojom/stable/stable_video_decoder_types_mojom_traits.h
++++ b/media/mojo/mojom/stable/stable_video_decoder_types_mojom_traits.h
+@@ -1209,6 +1209,7 @@
+       case ::media::VideoDecoderType::kBroker:
+       case ::media::VideoDecoderType::kOutOfProcess:
+       case ::media::VideoDecoderType::kVideoToolbox:
++      case ::media::VideoDecoderType::kRadeonUvd:
+         // Only decoders used on CrOS are supported.
+         NOTREACHED_NORETURN();
+     }
+--- a/media/mojo/services/gpu_mojo_media_client_mac.cc
++++ b/media/mojo/services/gpu_mojo_media_client_mac.cc
+@@ -4,26 +4,50 @@
+ 
+ #include <memory>
+ 
++#include "base/command_line.h"
++#include "base/functional/bind.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/task/thread_pool.h"
+ #include "build/build_config.h"
+ #include "media/base/audio_decoder.h"
++#include "media/media_buildflags.h"
+ #include "media/base/media_switches.h"
+ #include "media/base/offloading_audio_encoder.h"
+ #include "media/filters/mac/audio_toolbox_audio_decoder.h"
+ #include "media/filters/mac/audio_toolbox_audio_encoder.h"
+ #include "media/gpu/ipc/service/vda_video_decoder.h"
+-#if !defined(ARCH_CPU_PPC_FAMILY)
++#if defined(ARCH_CPU_PPC_FAMILY) && BUILDFLAG(ENABLE_FFMPEG_VIDEO_DECODERS)
++#include "media/gpu/mac/radeon_uvd/radeon_uvd_iokit_backend.h"
++#include "media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.h"
++#include "media/gpu/mac/radeon_uvd/replay_video_decoder.h"
++#elif !defined(ARCH_CPU_PPC_FAMILY)
+ #include "media/gpu/mac/video_toolbox_video_decoder.h"
+ #endif
+ #include "media/mojo/services/gpu_mojo_media_client.h"
+ 
+ namespace media {
++#if defined(ARCH_CPU_PPC_FAMILY) && BUILDFLAG(ENABLE_FFMPEG_VIDEO_DECODERS)
++namespace {
++bool RadeonUvdEnabled(const gpu::GpuPreferences& preferences) {
++  return !preferences.disable_accelerated_video_decode &&
++         base::FeatureList::IsEnabled(kRadeonUvdVideoDecoder) &&
++         base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII("type") ==
++             "gpu-process";
++}
++}  // namespace
++#endif
+ 
+ std::unique_ptr<VideoDecoder> CreatePlatformVideoDecoder(
+     VideoDecoderTraits& traits) {
+-#if defined(ARCH_CPU_PPC_FAMILY)
++#if defined(ARCH_CPU_PPC_FAMILY) && BUILDFLAG(ENABLE_FFMPEG_VIDEO_DECODERS)
++  if (!RadeonUvdEnabled(traits.gpu_preferences)) return nullptr;
++  return std::make_unique<aurora_uvd::ReplayVideoDecoder>(
++      std::make_unique<aurora_uvd::RadeonUvdVideoDecoder>(
++          aurora_uvd::CreateIOKitBackend()),
++      base::BindRepeating(&aurora_uvd::CreateWorkerFFmpegDecoder),
++      traits.media_log->Clone());
++#elif defined(ARCH_CPU_PPC_FAMILY)
+   return nullptr;
+ #else
+   if (base::FeatureList::IsEnabled(kVideoToolboxVideoDecoder) &&
+@@ -48,8 +72,29 @@
+     gpu::GpuPreferences gpu_preferences,
+     const gpu::GPUInfo& gpu_info,
+     base::OnceCallback<SupportedVideoDecoderConfigs()> get_vda_configs) {
++#if defined(ARCH_CPU_PPC_FAMILY) && BUILDFLAG(ENABLE_FFMPEG_VIDEO_DECODERS)
++  SupportedVideoDecoderConfigs configs;
++  if (!RadeonUvdEnabled(gpu_preferences)) return configs;
++  auto backend = aurora_uvd::CreateIOKitBackend();
++  aurora_uvd::Capabilities actual;
++  if (backend->Query(&actual) != aurora_uvd::BackendStatus::kOk ||
++      actual.max_width < 64 || actual.max_height < 64)
++    return configs;
++  const struct { uint32_t bit; VideoCodecProfile profile; } profiles[] = {
++      {1, H264PROFILE_BASELINE}, {2, H264PROFILE_MAIN}, {4, H264PROFILE_HIGH}};
++  for (const auto& profile : profiles) {
++    if (actual.profile_mask & profile.bit)
++      configs.emplace_back(profile.profile, profile.profile, gfx::Size(64, 64),
++                           gfx::Size(actual.max_width, actual.max_height),
++                           false, false);
++  }
++  return configs;
++#elif defined(ARCH_CPU_PPC_FAMILY)
++  return SupportedVideoDecoderConfigs();
++#else
+   // TODO(crbug.com/1331597): Implement for VideoToolboxVideoDecoder.
+   return std::move(get_vda_configs).Run();
++#endif
+ }
+ 
+ std::unique_ptr<AudioDecoder> CreatePlatformAudioDecoder(
+@@ -78,7 +123,14 @@
+     gpu::GpuDriverBugWorkarounds gpu_workarounds,
+     gpu::GpuPreferences gpu_preferences,
+     const gpu::GPUInfo& gpu_info) {
++#if defined(ARCH_CPU_PPC_FAMILY) && BUILDFLAG(ENABLE_FFMPEG_VIDEO_DECODERS)
++  return RadeonUvdEnabled(gpu_preferences) ? VideoDecoderType::kRadeonUvd :
++                                           VideoDecoderType::kUnknown;
++#elif defined(ARCH_CPU_PPC_FAMILY)
++  return VideoDecoderType::kUnknown;
++#else
+   return VideoDecoderType::kVda;
++#endif
+ }
+ 
+ }  // namespace media
+--- a/tools/metrics/histograms/enums.xml
++++ b/tools/metrics/histograms/enums.xml
+@@ -110382,6 +110382,7 @@
+   <int value="14" label="VDA Video Decoder"/>
+   <int value="16" label="V4l2 Video Decoder"/>
+   <int value="18" label="OOP Video Decoder"/>
++  <int value="20" label="Radeon UVD Video Decoder"/>
+ </enum>
+ 
+ <enum name="VideoEncoderUseCase">
+--- a/media/mojo/services/mojo_video_decoder_service.cc
++++ b/media/mojo/services/mojo_video_decoder_service.cc
+@@ -422,11 +422,6 @@
+   TRACE_EVENT1("media", "MojoVideoDecoderService::OnDecoderOutput",
+                "video_frame", frame->AsHumanReadableString());
+ 
+-  // All MojoVideoDecoder-based decoders are hardware decoders. If you're the
+-  // first to implement an out-of-process decoder that is not power efficent,
+-  // you can remove this DCHECK.
+-  DCHECK(frame->metadata().power_efficient);
+-
+   absl::optional<base::UnguessableToken> release_token;
+   if ((decoder_->FramesHoldExternalResources() ||
+        frame->HasReleaseMailboxCB()) &&
+--- a/ui/gfx/mac/leopard_gpu_frame.mm
++++ b/ui/gfx/mac/leopard_gpu_frame.mm
+@@ -496,8 +496,7 @@
+ 
+ bool LeopardGpuPresentationEnabled() {
+   const auto* command_line = base::CommandLine::ForCurrentProcess();
+-  return (command_line->HasSwitch("enable-leopard-gpu-presentation") ||
+-          command_line->HasSwitch("enable-leopard-gpu-presentation-test")) &&
++  return !command_line->HasSwitch("disable-leopard-gpu-presentation") &&
+          SurfaceApi().available();
+ }
+ 
+--- a/ui/accelerated_widget_mac/display_ca_layer_tree.mm
++++ b/ui/accelerated_widget_mac/display_ca_layer_tree.mm
+@@ -22,6 +22,7 @@
+ #include "base/time/time.h"
+ #include "ui/gfx/mac/leopard_frame_damage.h"
+ #include "ui/gfx/mac/leopard_frame_damage_regions.h"
++#include "ui/gfx/mac/leopard_gpu_frame.h"
+ #include "ui/accelerated_widget_mac/leopard_surface_host.h"
+ #include "ui/accelerated_widget_mac/leopard_frame_mapping.h"
+ #include "ui/accelerated_widget_mac/leopard_texture_capacity.h"
+@@ -37,6 +38,7 @@
+ #include "base/mac/mac_util.h"
+ #include "base/mac/scoped_cftyperef.h"
+ #include "base/no_destructor.h"
++#include "base/strings/stringprintf.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
+ #include "ui/base/cocoa/animation_utils.h"
+@@ -105,6 +107,68 @@
+     return;
+   }
+   new_frame->damage.Merge(old_frame.damage);
++}
++
++void TraceSoftwareLayer(CALayer* layer, const char* phase,
++                        CGContextRef context = nullptr) {
++  bool enabled = false;
++  TRACE_EVENT_CATEGORY_GROUP_ENABLED("gpu", &enabled);
++  if (!enabled)
++    return;
++  std::string state(phase);
++  for (CALayer* current = layer; current; current = [current superlayer]) {
++    const CGRect bounds = [current bounds];
++    const CGPoint position = [current position];
++    const CGPoint anchor = [current anchorPoint];
++    base::StringAppendF(&state,
++        " layer=%p bounds=%.1f,%.1f,%.1f,%.1f pos=%.1f,%.1f anchor=%.1f,%.1f"
++        " opacity=%.3f hidden=%d masks=%d",
++        current, bounds.origin.x, bounds.origin.y, bounds.size.width,
++        bounds.size.height, position.x, position.y, anchor.x, anchor.y,
++        static_cast<double>([current opacity]), !![current isHidden],
++        !![current masksToBounds]);
++    if (state.size() > 2048)
++      break;
++  }
++  if (context) {
++    const CGRect clip = CGContextGetClipBoundingBox(context);
++    const CGAffineTransform ctm = CGContextGetCTM(context);
++    base::StringAppendF(&state, " clip=%.1f,%.1f,%.1f,%.1f"
++        " ctm=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
++        clip.origin.x, clip.origin.y, clip.size.width, clip.size.height,
++        ctm.a, ctm.b, ctm.c, ctm.d, ctm.tx, ctm.ty);
++  }
++  TRACE_EVENT_INSTANT2("gpu", "LeopardPresentation.CGLayerState",
++                      TRACE_EVENT_SCOPE_THREAD,
++                      "layer", reinterpret_cast<uintptr_t>(layer), "state", state);
++}
++
++void TraceSoftwarePixels(CALayer* layer, const void* address,
++                         size_t pixels, bool is_argb, bool bottom_up) {
++  bool enabled = false;
++  TRACE_EVENT_CATEGORY_GROUP_ENABLED("gpu", &enabled);
++  if (!enabled || !pixels)
++    return;
++  const size_t step = 1 + (pixels - 1) / 262144;
++  const auto* bytes = static_cast<const uint8_t*>(address);
++  size_t samples = 0, opaque = 0, transparent = 0, visible_nonwhite = 0;
++  for (size_t i = 0; i < pixels; i += step) {
++    const uint8_t* pixel = bytes + i * 4;
++    const uint8_t alpha = pixel[is_argb ? 0 : 3];
++    const uint8_t* rgb = pixel + (is_argb ? 1 : 0);
++    ++samples;
++    opaque += alpha == 255;
++    transparent += alpha == 0;
++    visible_nonwhite += alpha && (rgb[0] != 255 || rgb[1] != 255 || rgb[2] != 255);
++  }
++  const std::string stats = base::StringPrintf(
++      "pixels=%zu samples=%zu step=%zu opaque=%zu transparent=%zu"
++      " visible_nonwhite=%zu argb=%d bottom_up=%d first=%02x%02x%02x%02x",
++      pixels, samples, step, opaque, transparent, visible_nonwhite, is_argb,
++      bottom_up, bytes[0], bytes[1], bytes[2], bytes[3]);
++  TRACE_EVENT_INSTANT2("gpu", "LeopardPresentation.CGSourcePixels",
++                      TRACE_EVENT_SCOPE_THREAD,
++                      "layer", reinterpret_cast<uintptr_t>(layer), "stats", stats);
+ }
+ 
+ @implementation ChromiumSoftwareFrameLayer
+@@ -185,6 +249,7 @@
+ }
+ 
+ - (void)drawInContext:(CGContextRef)context {
++  TraceSoftwareLayer(self, "draw_begin", context);
+   if (pending_provider_) {
+     static const base::NoDestructor<base::ScopedCFTypeRef<CGColorSpaceRef>>
+         color_space(CGColorSpaceCreateDeviceRGB());
+@@ -213,6 +278,7 @@
+     }
+     CGContextDrawImage(context, [self bounds], image_);
+     CGContextRestoreGState(context);
++    TraceSoftwareLayer(self, "draw_complete", context);
+     if (frame_acknowledgment_)
+       frame_acknowledgment_->Presented();
+   } else if (frame_acknowledgment_) {
+@@ -1059,9 +1125,10 @@
+ #endif
+   const auto* command_line = base::CommandLine::ForCurrentProcess();
+   // Avoid the CAOpenGLLayer context-switch crash in native-mode fallback.
+-  const bool native_presentation_requested =
+-      command_line->HasSwitch("enable-leopard-gpu-presentation") ||
+-      command_line->HasSwitch("enable-leopard-gpu-presentation-test");
++  bool native_presentation_requested = false;
++#if defined(ARCH_CPU_PPC_FAMILY)
++  native_presentation_requested = gfx::LeopardGpuPresentationEnabled();
++#endif
+   const bool direct_image_presentation = software_opengl_failed_ ||
+       use_software_layers || native_presentation_requested ||
+       command_line->HasSwitch("leopard-direct-image-presentation");
+@@ -1302,6 +1369,13 @@
+                    (bottom_up ? damage.y() : pixel_size.height() - damage.bottom()) *
+                        inverse_scale,
+                    damage.width() * inverse_scale, damage.height() * inverse_scale);
++    TRACE_EVENT_INSTANT2("gpu", "LeopardPresentation.CGInstall",
++                        TRACE_EVENT_SCOPE_THREAD,
++                        "tree", reinterpret_cast<uintptr_t>(this),
++                        "layer", reinterpret_cast<uintptr_t>(io_surface_layer_));
++    TraceSoftwareLayer(io_surface_layer_, "install");
++    TraceSoftwarePixels(io_surface_layer_, address, image_size / 4,
++                        is_argb, bottom_up);
+     [(ChromiumSoftwareFrameLayer*)io_surface_layer_
+         setFrameAcknowledgment:acknowledgment];
+     [(ChromiumSoftwareFrameLayer*)io_surface_layer_
+--- a/content/browser/gpu/gpu_process_host.cc
++++ b/content/browser/gpu/gpu_process_host.cc
+@@ -233,6 +233,7 @@
+     "disable-leopard-sparse-presentation",
+     "disable-leopard-command-batch-budget",
+       "disable-leopard-consumer-pacing",
++      "disable-leopard-gpu-presentation",
+       "enable-leopard-gpu-presentation",
+       "enable-leopard-gpu-presentation-test",
+ #endif
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
+@@ -11,6 +11,7 @@
+ #if defined(ARCH_CPU_PPC_FAMILY)
+  @private
+   BOOL _leopardFrameConfigured;
++  BOOL _leopardContentViewTeardown;
+   id _leopardConfiguredLayer;
+   NSSize _leopardOpaqueShapeSize;
+   NSUInteger _leopardNativeSurfaceUsers;
+@@ -19,6 +20,7 @@
+ }
+ #if defined(__ppc__) || defined(__ppc64__)
+ - (void)leopardLayoutWindowButtons;
++- (void)leopardBeginContentViewTeardown;
+ - (BOOL)leopardAcquireNativeSurface;
+ - (BOOL)leopardRefreshNativeSurfaceTransparency;
+ - (void)leopardReleaseNativeSurface;
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+@@ -114,8 +114,8 @@
+ #if !defined(__clang__)
+   [root retain];
+ #endif
+-  // CAViewUpdate waits for the display-link renderer. Suspend its software
+-  // path before a smaller backing can be paired with the old view bounds.
++  // Pause drains the renderer and unbinds its backing before AppKit resizes.
++  // Keep software CA selected while the old view bounds are still installed.
+   [root leopardSuspendNativeSurfaceRendering];
+   objc_super superclass = {
+       window, class_getSuperclass(objc_getClass("BrowserNativeWidgetWindow"))};
+@@ -335,7 +335,15 @@
+   return rect;
+ }
+ 
++- (void)leopardBeginContentViewTeardown {
++  _leopardContentViewTeardown = YES;
++  [NSObject cancelPreviousPerformRequestsWithTarget:self
++      selector:@selector(leopardInvalidateNativeSurface) object:nil];
++}
++
+ - (BOOL)leopardAcquireNativeSurface {
++  if (_leopardContentViewTeardown)
++    return NO;
+   BridgedContentView* root = (BridgedContentView*)[self contentView];
+   if (_leopardNativeSurfaceUsers) {
+     if (_leopardNativeSurfaceRoot != root)
+@@ -363,6 +371,8 @@
+ }
+ 
+ - (void)leopardScheduleNativeSurfaceInvalidation {
++  if (_leopardContentViewTeardown)
++    return;
+   [NSObject cancelPreviousPerformRequestsWithTarget:self
+       selector:@selector(leopardInvalidateNativeSurface) object:nil];
+   [self performSelector:@selector(leopardInvalidateNativeSurface)
+@@ -371,6 +381,8 @@
+ }
+ 
+ - (void)leopardInvalidateNativeSurface {
++  if (_leopardContentViewTeardown)
++    return;
+   BridgedContentView* root = (BridgedContentView*)_leopardNativeSurfaceRoot;
+   if (!_leopardNativeSurfaceUsers || root != [self contentView] ||
+       ![root leopardNativeSurfaceRendering]) {
+@@ -389,7 +401,8 @@
+ 
+ - (BOOL)leopardRefreshNativeSurfaceTransparency {
+   NSView* root = _leopardNativeSurfaceRoot;
+-  if (!_leopardNativeSurfaceUsers || root != [self contentView])
++  if (_leopardContentViewTeardown || !_leopardNativeSurfaceUsers ||
++      root != [self contentView])
+     return NO;
+   CGRect empty = CGRectZero;
+   void* region = nullptr;
+@@ -411,13 +424,15 @@
+       selector:@selector(leopardInvalidateNativeSurface) object:nil];
+   BridgedContentView* root = (BridgedContentView*)_leopardNativeSurfaceRoot;
+   [root setLeopardNativeSurfaceRendering:NO];
+-  [[root superview] setNeedsDisplay:YES];
++  if (!_leopardContentViewTeardown)
++    [[root superview] setNeedsDisplay:YES];
+ #if !defined(__clang__)
+   [root release];
+ #endif
+   _leopardNativeSurfaceRoot = nil;
+   _leopardOpaqueShapeSize = NSZeroSize;
+-  [self leopardLayoutWindowButtons];
++  if (!_leopardContentViewTeardown)
++    [self leopardLayoutWindowButtons];
+ }
+ 
+ - (BOOL)leopardUsesSoftwareLayers {
+@@ -425,6 +440,8 @@
+ }
+ 
+ - (void)leopardLayoutWindowButtons {
++  if (_leopardContentViewTeardown)
++    return;
+   NSView* view = [self contentView];
+   if (!view)
+     return;
+@@ -507,6 +524,8 @@
+   _leopardConfiguredLayer = nil;
+   _leopardOpaqueShapeSize = NSZeroSize;
+   [super setContentView:view];
++  if (view)
++    _leopardContentViewTeardown = NO;
+   [self leopardLayoutWindowButtons];
+ }
+ 
+--- a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
++++ b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
+@@ -15,6 +15,7 @@
+ #include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
++#include "base/trace_event/trace_event.h"
+ #import "base/mac/foundation_util.h"
+ #include "base/mac/mac_util.h"
+ #include "base/memory/raw_ptr.h"
+@@ -73,10 +74,21 @@
+ // The NSView that hosts the composited CALayer drawing the UI. It fills the
+ // window but is not hittable so that accessibility hit tests always go to the
+ // BridgedContentView.
++#if defined(ARCH_CPU_PPC_FAMILY)
++@interface NSView (LeopardCompositorLayerRenderer)
++- (unsigned)_CAViewFlags;
++@end
++#endif
++
+ @interface ViewsCompositorSuperview : NSView
+ @end
+ 
+ @implementation ViewsCompositorSuperview
++#if defined(ARCH_CPU_PPC_FAMILY)
++- (unsigned)_CAViewFlags {
++  return [super _CAViewFlags] | 4u;
++}
++#endif
+ - (NSView*)hitTest:(NSPoint)aPoint {
+   return nil;
+ }
+@@ -624,6 +636,9 @@
+   if (!bridged_view_)
+     return;
+ #if defined(ARCH_CPU_PPC_FAMILY)
++  // Teardown must not rebuild the window shadow after removing its layer tree.
++  if ([window_ respondsToSelector:@selector(leopardBeginContentViewTeardown)])
++    [(BrowserNativeWidgetWindow*)window_ leopardBeginContentViewTeardown];
+   display_ca_layer_tree_.reset();
+ #endif
+   [bridged_view_ clearView];
+@@ -1720,10 +1735,20 @@
+ #endif
+ 
+ #if defined(ARCH_CPU_PPC_FAMILY)
+-  if (waiting_for_first_popup_frame_ && !ca_layer_params.is_empty) {
++  // A native token can be rejected before any popup pixels are installed.
++  if (waiting_for_first_popup_frame_ && !ca_layer_params.is_empty &&
++      ca_layer_params.local_gpu_frame_token.is_empty()) {
++    TRACE_EVENT_INSTANT2("gpu", "LeopardPresentation.PopupFallback",
++                        TRACE_EVENT_SCOPE_THREAD,
++                        "window", static_cast<int>([window_ windowNumber]),
++                        "tree", reinterpret_cast<uintptr_t>(display_ca_layer_tree_.get()));
+     [CATransaction flush];
+     waiting_for_first_popup_frame_ = false;
+     [window_ setAlphaValue:popup_frame_opacity_];
++    TRACE_EVENT_INSTANT2("gpu", "LeopardPresentation.PopupRevealed",
++                        TRACE_EVENT_SCOPE_THREAD,
++                        "window", static_cast<int>([window_ windowNumber]),
++                        "alpha", static_cast<double>([window_ alphaValue]));
+   }
+ #endif
+ 
+--- a/ui/accessibility/platform/ax_platform_node_cocoa.mm
++++ b/ui/accessibility/platform/ax_platform_node_cocoa.mm
+@@ -185,6 +185,36 @@
+       [children addObject:it->GetNativeViewAccessible()];
+   }
+   return NSAccessibilityUnignoredChildren(children);
++}
++
++- (id)accessibilityHitTest:(NSPoint)point {
++  if (!node_ || !NSPointInRect(point, [self boundsInScreen]))
++    return nil;
++
++  NSEnumerator* children =
++      [[self accessibilityChildren] reverseObjectEnumerator];
++  id child;
++  while ((child = [children nextObject])) {
++    // Native Leopard children expose geometry through the legacy attributes.
++    NSValue* position =
++        [child accessibilityAttributeValue:NSAccessibilityPositionAttribute];
++    NSValue* size =
++        [child accessibilityAttributeValue:NSAccessibilitySizeAttribute];
++    if (!position || !size)
++      continue;
++    NSRect bounds;
++    bounds.origin = [position pointValue];
++    bounds.size = [size sizeValue];
++    if (!NSPointInRect(point, bounds))
++      continue;
++    if (id hit = [child accessibilityHitTest:point])
++      return hit;
++  }
++  return NSAccessibilityUnignoredAncestor(self);
++}
++
++- (id)accessibilityFocusedUIElement {
++  return node_ ? node_->GetDelegate()->GetFocus() : nil;
+ }
+ 
+ - (NSArray*)accessibilityCustomContent {
+--- a/components/remote_cocoa/app_shim/bridged_content_view.mm
++++ b/components/remote_cocoa/app_shim/bridged_content_view.mm
+@@ -220,6 +220,9 @@
+ @interface NSView (LeopardLayerRenderer)
+ - (unsigned)_CAViewFlags;
+ - (void)_forceUpdateLayerTreeRenderer;
++- (BOOL)_layerTreeRendererPaused;
++- (void)_pauseLayerTreeRenderer;
++- (void)_resumeLayerTreeRenderer;
+ @end
+ #endif
+ 
+@@ -797,9 +800,8 @@
+ 
+ #if defined(ARCH_CPU_PPC_FAMILY)
+ - (unsigned)_CAViewFlags {
+-  const BOOL software =
+-      _leopardNativeSurfaceRendering && !_leopardNativeSurfaceResizeDepth;
+-  return [super _CAViewFlags] | (software ? 4u : 0u);
++  // Accelerated CA creates legacy GL contexts on its display-link thread.
++  return [super _CAViewFlags] | 4u;
+ }
+ 
+ - (BOOL)leopardNativeSurfaceRendering {
+@@ -815,8 +817,27 @@
+ }
+ 
+ - (void)leopardSuspendNativeSurfaceRendering {
+-  if (++_leopardNativeSurfaceResizeDepth == 1 && _leopardNativeSurfaceRendering)
+-    [self _forceUpdateLayerTreeRenderer];
++  if (++_leopardNativeSurfaceResizeDepth == 1) {
++    _leopardOwnsRendererPause = ![self _layerTreeRendererPaused];
++    if (_leopardOwnsRendererPause)
++      [super _pauseLayerTreeRenderer];
++  }
++}
++
++- (void)_pauseLayerTreeRenderer {
++  if (_leopardNativeSurfaceResizeDepth) {
++    _leopardOwnsRendererPause = NO;
++    _leopardRendererResumePending = NO;
++  }
++  [super _pauseLayerTreeRenderer];
++}
++
++- (void)_resumeLayerTreeRenderer {
++  if (_leopardNativeSurfaceResizeDepth) {
++    _leopardRendererResumePending = YES;
++    return;
++  }
++  [super _resumeLayerTreeRenderer];
+ }
+ 
+ - (BOOL)leopardNativeSurfaceRenderingSuspended {
+@@ -825,13 +846,18 @@
+ 
+ - (BOOL)leopardResumeNativeSurfaceRendering {
+   DCHECK(_leopardNativeSurfaceResizeDepth);
+-  if (_leopardNativeSurfaceResizeDepth &&
+-      --_leopardNativeSurfaceResizeDepth == 0 &&
+-      _leopardNativeSurfaceRendering) {
+-    [self _forceUpdateLayerTreeRenderer];
+-    return YES;
+-  }
+-  return NO;
++  if (!_leopardNativeSurfaceResizeDepth ||
++      --_leopardNativeSurfaceResizeDepth != 0)
++    return NO;
++  const BOOL resume = _leopardOwnsRendererPause || _leopardRendererResumePending;
++  _leopardOwnsRendererPause = NO;
++  _leopardRendererResumePending = NO;
++  if (resume) {
++    [self _resumeLayerTreeRenderer];
++    [self setNeedsDisplay:YES];
++    [[self superview] setNeedsDisplay:YES];
++  }
++  return resume;
+ }
+ #endif
+ 
+@@ -1763,6 +1789,8 @@
+ // NSAccessibility informal protocol implementation:
+ 
+ - (id)accessibilityHitTest:(NSPoint)point {
++  if (!_bridge)
++    return nil;
+   return [_bridge->host_helper()->GetNativeViewAccessible()
+       accessibilityHitTest:point];
+ }
+--- a/components/remote_cocoa/app_shim/bridged_content_view.h
++++ b/components/remote_cocoa/app_shim/bridged_content_view.h
+@@ -53,6 +53,8 @@
+ #if defined(ARCH_CPU_PPC_FAMILY)
+   BOOL _leopardNativeSurfaceRendering;
+   NSUInteger _leopardNativeSurfaceResizeDepth;
++  BOOL _leopardOwnsRendererPause;
++  BOOL _leopardRendererResumePending;
+ #endif
+ 
+   // Whether any -insertFoo: selector (e.g. -insertNewLine:) was passed to
+--- a/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm
++++ b/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm
+@@ -199,6 +199,12 @@
+ - (BOOL)shouldIgnoreMouseEvent;
+ @end
+ 
++#if defined(ARCH_CPU_PPC_FAMILY)
++@interface NSView (LeopardWebLayerRenderer)
++- (unsigned)_CAViewFlags;
++@end
++#endif
++
+ // RenderWidgetHostViewCocoa ---------------------------------------------------
+ 
+ // Private methods:
+@@ -242,6 +248,11 @@
+ @end
+ 
+ @implementation RenderWidgetHostViewCocoa
++#if defined(ARCH_CPU_PPC_FAMILY)
++- (unsigned)_CAViewFlags {
++  return [super _CAViewFlags] | 4u;
++}
++#endif
+ #if 0
+   // Dummy host and host helper that are always valid (see comments below about
+   // host_).
+--- a/ui/accelerated_widget_mac/leopard_surface_host.mm
++++ b/ui/accelerated_widget_mac/leopard_surface_host.mm
+@@ -24,6 +24,10 @@
+ #include "ui/accelerated_widget_mac/leopard_surface_session_registry.h"
+ #include "ui/gfx/ca_layer_params.h"
+ #include "ui/gfx/mac/leopard_surface_channel.h"
++
++@interface NSView (LeopardLayerRendererPolicy)
++- (unsigned)_CAViewFlags;
++@end
+ 
+ @interface NSWindow (LeopardNativeSurfaceParent)
+ - (BOOL)leopardAcquireNativeSurface;
+@@ -758,9 +762,8 @@
+ }
+ 
+ bool LeopardSurfaceHost::UsesSoftwareLayers() const {
+-  NSWindow* window = [view_ window];
+-  return [window respondsToSelector:@selector(leopardUsesSoftwareLayers)] &&
+-         [window leopardUsesSoftwareLayers];
++  return [view_ respondsToSelector:@selector(_CAViewFlags)] &&
++         ([view_ _CAViewFlags] & 4u) != 0;
+ }
+ 
+ }  // namespace ui

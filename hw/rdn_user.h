@@ -126,7 +126,63 @@ enum {
 	RDN_UC_SURFACE_BACKING,
 	/* scalar in: surface ID; out: metadata, with id 0 when absent. */
 	RDN_UC_SURFACE_QUERY,
+	/* Diagnostic only: does not advertise a hardware video decoder. */
+	RDN_UC_UVD_DIAGNOSTIC_INFO,
+	/* Admin only, EnableUVDDiagnostics personality opt-in; reserved input 0. */
+	RDN_UC_UVD_DIAGNOSTIC_INIT,
+	/* Admin-only fixed fixture; reserved input0, versioned status output. */
+	RDN_UC_UVD_FIXTURE_RUN,
+	/* Admin-only immutable CPU snapshot: generation, chunk index ->4096 bytes. */
+	RDN_UC_UVD_FIXTURE_READ,
 	RDN_UC_METHOD_COUNT
+};
+
+#define RDN_UVD_FIXTURE_VERSION 1u
+#define RDN_UVD_FIXTURE_ID 1u
+#define RDN_UVD_FIXTURE_CHUNK_BYTES 4096u
+#define RDN_UVD_FIXTURE_IDLE 0u
+#define RDN_UVD_FIXTURE_RUNNING 1u
+#define RDN_UVD_FIXTURE_COMPLETE 2u
+#define RDN_UVD_FIXTURE_FAILED 3u
+/* Complete CPU snapshot available, including diagnostic output from a failed check. */
+#define RDN_UVD_FIXTURE_OUTPUT_READY 1u
+#define RDN_UVD_FIXTURE_GUARDS_OK 2u
+#define RDN_UVD_FIXTURE_PACKED_MESSAGE 1u
+enum {
+	RDN_UVD_FIXTURE_PREPARE,
+	RDN_UVD_FIXTURE_CREATE_WAIT,
+	RDN_UVD_FIXTURE_DECODE_WAIT,
+	RDN_UVD_FIXTURE_SNAPSHOT,
+	RDN_UVD_FIXTURE_DESTROY_WAIT,
+	RDN_UVD_FIXTURE_FINISHED
+};
+
+struct rdn_user_uvd_fixture {
+	uint32_t version, fixture_id, state, stage;
+	int32_t error;
+	uint32_t generation, width, height, target_pitch, target_bytes;
+	uint32_t snapshot_bytes, feedback_offset, feedback_bytes;
+	uint32_t create_fence, decode_fence, destroy_fence, message_variant, flags;
+	int32_t idle_error;
+	uint32_t reserved[5];
+};
+
+#define RDN_UVD_DIAGNOSTIC_VERSION 1
+#define RDN_UVD_DIAGNOSTIC_ALLOWED 1
+#define RDN_UVD_DIAGNOSTIC_FIRMWARE 2
+#define RDN_UVD_DIAGNOSTIC_RLC_FIRMWARE 4
+#define RDN_UVD_DIAGNOSTIC_OFF 0
+#define RDN_UVD_DIAGNOSTIC_RING_READY 1
+#define RDN_UVD_DIAGNOSTIC_FAULTED 2
+
+struct rdn_user_uvd_diagnostic {
+	uint32_t version;
+	uint32_t flags;
+	uint32_t state;
+	uint32_t last_status;
+	int32_t last_error;
+	uint32_t reserved_bytes;
+	uint32_t reserved[2];
 };
 
 #define RDN_UC_POWER_QUERY		0

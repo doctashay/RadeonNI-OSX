@@ -27,7 +27,10 @@ HWCFLAGS = $(CFLAGS) -std=gnu99 -Wno-unused -Wno-sign-compare
 HW_SRCS  = rdn_gart.c rdn_mc.c rdn_watermark.c rdn_pm.c rdn_cursor.c rdn_mem.c rdn_gpu.c rdn_cp.c rdn_blit.c rdn_selftest.c rdn_post.c rdn_atom.c rdn_i2c.c rdn_mode.c rdn_dmt.c rdn_modeset.c rdn_dp.c \
 	rdn_pattern.c atom/atom.c
 HW_OBJS  = $(addprefix $(BUILD)/hw/,$(HW_SRCS:.c=.o))
+HW_OBJS += $(BUILD)/hw/rdn_uvd.o $(BUILD)/hw/rdn_mc_layout.o $(BUILD)/hw/rdn_uvd_h264.o $(BUILD)/hw/rdn_cp_dma_readback.o
 OBJS     = $(BUILD)/RadeonNI.o $(BUILD)/RadeonNIAccel.o $(BUILD)/RadeonNISurface.o $(BUILD)/kmod_info.o $(HW_OBJS)
+OBJS    += $(BUILD)/RadeonNIVideo.o $(BUILD)/RadeonNIVideoMemory.o $(BUILD)/RadeonNIUvdSession.o
+OBJS    += $(BUILD)/RadeonNIUvdFixture.o $(BUILD)/uvd_decode_fixture.o
 ifeq ($(LEOPARD),1)
 OBJS    += $(BUILD)/leopard.o
 CPPFLAGS += -DRDN_LEOPARD
@@ -50,6 +53,12 @@ $(BUILD)/%.o: %.c
 $(BUILD)/hw/%.o: $(HW)/%.c $(wildcard $(HW)/*.h $(HW)/atom/*.h)
 	@mkdir -p $(dir $@)
 	gcc $(CPPFLAGS) $(HWCFLAGS) -c -o $@ $<
+
+$(BUILD)/uvd_decode_fixture.o: ../../tests/uvd_decode_fixture.c ../../tests/uvd_decode_fixture.h
+	@mkdir -p $(dir $@)
+	gcc $(CPPFLAGS) $(HWCFLAGS) -c -o $@ $<
+
+$(BUILD)/RadeonNIUvdFixture.o: ../../tests/uvd_decode_fixture.h
 
 # Objects first: kld needs the symbols libkmodc++ defines for them.
 $(BUNDLE): $(OBJS) Info.plist

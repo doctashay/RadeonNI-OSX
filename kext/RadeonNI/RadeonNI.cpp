@@ -12,6 +12,7 @@
 #include <pexpert/pexpert.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IORegistryEntry.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <UserNotification/KUNCUserNotifications.h>
 
@@ -29,6 +30,9 @@ OSDefineMetaClassAndStructors(RadeonNI, IOFramebuffer)
 /* Aperture: 64-bit memory BAR at 0x10. Registers: 64-bit memory BAR at 0x18. */
 #define FB_BAR			kIOPCIConfigBaseAddress0
 #define REG_BAR			kIOPCIConfigBaseAddress2
+
+#define RDN_FIRST_START_PROPERTY "RadeonNIFirstStartClaimed"
+#define RDN_MC_BLOCKED_PROPERTY "RadeonNIMCLayoutBlocked"
 
 enum { kRdnPowerSleep, kRdnPowerIdle, kRdnPowerOn, kRdnPowerCount };
 
@@ -321,11 +325,209 @@ void RadeonNI::describeFb(const struct rdn_mode *mode, IOIndex depth,
 	fb->big_endian_pixels = true;
 }
 
-/*
- * POST if needed, read the EDID, collect the modes and set the preferred
- * one. The pattern is drawn so that there is something to see until the
- * window server takes the screen over.
- */
+bool RadeonNI::claimColdLayout()
+{
+	if (!fDevice->lockForArbitration(false)) {
+		IOLog("RadeonNI: cold MC layout cannot lock PCI provider\n");
+		return false;
+	}
+	fMCProviderLocked = true;
+	bool first = !fDevice->getProperty(RDN_FIRST_START_PROPERTY);
+	const char *reason = "first-start marker allocation";
+	fMCRebaseRequested = getProperty("UVDDiagnosticsRebaseVRAM") == kOSBooleanTrue;
+	if (!first && fMCRebaseRequested) {
+		reason = "provider already started";
+		goto fail;
+	}
+	if (fDevice->getProperty(RDN_MC_BLOCKED_PROPERTY) ||
+	    fDevice->getProperty(RDN_UVD_REBOOT_PROPERTY)) {
+		reason = "provider requires reboot";
+		goto fail;
+	}
+	if (first && (!fDevice->setProperty(RDN_FIRST_START_PROPERTY, true) ||
+	    fDevice->getProperty(RDN_FIRST_START_PROPERTY) != kOSBooleanTrue))
+		goto fail;
+	if (!fMCRebaseRequested) {
+		fDevice->unlockForArbitration();
+		fMCProviderLocked = false;
+		return true;
+	}
+	reason = "missing UVD diagnostic opt-ins";
+	if (getProperty("EnableUVDDiagnostics") != kOSBooleanTrue ||
+	    getProperty("UVDDiagnosticsBeforeCP") != kOSBooleanTrue)
+		goto fail;
+	reason = "local framebuffer already active";
+	if (fFbMap || fAccel || fModeSet)
+		goto fail;
+	reason = "PCI provider already open or exclusive open failed";
+	if (fDevice->isOpen() || !fDevice->open(this))
+		goto fail;
+	fMCProviderOpen = true;
+	{
+		OSIterator *clients = fDevice->getClientIterator();
+		OSObject *client;
+		bool other = !clients;
+		if (clients) {
+			while ((client = clients->getNextObject()))
+				if (client != this) {
+					IOService *service = OSDynamicCast(IOService, client);
+					IOLog("RadeonNI: cold MC layout sibling %s\n",
+					      service ? service->getName() : "non-service");
+					other = true;
+				}
+			other = other || !clients->isValid();
+			clients->release();
+		}
+		reason = "PCI sibling exists or iterator unavailable";
+		if (other)
+			goto fail;
+	}
+	{
+		IORegistryIterator *services = IORegistryIterator::iterateOver(
+			IORegistryEntry::getRegistryRoot(), gIOServicePlane,
+			kIORegistryIterateRecursively);
+		reason = "graphics registry iterator unavailable";
+		if (!services)
+			goto fail;
+		IORegistryEntry *entry;
+		bool present = false;
+		while ((entry = services->getNextObject()))
+			if (entry != this && (OSDynamicCast(IOFramebuffer, entry) ||
+			    OSDynamicCast(IOAccelerator, entry))) {
+				IOLog("RadeonNI: cold MC layout existing graphics service %s (%s)\n",
+				      entry->getName(), entry->getMetaClass()->getClassName());
+				present = true;
+			}
+		present = present || !services->isValid();
+		services->release();
+		reason = "graphics service exists or registry changed";
+		if (present)
+			goto fail;
+	}
+	return true;
+fail:
+	IOLog("RadeonNI: cold MC layout startup rejected: %s\n", reason);
+	if (fMCProviderOpen) {
+		fDevice->close(this);
+		fMCProviderOpen = false;
+	}
+	fDevice->unlockForArbitration();
+	fMCProviderLocked = false;
+	return false;
+}
+
+bool RadeonNI::resumeColdConsole(bool newLayout)
+{
+	PE_Video video;
+	IOPlatformExpert *platform = getPlatform();
+	if (!fMCConsoleSuspended || !platform)
+		return false;
+	if (newLayout) {
+		bzero(&video, sizeof(video));
+		if (!fModeSet || !fFbMap ||
+		    platform->getConsoleInfo(&video) != kIOReturnSuccess)
+			return false;
+		video.v_baseAddr = fFbMap->getVirtualAddress();
+		video.v_rowBytes = fFb.pitch_pixels * 4;
+		video.v_width = fFb.width;
+		video.v_height = fFb.height;
+		video.v_depth = 32;
+		if (platform->setConsoleInfo(&video, kPEReleaseScreen) != kIOReturnSuccess)
+			return false;
+	}
+	if (platform->setConsoleInfo(0, kPEEnableScreen) != kIOReturnSuccess ||
+	    platform->setConsoleInfo(0, kPEAcquireScreen) != kIOReturnSuccess)
+		return false;
+	fMCConsoleSuspended = false;
+	if (!newLayout)
+		fDevice->removeProperty(RDN_MC_BLOCKED_PROPERTY);
+	setProperty("MCLayoutConsoleRestored", true);
+	return true;
+}
+
+bool RadeonNI::failedColdStart(IOService *provider)
+{
+	if (!fMCConsoleSuspended && !fMCRebased) {
+		cleanUp();
+		return false;
+	}
+	if (!fMCConsoleSuspended) {
+		getPlatform()->setConsoleInfo(0, kPEDisableScreen);
+		fMCConsoleSuspended = true;
+	}
+	/* Keep ownership and mappings until reboot; do not publish a framebuffer. */
+	fMCFatal = true;
+	setProperty("MCLayoutQuarantined", true);
+	retain();
+	if (fMCProviderLocked) {
+		fDevice->unlockForArbitration();
+		fMCProviderLocked = false;
+	}
+	IOLog("RadeonNI: cold MC layout quarantined; console disabled, reboot required\n");
+	IOService::start(provider);
+	return true;
+}
+
+bool RadeonNI::rebaseColdLayout(int handover, bool unpostedEntry)
+{
+	struct rdn_mc_layout_result result;
+	IOPlatformExpert *platform = getPlatform();
+	PE_Video video;
+	if (!fMCRebaseRequested)
+		return true;
+	bzero(&video, sizeof(video));
+	if ((!unpostedEntry && handover <= 0) || !fMCProviderLocked || !fMCProviderOpen ||
+	    !platform || platform->getConsoleInfo(&video) != kIOReturnSuccess ||
+	    (!unpostedEntry && (!video.v_baseAddr || !video.v_rowBytes ||
+	                       !video.v_width || !video.v_height))) {
+		IOLog("RadeonNI: cold MC layout entry rejected (handover %d unposted %d lock %d open %d base 0x%lx row %lu %lux%lu)\n",
+		      handover, unpostedEntry, fMCProviderLocked, fMCProviderOpen,
+		      (unsigned long)video.v_baseAddr, (unsigned long)video.v_rowBytes,
+		      (unsigned long)video.v_width, (unsigned long)video.v_height);
+		return false;
+	}
+	setProperty("MCLayoutUnpostedEntry", unpostedEntry);
+	IOLog("RadeonNI: cold MC layout entry: handover %d unposted %d\n",
+	      handover, unpostedEntry);
+	if (!fDevice->setProperty(RDN_MC_BLOCKED_PROPERTY, true) ||
+	    fDevice->getProperty(RDN_MC_BLOCKED_PROPERTY) != kOSBooleanTrue)
+		return false;
+	/* Leopard drains both text output and the progress blitter before returning. */
+	if (platform->setConsoleInfo(0, kPEDisableScreen) != kIOReturnSuccess)
+		return false;
+	fMCConsoleSuspended = true;
+	bzero(&result, sizeof(result));
+	int r = rdn_mc_layout_rebase_zero(&fCard, RDN_MC_LAYOUT_CONDITIONS,
+					 RDN_MC_LAYOUT_SCRATCH_OFFSET, &result);
+	setProperty("MCLayoutResult", (UInt64)(SInt64)r, 32);
+	setProperty("MCLayoutBase", result.changed ? result.new_base : result.old_base, 64);
+	setProperty("MCLayoutStage", (UInt64)result.stage, 32);
+	setProperty("MCLayoutAccessRestored", result.access_restored != 0);
+	setProperty("MCLayoutFailedRegister", (UInt64)result.failed_reg, 32);
+	setProperty("MCLayoutExpected", (UInt64)result.expected, 32);
+	setProperty("MCLayoutActual", (UInt64)result.actual, 32);
+	IOLog("RadeonNI: cold MC layout result %d stage %lu changed %lu access %lu\n",
+	      r, (unsigned long)result.stage, (unsigned long)result.changed,
+	      (unsigned long)result.access_restored);
+	if (r)
+		IOLog("RadeonNI: cold MC layout register 0x%08lx expected 0x%08lx actual 0x%08lx\n",
+		      (unsigned long)result.failed_reg, (unsigned long)result.expected,
+		      (unsigned long)result.actual);
+	if (r) {
+		if (result.access_restored &&
+		    (result.rollback_ok || !result.modeset_required))
+			resumeColdConsole(false);
+		return false;
+	}
+	if (!result.access_restored)
+		return false;
+	fMCRebased = true;
+	fDevice->unlockForArbitration();
+	fMCProviderLocked = false;
+	return true;
+}
+
+/* POST, select a mode and prepare the framebuffer before publishing it. */
 bool RadeonNI::bringUp()
 {
 	UInt32 i;
@@ -333,7 +535,9 @@ bool RadeonNI::bringUp()
 
 	/* a card already running (set up by firmware) keeps its picture until the surface is cleared */
 	bool warm = rdn_card_posted(&fCard);
+	const bool unpostedEntry = !warm;
 	r = rdn_handover_take(&fCard);
+	const int handover = r;
 	/* For ioreg: 1 handed over by firmware, 0 no marker, -1 marker but card not running */
 	setProperty("HandOver", (UInt64)(SInt64)r, 32);
 	setProperty("PCICommandAtStart", (UInt64)fDevice->configRead16(kIOPCIConfigCommand), 16);
@@ -348,6 +552,8 @@ bool RadeonNI::bringUp()
 		IOLog("RadeonNI: POST failed (%d)\n", r);
 		return false;
 	}
+	if (!rebaseColdLayout(handover, unpostedEntry))
+		return false;
 	IOLog("RadeonNI: CONFIG_MEMSIZE %lu MB\n",
 	      (unsigned long)readReg(0x5428));
 
@@ -424,6 +630,27 @@ bool RadeonNI::bringUp()
 		IOLog("RadeonNI: cannot map the aperture\n");
 		return false;
 	}
+	if (fMCRebased) {
+		if (fFbMap->getLength() < RDN_MC_LAYOUT_SCRATCH_OFFSET + 4096u)
+			return false;
+		volatile UInt32 *scratch = (volatile UInt32 *)
+			(fFbMap->getVirtualAddress() + RDN_MC_LAYOUT_SCRATCH_OFFSET);
+		for (i = 0; i < 4096u / sizeof(*scratch); ++i)
+			scratch[i] = 0x6d430000u ^ i;
+		OSSynchronizeIO();
+		for (i = 0; i < 4096u / sizeof(*scratch); ++i)
+			if (scratch[i] != (0x6d430000u ^ i))
+				return false;
+		for (i = 0; i < 4096u / sizeof(*scratch); ++i)
+			scratch[i] = 0;
+		OSSynchronizeIO();
+		for (i = 0; i < 4096u / sizeof(*scratch); ++i)
+			if (scratch[i])
+				return false;
+		if (!setProperty("MCLayoutScratchVerified", true) ||
+		    getProperty("MCLayoutScratchVerified") != kOSBooleanTrue)
+			return false;
+	}
 
 	/* Linear ramps until the system loads its own tables. */
 	for (i = 0; i < 256; i++) {
@@ -451,13 +678,15 @@ bool RadeonNI::bringUp()
 	}
 	if (programMode(fPreferred, kDepth32) != kIOReturnSuccess)
 		return false;
+	if (fMCRebased && !resumeColdConsole(true))
+		return false;
 
 	/*
 	 * When firmware left a console (its boot video), the kernel keeps drawing its
 	 * progress spinner for that layout until IOFramebuffer sets up our framebuffer
 	 * a little later: tell it the new layout now, as IOFramebuffer::doSetup() will.
 	 */
-	if (warm) {
+	if (warm && !fMCRebased) {
 		PE_Video v;
 
 		IOReturn cr;
@@ -566,11 +795,15 @@ bool RadeonNI::start(IOService *provider)
 	fDevice = OSDynamicCast(IOPCIDevice, provider);
 	if (!fDevice)
 		return false;
+	if (!claimColdLayout())
+		return false;
 	model = cardModel(fDevice->configRead16(kIOPCIConfigDeviceID));
 
 	fLock = IOLockAlloc();
-	if (!fLock)
+	if (!fLock) {
+		cleanUp();
 		return false;
+	}
 	fOutputOn = true;
 	fOutputRequested = true;
 	fDisplayRequested = true;
@@ -588,6 +821,7 @@ bool RadeonNI::start(IOService *provider)
 	fRegMap = fDevice->mapDeviceMemoryWithRegister(REG_BAR);
 	if (!fRegMap) {
 		IOLog("RadeonNI: cannot map the register BAR\n");
+		cleanUp();
 		return false;
 	}
 	fRegs = (volatile UInt8 *)fRegMap->getVirtualAddress();
@@ -607,15 +841,13 @@ bool RadeonNI::start(IOService *provider)
 
 	if (!loadBios()) {
 		IOLog("RadeonNI: no usable VBIOS\n");
-		cleanUp();
-		return false;
+		return failedColdStart(provider);
 	}
 	fCardReady = true;
 
 	/* The hardware has to be up before IOFramebuffer starts asking. */
 	if (!bringUp()) {
-		cleanUp();
-		return false;
+		return failedColdStart(provider);
 	}
 	fDevice->setProperty("model", (void *)model, strlen(model) + 1);
 	memoryMB = readReg(0x5428);
@@ -627,8 +859,7 @@ bool RadeonNI::start(IOService *provider)
 
 	if (!super::start(provider)) {
 		IOLog("RadeonNI: IOFramebuffer::start failed\n");
-		cleanUp();
-		return false;
+		return failedColdStart(provider);
 	}
 	setName(model);
 	IOLog("RadeonNI: framebuffer started\n");
@@ -745,6 +976,13 @@ void RadeonNI::checkFirmwareHook()
 
 void RadeonNI::cleanUp()
 {
+	if (fMCFatal)
+		return;
+	if (fMCRebased && fFbMap && !fMCConsoleSuspended) {
+		/* Stop console writes before releasing framebuffer resources. */
+		getPlatform()->setConsoleInfo(0, kPEDisableScreen);
+		fMCConsoleSuspended = true;
+	}
 	if (fCardReady) {
 		rdn_card_fini(&fCard);
 		fCardReady = false;
@@ -766,10 +1004,22 @@ void RadeonNI::cleanUp()
 		IOLockFree(fLock);
 		fLock = 0;
 	}
+	if (fMCProviderOpen) {
+		fDevice->close(this);
+		fMCProviderOpen = false;
+	}
+	if (fMCProviderLocked) {
+		fDevice->unlockForArbitration();
+		fMCProviderLocked = false;
+	}
 }
 
 void RadeonNI::stop(IOService *provider)
 {
+	if (fMCFatal)
+		return;
+	if (fAccel)
+		fAccel->prepareToRetire();
 	stopHotplug();
 	if (fAccel) {
 		fAccel->retire(provider);
@@ -779,6 +1029,38 @@ void RadeonNI::stop(IOService *provider)
 	super::stop(provider);
 	cleanUp();
 	IOLog("RadeonNI: stopped\n");
+}
+
+bool RadeonNI::terminate(IOOptionBits options)
+{
+	return !fMCFatal && super::terminate(options);
+}
+
+bool RadeonNI::requestTerminate(IOService *provider, IOOptionBits options)
+{
+	return !fMCFatal && super::requestTerminate(provider, options);
+}
+
+IOReturn RadeonNI::newUserClient(task_t task, void *security, UInt32 type,
+				IOUserClient **handler)
+{
+	if (fMCFatal) {
+		if (handler)
+			*handler = 0;
+		return kIOReturnNotReady;
+	}
+	return super::newUserClient(task, security, type, handler);
+}
+
+IOReturn RadeonNI::newUserClient(task_t task, void *security, UInt32 type,
+				OSDictionary *properties, IOUserClient **handler)
+{
+	if (fMCFatal) {
+		if (handler)
+			*handler = 0;
+		return kIOReturnNotReady;
+	}
+	return IOService::newUserClient(task, security, type, properties, handler);
 }
 
 /*

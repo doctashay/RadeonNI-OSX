@@ -123,6 +123,53 @@ void rdn_mem_free(struct rdn_mem *mem, uint64_t offset)
 	}
 }
 
+int rdn_mem_alloc_in_range(struct rdn_mem *mem, uint64_t size, uint64_t align,
+		uint64_t minimum, uint64_t maximum, uint64_t *offset)
+{
+	struct rdn_mem_block *b, *allocation, *tail;
+	uint64_t start, end, limit;
+	if (!mem || !offset || !size || !align || (align & (align - 1)) ||
+	    minimum >= maximum || size > maximum - minimum)
+		return -ENOMEM;
+	for (b = mem->head; b; b = b->next) {
+		if (b->used || b->start > UINT64_MAX - b->size)
+			continue;
+		end = b->start + b->size;
+		start = b->start > minimum ? b->start : minimum;
+		limit = end < maximum ? end : maximum;
+		if (start > UINT64_MAX - (align - 1))
+			continue;
+		start = (start + align - 1) & ~(align - 1);
+		if (start >= limit || size > limit - start)
+			continue;
+		allocation = start == b->start ? NULL : block_new(mem, start, size, true);
+		if (start != b->start && !allocation)
+			return -ENOMEM;
+		tail = start + size == end ? NULL : block_new(mem, start + size,
+			end - start - size, false);
+		if (start + size != end && !tail) {
+			if (allocation)
+				mem->os->free(mem->os->cookie, allocation);
+			return -ENOMEM;
+		}
+		if (tail)
+			tail->next = b->next;
+		if (allocation) {
+			allocation->next = tail ? tail : b->next;
+			b->next = allocation;
+			b->size = start - b->start;
+		} else {
+			b->used = true;
+			b->size = size;
+			if (tail)
+				b->next = tail;
+		}
+		*offset = start;
+		return 0;
+	}
+	return -ENOMEM;
+}
+
 uint64_t rdn_mem_available(struct rdn_mem *mem)
 {
 	struct rdn_mem_block *b;
@@ -132,4 +179,14 @@ uint64_t rdn_mem_available(struct rdn_mem *mem)
 		if (!b->used)
 			total += b->size;
 	return total;
+}
+
+uint64_t rdn_mem_largest(struct rdn_mem *mem)
+{
+	struct rdn_mem_block *b;
+	uint64_t largest = 0;
+	for (b = mem->head; b; b = b->next)
+		if (!b->used && b->size > largest)
+			largest = b->size;
+	return largest;
 }

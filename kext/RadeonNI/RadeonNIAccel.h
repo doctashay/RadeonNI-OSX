@@ -29,9 +29,15 @@ extern "C" {
 #include "rdn_mem.h"
 #include "rdn_pm.h"
 #include "rdn_user.h"
+#include "rdn_uvd.h"
 }
 
 class RadeonNI;
+class RadeonNIVideoUserClient;
+struct RadeonNIVideoSession;
+#include "rdn_video.h"
+
+#define RDN_UVD_REBOOT_PROPERTY "RadeonNIUVDRebootRequired"
 
 /*
  * What Tiger's window server wants to see before it considers compositing
@@ -68,6 +74,22 @@ class RadeonNIAccel : public IOAccelerator
 public:
 	/* Create, attach under the PCI device and publish. */
 	static RadeonNIAccel *withFramebuffer(RadeonNI *fb, IOService *provider);
+	virtual void free(void);
+	void prepareToRetire(void);
+	bool videoCharge(UInt32 bytes);
+	void videoUncharge(UInt32 bytes);
+	void videoQuery(bool administrator, struct rdn_video_query *out);
+	IOReturn videoCreate(RadeonNIVideoUserClient *owner, bool administrator,
+		const struct rdn_video_create *in, struct rdn_video_session *out);
+	IOReturn videoDecode(RadeonNIVideoUserClient *owner,
+		const struct rdn_video_decode *in, struct rdn_video_output *out);
+	IOReturn videoRelease(RadeonNIVideoUserClient *owner,
+		const struct rdn_video_release *in);
+	IOReturn videoDestroy(RadeonNIVideoUserClient *owner,
+		const struct rdn_video_destroy *in);
+	void videoClose(RadeonNIVideoUserClient *owner);
+	IOReturn videoMemory(RadeonNIVideoUserClient *owner, UInt32 type,
+		IOOptionBits *options, IOMemoryDescriptor **memory);
 	void retire(IOService *provider);
 
 	virtual IOReturn newUserClient(task_t owningTask, void *securityID,
@@ -93,6 +115,10 @@ public:
 	IOReturn power(UInt32 state, UInt32 what, UInt32 *sclk, UInt32 *mclk,
 		       UInt32 *temperature);
 	IOReturn regRead(UInt32 offset, UInt32 *value);
+	void uvdDiagnosticInfo(struct rdn_user_uvd_diagnostic *info);
+	IOReturn uvdDiagnosticInit(UInt32 *status);
+	IOReturn uvdFixtureRun(struct rdn_user_uvd_fixture *result);
+	IOReturn uvdFixtureRead(UInt32 generation, UInt32 chunk, void *bytes);
 	IOMemoryDescriptor *apertureMemory(void);
 	UInt32 apertureBytes(void);
 	/* The shapes of the window server's surfaces, by surface ID. */
@@ -132,7 +158,24 @@ public:
 
 private:
 	RadeonNI *fFramebuffer;
+	IOService *fUvdProvider;
 	IOLock *fLock;
+	IOLock *fUvdLock;
+	RadeonNIVideoSession *fVideoSession;
+	UInt64 fVideoEpoch;
+	volatile UInt32 fVideoCpuBytes;
+	bool fVideoBusy;
+	bool videoReady(bool administrator, bool validation);
+	int videoCommand(UInt32 type, const struct rdn_uvd_h264_picture *picture,
+		UInt32 bitstreamBytes);
+	void videoCleanup(bool destroy);
+	int videoBindReadback(void);
+	int videoUnbindReadback(void);
+	int videoReadback(void);
+	int videoSubmitGfx(UInt32 words,bool poisonOnBusy);
+	int videoInitializeVram(void);
+	void videoPoison(int error);
+	bool fRetiring;
 	struct rdn_accel fAccel;
 	struct rdn_mem fMem;
 	/* Video memory beyond the aperture; fHiddenSize 0 if there is none. */
@@ -140,6 +183,13 @@ private:
 	UInt32 fHiddenOffset, fHiddenSize;
 	void *fPfp, *fMe;
 	bool fEngineUp;
+	struct rdn_uvd fUvd;
+	UInt32 fUvdState, fUvdOffset, fUvdBytes, fUvdStatus;
+	SInt32 fUvdError;
+	bool fUvdColdAttempted;
+	struct rdn_user_uvd_fixture fUvdFixture;
+	UInt32 fUvdFixtureOffset, fUvdFixtureBytes;
+	UInt8 *fUvdFixtureSnapshot;
 	/* The power state the card was last put in (hw/rdn_pm.h). */
 	struct rdn_pm_state fPower;
 	bool fPowerKnown;
@@ -190,6 +240,9 @@ private:
 	RadeonNIAGPShim *fShim;
 
 	bool startEngine(void);
+	static void prepareUvdBeforeCP(void *cookie);
+	IOReturn uvdDiagnosticInitImpl(UInt32 *status, bool prepareOnly);
+	void releaseUvdFixtureSnapshot(void);
 	/* rdn_gart=1: the page table for system memory, and a test of it. */
 	void startGart(void);
 	struct rdn_gart fGart;
@@ -240,6 +293,13 @@ public:
 	IOReturn methodSurfaceList(struct rdn_user_surfaces *list, IOByteCount *size);
 	IOReturn methodSurfaceLocked(UInt32 *wid);
 	IOReturn methodRegRead(UInt32 offset, UInt32 *value);
+	IOReturn methodUvdDiagnosticInfo(struct rdn_user_uvd_diagnostic *info,
+				       IOByteCount *size);
+	IOReturn methodUvdDiagnosticInit(UInt32 reserved, UInt32 *status);
+	IOReturn methodUvdFixtureRun(UInt32 reserved, struct rdn_user_uvd_fixture *result,
+				    IOByteCount *size);
+	IOReturn methodUvdFixtureRead(UInt32 generation, UInt32 chunk, void *bytes,
+				     IOByteCount *size);
 	IOReturn methodAllocHidden(UInt32 size, UInt32 align, UInt32 *offset);
 	IOReturn methodHiddenInfo(UInt32 *offset, UInt32 *size);
 	IOReturn methodGartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages);
@@ -256,6 +316,7 @@ public:
 private:
 	RadeonNIAccel *fAccel;
 	task_t fTask;
+	bool fUvdAdministrator;
 	/* What this client allocated, so that it can be freed when it goes. */
 	UInt32 *fOffsets;
 	UInt32 fCount;

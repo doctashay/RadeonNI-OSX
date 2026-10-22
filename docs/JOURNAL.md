@@ -6825,6 +6825,40 @@ dev_fence_wait under compositor flush. Stopped the test process; native
 modern/legacy rendering validation remains pending desktop recovery.
 No claim of game stability or complete 4.6 conformance follows from this build.
 
+## 2026-10-22: isolated UVD diagnostics and first Leopard boot
+
+Started H.264 bring-up in `h264-development-20261022`, copied from the dirty
+stable source without changing it. Imported the upstream UVD core and hardened
+address checks, PPC byte order, bounded waits, failure state, and storage
+lifetime. Experimental flags and raw user command submission remain disabled.
+The new administrator-only diagnostic requires `EnableUVDDiagnostics` and
+`FW_UVD`. A PCI-provider marker blocks driver restart after hardware access;
+reserved VRAM is not recycled after a timeout. Recovery requires a reboot.
+
+Validation: 104 core checks pass on x86 and big-endian PPC QEMU; ASan/UBSan and
+16 kernel-boundary tests pass. Native Apple GCC 4.0.1 builds the PPC32 kernel
+and probe; C/C++ layouts agree. Native relocation and dry loader checks pass.
+The AMD H.264 IDR fixture has an independently decoded NV12 reference, but has
+not been submitted to this hardware. These checks do not establish decoding.
+
+With user authorization, installed candidate `20261022T052538Z` on `.98` and
+rebooted. Kernel SHA256:
+`78bf0f6078dd97827fb6f39a9464119a1d328b51362abde16be5ee717ccdf78f`.
+Preserved the installed personality, adding only diagnostic enablement and the
+205080-byte `SUMO_uvd.bin`; the GL bundle is unchanged. The first unrestricted
+mkext rebuild exceeded Leopard's size limit and automatically restored the old
+driver. The retry with PPC/local-root/previously-loaded filtering passed.
+Backup: `~/RadeonNI-diagnostics/uvd-20261022T052538Z-retry/`.
+
+The desktop returned at 1920x1080. Actual UVD startup took 10.6338 seconds and
+failed with status `0x0`, error `-5`; state became faulted and 1192000 bytes
+remained reserved. No H.264 frame was decoded. Desktop capture remained valid;
+Aurora reopened on YouTube with separate browser/GPU processes. Upstream
+experiments show that RLC alone is insufficient: memory-window configuration
+and RLC/UVD startup ordering remain bring-up hypotheses. Aurora still uses
+software video decoding. Evidence is in sibling `h264-validation-20261022/`.
+All development changes remain unstaged.
+
 ### Native bridge validation after reboot
 
 The PPC32 native test reports AMD TURKS, OpenGL 4.6 compatibility, and GLSL
@@ -6841,3 +6875,538 @@ conclusion about the required client buffer representation.
 CS:GO PID 330 rendered the Dust loading screen, then crashed at 10:47:53
 in _mesa_bind_framebuffers+212 on render thread 19, during ToGL presentation.
 Report saved as ../csgo-modern-104753.crash. No game-stability pass.
+
+### UVD: RLC, address-field and firmware-fetch checks
+
+Candidate `20261022T060039Z` added the discrete Turks RLC startup sequence and
+the exact 3072-byte `BTC_rlc.bin`. The administrator diagnostic drains graphics
+through a fresh fence while holding the accelerator lock before changing RLC.
+Missing firmware, fence failure, and timeout return before UVD storage/hardware
+access. The native C/C++ layout check and 23 kernel-boundary tests pass.
+
+RLC enable reads back as 1 on `.98`, but UVD startup still fails with status 0
+after 10.64 seconds. The VCPU allocation is at GPU address `0xf0269d000`, with
+VRAM still at `0xf00000000`. A CP DMA copy of all 205080 firmware bytes from
+that address completed behind a fresh fence with zero mismatches, zero guard
+errors, and the source unchanged.
+
+Candidate `20261022T061724Z` masks the VCPU cache offsets to their documented
+25-bit fields, retaining the separate LMI address extensions. Its 157 core
+checks pass on host and big-endian PPC/QEMU and under ASan/UBSan; native Apple
+GCC, ABI, relocation, loader, and kernel-boundary checks pass. After reboot,
+the corrected fields read back correctly, but UVD still fails with status 0
+after 10.74 seconds. `UVD_LMI_STATUS=0x3f7f` reports clean/idle queues;
+`UVD_CGC_STATUS=0x1fffffff` has no verified running/gated polarity here.
+
+A separate CP immediate-fill test writes `0x01234567` into owned, guarded VRAM.
+The CPU reads `67 45 23 01`, as expected without an aperture byte transform;
+the fence completes and guards are intact. This independently validates the
+byte-order assumption that the memory-to-memory round trip cannot establish.
+The desktop remains readable after the failed init. UVD remains faulted with
+1192000 bytes quarantined; no decode command has been submitted. Each candidate
+has its own backup under `~/RadeonNI-diagnostics/uvd-<stamp>/`, and the GL bundle
+is unchanged. Hardware evidence remains in `h264-validation-20261022/`.
+
+### UVD: reset-state and cold RLC ordering experiments
+
+Candidate `20261022T062708Z` repeated the indexed memory-window programming
+after LMI reset and before VCPU startup. It still failed with status 0; the
+two-line production experiment and its specific tests were reverted. Its
+native logs and source snapshot are retained.
+
+Candidate `20261022T064250Z` separates firmware/window/RLC preparation from
+VCPU startup. `UVDDiagnosticsBeforeCP` is a separate opt-in personality key:
+the callback prepares UVD storage with ME/PFP halted, then normal CP startup
+continues. The administrator probe later drains graphics and starts the
+prepared UVD instance without recopying firmware or reallocating buffers.
+The provider marker and storage survive failed preparation or startup;
+prepared cancellation performs no UVD MMIO. The default path keeps the
+original combined initialization call.
+
+The split passes 192 UVD model checks on host and big-endian PPC/QEMU,
+ASan/UBSan, 31 extracted kernel-boundary tests, and native Apple build/ABI
+checks (108-byte state, prepared at offset 104). The real CP ordering model
+passes 33 checks; its sanitizer run excludes shift checks because an existing
+signed `1 << 31` register macro is reported separately.
+
+On `.98`, early preparation succeeds and reserves 1192000 bytes. The later
+probe confirms RLC remains enabled after CP startup, but the VCPU still fails
+after 10.52 seconds with status 0. Its VCPU/ring addresses are `0xf02200000`
+and `0xf02322000`. This disproves RLC-versus-CP execution order as the whole
+cause. No H.264 frame has been submitted or hardware capability advertised.
+
+### UVD: cold VRAM layout diagnostic
+
+`UVDDiagnosticsRebaseVRAM` adds an opt-in cold-only test of Linux's zero GPU
+VRAM base on this 1002:675d, 1 GiB card. The caller claims first-start and
+exclusive PCI ownership before hardware access, rejects other graphics clients,
+and accepts either a fresh OF handover or all six CRTCs off with CONFIG_MEMSIZE
+zero before POST. Leopard's synchronous console disable drains text/spinner
+writes before the bounded MC transition. The helper rejects active DP, cursors,
+engines and VM contexts, verifies the complete mapping, and leaves CRTCs off
+for a full modeset. Failed restoration retains an unpublished service and its
+PCI ownership/mappings until reboot, denying termination and new clients.
+
+A reserved page at aperture offset `0x021ff000` is checked with a nonzero pattern
+and then cleared. The explicit GART scratch API preserves this page across
+resume; the existing API retains its previous behavior. Model checks cover
+98 MC cases, 27 GART cases, and 61 extracted caller scenarios on host,
+big-endian PPC/QEMU and sanitizers. Apple GCC4 builds the candidate; native
+C/C++ ABI checks agree, including 28-byte GART and 48-byte layout result.
+
+Candidate `20261022T071359Z` booted on `.98` with strict unposted-entry admission.
+All engine/ownership checks passed, but mapping verification rejected
+MC_VM_AGP_TOP: writing `0x0fffffff` read back `0x0003ffff`. The helper restored
+the old mapping and access, then driver startup failed without publishing an
+accelerator. SSH remains available. No UVD init, GPU sentinel or H.264 command
+was submitted in this boot; the AGP register width is being corrected before
+the next trial. Source, native build, loader checks and logs are preserved in
+the sibling validation directory; all changes remain unstaged.
+
+Candidate `20261022T072205Z` uses the observed 18-bit AGP TOP/BOT value
+`0x0003ffff`, retaining full readback equality. The model now emulates this
+register truncation and passes 99 cases. On `.98`, the cold transition reaches
+stage 6 with GPU VRAM base zero and CPU access restored. The reserved scratch
+page, console modeset, graphics startup and a fresh fenced CP immediate-fill
+test pass; the 1920x1080 desktop remains readable.
+
+UVD initialization now boots the firmware processor (`UVD_STATUS=0x2`) in
+0.417 seconds. The ring test fails with its context sentinel unchanged at
+`0xcafedead`. The instance remains faulted with 1192000 bytes quarantined until
+reboot. No H.264 command has been submitted. Linux's UVD ring reserves and pads
+to 16 dwords; this implementation still publishes a two-dword ring test. That
+concrete discrepancy is the next candidate, not yet a proven hardware cause.
+
+Candidate `20261022T073657Z` rounds ring reservations to 16 dwords and pads
+commits with UVD's one-word NOP before publishing WPTR. An 18-word IB/fence
+submission now reserves 32 words. The model covers capacity, wrap and both byte
+orders; all 199 checks pass on host, PPC/QEMU and ASan/UBSan. The original core
+fails the corrected model's initial ring test. Native Apple build, ABI reuse,
+loader and relocation checks pass.
+
+After reboot, `.98` again passes MC/scratch verification, the fenced CP sentinel
+and desktop inspection. UVD initialization at 07:40:10 UTC succeeds in 0.250
+seconds: the ring test reports zero microseconds, semaphore setup completes,
+and the diagnostic reports RING_READY with status 2 and error 0. This confirms
+the padding correction on hardware. No H.264 frame has been submitted yet;
+the fixed-frame diagnostic and exact pixel comparison are the next step.
+
+Candidate `20261022T075328Z` adds administrator-only fixed H.264 RUN/READ
+diagnostics, appended at selectors 24/25. The service owns the guarded VRAM
+slab and immutable CPU snapshot independently of client lifetime. It submits
+CREATE, DECODE and DESTROY with separate fences, retaining GPU storage until
+reboot. Fully completed but incorrect output remains available for diagnosis;
+incomplete submissions never publish a snapshot. The 37 boundary scenarios,
+901 packing checks, existing 31 startup tests, native Apple build, ABI and
+stack audit pass. The longest inspected native driver call chain uses 5664
+bytes of Leopard's 16384-byte kernel stack.
+
+On `.98` at 07:59:35 UTC, the 864x480 High-profile IDR fixture passes all three
+fences (1/2/3), buffer guards and idle transition. Its 622080 NV12 bytes match
+the independent FFmpeg reference exactly, SHA256
+`f8128078aebc6e5dcf4f80afecd8ff1f01ce3f82ae6d543bb9dcb828f496250e`.
+Local independent field weaving gives the same bytes. The message uses the
+validated packer's db_pitch=864. Raw target/feedback and native evidence are
+saved under `hardware-20261022T075328Z-fixture*` in the validation directory.
+The 1.22-second probe total includes allocation, initialization, readback and
+chunked IPC; it is not a decode throughput measurement. The desktop remains
+intact and UVD stays ready. This proves one hardware-decoded IDR; inter-frame
+correctness and Aurora integration remain pending.
+
+Readback measurements on the same boot show that CPU aperture reads cannot
+serve real-time playback: copying a 3133440-byte 1920x1088 NV12 frame takes
+106.58 ms with libc memcpy, versus 413.1 ms with word reads and 1634.4 ms
+with byte reads. The benchmark uses owned VRAM, verifies all bytes and guards,
+and submits no GPU commands.
+
+The guarded CP-DMA VRAM-to-GART benchmark at 08:15:25 UTC passes all nine
+trials (622080, 1382400 and 3133440 bytes, three copies each). At 1080p, DMA,
+fence wait and a subsequent RAM memcpy total 2.534-2.537 ms; the RAM copy
+accounts for about 1.47 ms. Destination bytes, surrounding guards and the
+complete source allocation match in every trial. GART pages are snooped;
+the test poisons destination RAM before each submission to exercise actual
+G5 coherence. These are transfer timings, not video playback FPS. Source,
+native build and results are in `gart-readback-20261022T081525Z.json` and
+`gart-readback-benchmark/` in the sibling validation directory.
+
+Candidate `20261022T083830Z` adds a separate `rdnv` video user client with
+bounded CREATE/DECODE/RELEASE/DESTROY sessions. The kernel owns command buffers,
+reference storage, fences and a private GART readback allocation; user mappings
+contain only bitstream uploads or read-only NV12 output. Tokens and sequences
+reject stale releases, and mapped-memory charges survive client closure until
+the final mapping disappears. Uncertain GPU ownership retains allocations.
+
+The frame path copies the UVD target and all twelve guard pages through one
+CP-DMA submission before weaving field storage into NV12 in cached RAM. Both
+UVD and GFX submissions have nonwaiting variants; GFX queue retries and fence
+waits release the display lock. Capability queries use try-lock admission.
+GART binding uses 64-bit physical addresses and checked TLB invalidation.
+Production startup remains gated by `EnableUVDSessions` and validated API 1;
+this candidate is installed with administrator validation enabled only.
+
+Validation includes 34 session scenarios on host, big-endian PPC and
+sanitizers; 38 existing diagnostic/fixture tests; 201 UVD model checks;
+298 DMA packing checks; and 7961 GFX reservation/order checks. The last
+sanitizer run excludes the pre-existing signed PACKET3 shift. Native Apple
+GCC4 builds and C/C++ ABI checks pass; the new wire structures also compile
+for PPC32 and PPC64 user processes. Loader validation checks 14355 relocations.
+The deepest inspected new driver stack chain is 1472 bytes. The candidate's
+SHA256 is `bb98c94b5034fe76be1793d513b44ebbb85ea1903de561371450edb1179e2b42`.
+Reboot was requested at 08:42:36 UTC; native session/frame tests are pending.
+
+The candidate boots at 08:43:07 UTC and passes MC/scratch checks, the GFX
+sentinel and the original exact-pixel UVD fixture. Both native PPC32 and PPC64
+clients successfully create/map/destroy sessions. Output mappings have current
+and maximum protection READ only; write upgrades and writes fail, alternate
+cache mappings are rejected, and mappings remain valid through session destroy.
+An unprivileged query advertises no capabilities while validation-only mode
+is active. The desktop remains intact.
+
+The Chromium-parser CLI v3 initializes but returns UnsupportedConfig before
+submitting the fixed fixture (1.35 ms, zero frames). UVD remains ready. This is
+not a hardware-decode pass for the new session path; parser/adapter rejection
+is being traced before proceeding to the multiframe corpus. The earlier
+standalone CLI's C++ runtime interposition and loader-path failures were fixed
+using the existing Chromium symbol-visibility link rule and an explicit local
+runtime dependency; v2/v3 native startup controls now have clean stderr.
+
+The v3 rejection was clear-only H.264 subsample metadata. Chromium supplies
+these ranges for unencrypted slices; the adapter incorrectly rejected any
+nonempty list. CLI v4 accepts exact clear-byte coverage while still rejecting
+encrypted or malformed ranges. Its 46 checks pass on host, big-endian PPC and
+sanitizers. It is staged for native testing, not yet enabled in Aurora.
+
+The direct new-session fixture at 08:51:09 UTC exposes a separate DMA bug:
+U4 DART reports invalid PCI writes and the guard check faults the session.
+The driver retains uncertain allocations; no output is published. Leopard
+XNU 1228.15.4 confirms that getPhysicalSegment64 returns unmapped physical
+pages, while the legacy mapped accessor used by the successful DMA benchmark
+returns IOVM addresses. A retained mapped IODMACommand is being validated to
+preserve DART translation and full address width. No decoding is retried on
+the faulted boot.
+
+Candidate `20261022T085844Z` replaces raw physical-page lookup with a retained
+mapped IODMACommand. Its 41 session scenarios distinguish raw RAM from DART
+addresses and verify translation lifetime through checked GART invalidation;
+host, big-endian and sanitizer runs pass. Native Apple build and all 14371
+loader relocations pass. Installed SHA256:
+`d136b77995802353e74f1c366d141d186dc462e76ace2d1a442d722071dea5fe`.
+After reboot at 09:01:52 UTC, MC/scratch, GFX and UVD startup checks pass.
+
+The new session API now returns the exact fixed-fixture NV12 in 5.65 ms with
+no DART faults. The direct client initially reported two teardown failures:
+Leopard unmap-by-type re-queries clientMemoryForType, so unmaps must precede
+DESTROY. With RELEASE/unmap/DESTROY/CLOSE ordering, every call and the exact
+pixel check passes at 09:07:01 UTC. This corrects client cleanup, not kernel
+decode ownership. The browser backend is receiving the same correction.
+
+Chromium CLI v4 decodes all 512 frames in seven independent clips exactly:
+Baseline CAVLC, Main CABAC/B-frames, High/8x8, cropped 1080p, 720p, and two
+B-pyramid/adaptive-reference streams. UVD remains ready throughout. These
+runs include CPU SHA256 per output frame and session creation, so their
+aggregate timings are not playback rates. A separate timed run will omit
+hashing after these correctness checks.
+
+The experimental MMCO2-6 CLI v5 does not yet pass the synthetic 32x32 corpus.
+One clip returns all six frames with incorrect pixels; the other rejects a
+later picture after producing one incorrect frame. Neither faults UVD.
+Long-term-reference support remains unmerged pending diagnosis. Aurora's
+production capability remains disabled while integration and fallback are
+validated.
+
+The dimension controls isolate the blank output: 32x32 returns zero pixels
+for both normal CAVLC and I_PCM, at levels 1.0 and 3.0; 64x64, 128x128 and
+320x192 pass both encodings exactly. Sessions and browser admission now use
+a conservative 64x64 minimum. Repeating the long-term/MMCO6 stream at 64x64
+passes all six frames. MMCO5 still exposes Chromium's previous-frame-number
+bookkeeping; it remains rejected before hardware submission, with software
+replay planned instead of changing the generic parser.
+
+CLI v6 omits pixel hashing for timed runs after the independent exact checks.
+At 720p, steady frame submission averages 17.46 ms; at 1080p it averages
+36.59 ms. The 1080p breakdown is 22.07 ms in the combined kernel decode/
+readback/weave call, 4.55 ms allocating a zeroed vector, 1.47 ms copying its
+contents and 6.88 ms allocating/copying the final shared frame. Session
+creation takes 3136 ms. These are decoder-pipeline timings, not presentation
+FPS. Driver stage timing and direct shared-buffer output are being tested.
+
+The first native software-replay test passes all sixteen injected-failure
+scenarios across the six-frame MMCO clip and 64-frame Main/B-frame clip.
+It compares real FFmpeg pixels and original timestamps, including duplicate
+and reordered PTS, whole-stream input packets, and reset/reinitialize failure.
+This is CPU-only fallback validation; it does not enable Aurora hardware
+decoding. Evidence: `native-replay-test-20261022T091820Z.json`.
+
+Native candidate 20261022T093801Z replaces the two CPU aperture fills with
+immediate CP_DMA initialization. The executing 4 KiB IB is excluded; all
+payload and guard spans complete behind one checked GFX fence before UVD
+CREATE. Unknown completion retains the allocation. Apple GCC4 stack audit
+finds 1328 bytes on the inspected CREATE chain and 1616 on DECODE, with no
+dynamic stack allocation. The command buffer is heap-owned.
+
+After the 09:41:53 UTC boot, both ABI mapping probes and all 512 reference
+frames pass again. Initializing 87,764,992 bytes takes 35.2 ms on CP_DMA;
+total 1080p session creation falls from 3136 to 221.5 ms. Direct output into
+the final shared frame removes the intermediate vector allocation/copy.
+Steady 1080p submission averages 29.03 ms, including 22.09 ms in the kernel
+decode/readback/weave call. These timings exclude display and do not establish
+browser playback FPS.
+
+Completed DECODE feedback must echo the request sequence and contain zero
+status before output publication. A truncated 64x64 I_PCM stream previously
+returned a partial image with nonzero status. The new driver rejects it,
+publishes no frame, stays READY, and permits a clean session to decode the
+fixed fixture exactly. Evidence: feedback-replay-20261022T093801Z-final093801.
+
+The combined Chromium CLI decodes the early and later MMCO fallback clips
+with exact logical NV12 pixels. The six-frame later-MMCO fixture still has
+all initial pictures in the DPB when fallback occurs; it does not prove
+recovery after an already displayed hardware frame. That coverage requires
+a longer prefix. The full browser integration is compiling; production
+capability and the default browser feature remain disabled at this point.
+
+The extended 27-frame fallback fixture forces DPB output before MMCO6:
+eight hardware NV12 frames followed by nineteen software I420 frames match
+the complete reference exactly. No duplicated or missing output is observed.
+Evidence: feedback-replay-20261022T093801Z-late24-final093801/results.json.
+
+Production session flags were enabled without changing the driver binary.
+After the 09:55:23 UTC reboot, UVD initializes automatically, MC/scratch
+checks remain valid, and a non-root CLI decodes the fixed fixture exactly
+without the validation override. The administrative validation path is
+disabled. Evidence: production-plist-20261022T095350Z/check.json. Browser
+integration still awaits its full build and real playback validation.
+
+### Aurora playback and normal-app deployment
+
+The `h264-default-on-lifetime` Aurora package enables the guarded UVD
+factory and separate-process Leopard surface presentation by default.
+Framework SHA256 is
+`fc406e8ad6d9d9e9c9909142b90fe1b3690e352792deda8901e7cf1f8de0f2aa`.
+All 322 bundle members were verified before and after installation at
+`/Volumes/240GBHFS+10.5.8PPCSATA/Chromium Aurora.app`. The prior app is
+preserved at `Chromium Aurora.backup-20261022T115550Z-f06e28f9.app` on
+that volume. The Desktop symlink, existing profile and boot-volume
+`/Applications` copy were not replaced.
+
+The isolated default launch used no UVD or presentation overrides.
+Browser 1341 and GPU 1347 remained separate. Three ten-second trials
+per resolution at 720p and 1080p presented 299-300 frames per interval,
+with zero measured dropped or corrupted frames. Media load/property
+events identify RadeonUvdVideoDecoder for all six measured loads.
+Paused captures at one second match the software control exactly for
+both clips; separate Mac desktop inspection confirmed visible output.
+Evidence: final-default-runtime-validation.json and
+browser-video-final-default-20261022T114251Z.json in the validation directory.
+
+Late-MMCO and PAFF cases completed through FFmpeg fallback. The reported
+decoder name and platform-decoder property now change together, so
+software fallback does not retain a hardware-decoder label. Native window
+teardown marks content destruction before resetting its layer tree and
+skips shadow/layout reconstruction while retaining renderer/refcount
+cleanup. A second window closed without terminating the first; playback
+continued after minimize/restore. Final browser/GPU exit and a 12-second
+crash-report grace passed without a new owned or unattributed report
+(final-default-shutdown-v2.json).
+
+The ordinary app then launched with the existing default profile and only
+diagnostic CDP/logging arguments. Browser 1531 and GPU 1542 used the same
+verified package, with native presentation active and no UVD/presentation
+overrides. The original YouTube URL, `watch?v=XIqJaT3cvf8`, selected 1080p
+H264 and reported RadeonUvdVideoDecoder/platform=true. Its 15.08-second
+sample advanced 364 total video frames with nine drops, no corruption and
+no Media error. Ten trusted control clicks completed, but observed resume
+latency reached 737 ms; this is not a claim that YouTube UI work is faster.
+Evidence: normal-default-diagnostic-launch.json and
+youtube-normal-default-20261022T115830Z.json.
+
+CPU results are descriptive. In the final 1080p comparison renderer CPU
+was about 58% lower, while total owned-process CPU was only about 1% lower.
+At 720p renderer CPU was lower but total CPU was higher; browser/utility
+work varied and only two software-control trials qualified. Earlier
+explicit-feature runs also changed WebUICodeCache/CanvasOopRasterization
+and are not used as CPU speedup evidence. These runs prove the tested
+playback path, not a general total-CPU improvement or tear-free scanout.
+
+The production driver binary remains `02817de17f60bb661d36fa6dbfd5a6322a0beb781f3c2f374818c9cd4ed33ec7`.
+Hardware admission remains limited to the validated Turks setup,
+progressive 8-bit 4:2:0 Baseline/Main/High, 64x64 through 1920x1088, and
+one hardware session. Video frames cross into CPU-backed NV12 through
+GART/CP_DMA; this is not zero-copy video. Unknown DMA completion still
+quarantines resources until reboot. Unsupported streams retain software
+fallback; this work does not establish full H264 conformance.
+
+The normal diagnostic browser and GPU subsequently exited after Browser.close.
+The launcher saw a transitional process command and reported a verification
+failure; same-boot read-only reconciliation confirmed both PIDs absent.
+A scan including normal-profile Crashpad pending/completed and Apple reports
+found all 2,807 entries unchanged from the pre-close baseline. The remaining
+restore bubble is consistent with inherited session state: Chromium's
+ExitTypeService destructor preserves the previous crash status while waiting
+for user acknowledgement, including dismissal of that bubble. No new crash
+report was found; no helper rewrote profile preferences to hide it.
+
+The final handoff launched the installed ordinary app with only the original
+YouTube URL: browser 1672 and GPU 1683, existing default profile, no CDP,
+feature, presentation or profile arguments. Full bundle identity and visible
+playback were verified, and the app was left running for the user. Evidence:
+normal-default-final-launch.json, normal-default-final-desktop.png,
+normal-diagnostic-close-reconciliation-20261022T120450Z.json and
+normal-close-crash-scan-20261022T120749Z.json. The helper's post-CDP grace is
+now passive; an additional quit event still requires exact live PID identity.
+
+### Handoff interrupted by legacy accessibility hit-testing
+
+The preceding final-handoff status was superseded at 12:10:35 UTC. Browser
+1672 aborted during a System Events accessibility hit-test with
+`-[AXPlatformNodeCocoa accessibilityHitTest:]: unrecognized selector`.
+The exception originated in `BridgedContentView accessibilityHitTest:` on
+the UI thread; the saved report is
+`normal-final-ui-20261022T121035Z.crash`. The ordinary app had been playing,
+but that launch is no longer a completed stable handoff.
+
+The verified UVD decode, pixel, fallback and playback results remain valid.
+This new blocker is the Leopard accessibility adapter, not evidence of a
+decode failure. The browser fix and a fresh normal-app accessibility and
+playback run are required before restoring the final-handoff claim.
+
+### Resize failure after the accessibility fix
+
+The accessibility-fix candidate passed video playback, then browser 1923
+received SIGBUS during Browser.setWindowBounds at 12:28:16 UTC. The UI-thread
+stack is CFSetAddValue -> CFRunLoopAddObserver -> NSWindow
+_postWindowNeedsDisplay -> setFrame -> LeopardSetWindowFrame. This is a
+separate runtime blocker; the corrected candidate has not completed its
+window-lifecycle gate and is not a stable final handoff. No decode failure
+is established by this stack.
+
+The exact report is
+`native-ax-resize-crash-1923/Chromium Aurora_2026-10-22-062816_G5-Quad-Leopard.crash`.
+A read-only scan of 270 retained Aurora/Chromium Apple crash reports found
+this as the only report containing CFSetAddValue or LeopardSetWindowFrame;
+that absence does not establish when the bug originated. The scan record
+is `native-ax-resize-crash-1923/apple-crash-history.json`. Diagnosis and a
+fresh resize/shutdown run remain required before final handoff.
+
+### Earlier GLD fault and final CA presentation validation
+
+The saved browser logs correct the preceding Apple-report interpretation.
+Both browser 1923 and 2867 first faulted on the Core Animation display-link
+thread, through CGLChoosePixelFormat and the GL driver current-context hook.
+st_api_get_current failed loading ctx->st after the TLS lookup returned an
+invalid nonnull context. The later main-thread AppKit/CF stacks are not the
+first observed fault. TLS selection, stale context lifetime and earlier
+corruption are not distinguished by this evidence; see
+native-popup-resize-crash-2867/tls-current-context-review.json.
+
+The final browser keeps the affected CA roots in software rendering through
+popup, fallback, resize and teardown, while native presentation still uses
+the separate GPU process. RadeonNIGLDriver was not changed; its SHA256 remains
+ab1c4374d923c71d9454063c1a2f29754bb71c09885adc7f87d51d0a359c7a2d.
+The h264-default-on-ca package framework is
+8fb45eb262ee8652a016dd775db0170f86e08e514cd61e172e1cf016d4ee74a7.
+
+Fresh default-mode validation passed a visibly painted popup and native
+mouse click, 20 subsequent resize transitions, and 720p/1080p playback
+with 300 frame callbacks in 10 seconds each and no measured drops or
+corruption. Both pixel comparisons matched the software references exactly.
+Shutdown observed both owned processes exit, then 12 seconds without a new
+crash report. These bounded results are recorded in final-ca-runtime-validation.json,
+final-ca-shutdown-v2.json and native-software-ca-fix/post-popup-resize.json.
+The initial shutdown-helper timeout is preserved separately.
+
+The verified bundle replaced the ordinary external-volume app, with its
+previous app retained as Chromium Aurora.backup-20261022T141026Z-7a091853.app.
+The Desktop link, default Aurora profile and boot-volume Applications copy
+were preserved. Installation is recorded in
+browser-package/h264-default-on-ca/normal-install-20261022T141026Z-7a091853.json.
+The 37-file build-time manifest remains preserved as
+chromium-factory-integration/manifest-buildtime-058973193b0c.json;
+only the current manifest's stale status metadata was updated.
+
+Ordinary-profile YouTube 1080p H264 reported RadeonUvdVideoDecoder and
+platform=true without UVD or presentation overrides. In 19.0053 seconds,
+media time advanced 18.427879 seconds; frame counters increased by 436,
+including 16 drops and no corruption or media error. UVD remained ready
+with error 0; the kernel binary remained
+02817de17f60bb661d36fa6dbfd5a6322a0beb781f3c2f374818c9cd4ed33ec7.
+Evidence: youtube-normal-final-ca-20261022T141521Z.json and
+uvd-state-normal-final-ca-youtube-20261022T141711Z.json. Ten trusted control
+clicks completed, with median handler/rAF/resume-callback delays of
+81.7/310.7/773.7 ms. This does not establish a UI-jank cure or a total-CPU
+improvement. These callback timings do not measure physical scanout.
+
+The diagnostic browser closed normally. The final normal launch left browser
+3723 and separate GPU 3734 running with only the app and original YouTube
+URL in argv, using the existing profile. Its identity and bundle are bound
+in normal-final-ca-handoff.json. The stale restore notice was dismissed by
+one observed native mouse click with process identity unchanged and cursor
+restored; normal-final-ca-restore-dismissal-v2.json records that action.
+The final normal-final-ca-ready-desktop.png was visually checked and showed
+the rendered YouTube UI and advancing video without that notice. No universal
+H264 coverage, zero-copy video transport or physical-vsync guarantee is claimed.
+
+A final read-only check confirmed both handoff processes alive and no new
+.crash or .dmp report since launch; see normal-final-ca-handoff-state.json.
+
+### 2026-10-22: UVD allocation under graphics load
+
+A later production CREATE returned kIOReturnNoMemory before any decode,
+despite READY/PRODUCTION with no active video session. The installed API
+could not identify the failing allocator. Evidence is in
+performance-1080p60-20261022/diagnosis/create1080-exact-status.json under the
+validation directory. The restored YouTube session consequently used FFmpeg.
+
+The UVD allocator now keeps only message, feedback, IB and bitstream storage
+in CPU-visible VRAM. DPB and target use independent hidden-VRAM allocations,
+with visible fallback and a 256 MiB segment constraint on each guarded span.
+The required 17-image legacy DPB is unchanged. For 1920x1088, visible demand
+falls from 87,764,992 to 4,239,360 bytes. Initialization, readback and guard
+checks use explicit GPU addresses; rollback and DMA quarantine retain both
+pools correctly. CREATE logs placement on success and allocation stage,
+free/largest ranges and CPU charge on failure.
+
+All 23 session test groups passed on host, big-endian and sanitizer builds.
+The constrained allocator and existing allocator tests passed; the standalone
+make test-mem-segment target needs no VBIOS files. The native Leopard build,
+C/C++ ABI checks and 14,627 relocation checks passed. The six-file source
+change and reviews are bound by uvd-memory-candidate-v2/manifest.json.
+
+Candidate 20261022T152618Z was installed with a verified rollback backup and
+activated by an authorized reboot (boot epoch 1792683084). Kernel SHA256 is
+4d9c89de6fdd3faeb3f20ed9db23e4bed659edca8d715bbd0ad6ee1d5c5cfbe5.
+Jak was left closed after reboot as requested. Production CLI checks matched
+all 180 NV12 frame hashes from the 1080p30/60 test GOPs, with hardware type20,
+power-efficient output and no fallback. Kernel placement logs report hidden=3
+for both streams. See memory-fix-nojak-v1-exact.json and
+uvd-memory-work/first-hardware-kernel-log.json in the validation tree.
+
+The fresh matched eight-trial comparison is in
+performance-1080p60-20261022/memory-fix-ab-v2/results.json. Both paths sustained
+1080p30 with zero drops. One stable CPU pair measured 1.200 owned-process core
+equivalents for UVD versus 1.416 for software (15.27% lower); the other pair
+was excluded because utility processes exited during measurement. This is a
+bounded single-pair CPU result, not a general YouTube speedup.
+
+The 1080p60 stress clip advanced at 0.515x real time with UVD and 1.000x with
+software. UVD reported 43 drops among 607 frames; software reported 7 among
+1200. Lower UVD CPU use at this rate does not establish efficiency because
+it delivered less work. Historical native timing also puts the bottleneck
+before presentation: roughly 29 ms per frame, including 18-19 ms for UVD
+submission/fence completion and about 5.5 ms for the mapped-output copy.
+Those timings do not establish a physical decoder ceiling. Clock and timer
+evidence is recorded in diagnosis/uvd-clock-timer-audit.json; no speculative
+clock change or removal of synchronization was made.
+
+The first comparison's software launch failed because the test volume had
+only 4 MiB free. An obsolete isolated v12 app was verified against its retained
+local archive and all 322 manifest members, then removed to recover 481.8 MiB.
+Profiles and the current app were preserved. The full comparison above was
+rerun afterward; the partial first run remains separately recorded.
+
+The normal profile was restored to the saved YouTube URL, position, quality,
+volume, mute and playback state. Browser 1006 and separate GPU 1017 were left
+running. current-video-decoder-20261022T155306Z.json correlates the current
+1080p blob with RadeonUvdVideoDecoder/platform=true and advancing playback;
+uvd-memory-work/restored-playback.json records all restoration checks. Jak
+remained closed. Changes are unstaged; no commit was made.

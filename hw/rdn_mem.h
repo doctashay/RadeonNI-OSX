@@ -29,9 +29,13 @@ void rdn_mem_fini(struct rdn_mem *mem);
 /* `align` is a power of two. Returns 0 and the offset, or -ENOMEM. */
 int rdn_mem_alloc(struct rdn_mem *mem, uint64_t size, uint64_t align,
 		  uint64_t *offset);
+/* First fit inside [minimum, maximum); failure leaves the allocator unchanged. */
+int rdn_mem_alloc_in_range(struct rdn_mem *mem, uint64_t size, uint64_t align,
+		uint64_t minimum, uint64_t maximum, uint64_t *offset);
 /* Free the range that starts at `offset`; unknown offsets are ignored. */
 void rdn_mem_free(struct rdn_mem *mem, uint64_t offset);
 /* Bytes not handed out. */
 uint64_t rdn_mem_available(struct rdn_mem *mem);
+uint64_t rdn_mem_largest(struct rdn_mem *mem);
 
 #endif /* RDN_MEM_H */
