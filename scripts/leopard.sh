@@ -49,7 +49,7 @@ tag=xnu-1228.15.4
 gdir=osx-gpu-leopard
 
 build() {
-    tar -C "$root" -cf - hw kext | gssh "rm -rf ~/$gdir && mkdir -p ~/$gdir && tar -C ~/$gdir -xf -"
+    tar -C "$root" -cf - hw kext tests/uvd_decode_fixture.c tests/uvd_decode_fixture.h | gssh "rm -rf ~/$gdir && mkdir -p ~/$gdir && tar -C ~/$gdir -xf -"
     gssh "cd ~/$gdir/kext/RadeonNI && make LEOPARD=1 2>&1 | tail -5 && file build-leopard/RadeonNI.kext/Contents/MacOS/RadeonNI"
     rm -rf "$out"
     mkdir -p "$out"
