@@ -73,6 +73,7 @@
 #include "main/glthread.h"
 #include "main/context.h"
 #include "main/mtypes.h"
+#include "main/texobj.h"
 
 #include "glapi/glapi/glapi.h"  /* for OSMesaGetProcAddress below */
 
@@ -93,6 +94,8 @@
 #include "frontend/api.h"
 #include "frontend/winsys_handle.h"
 #include "rdn_engine.h"
+#include "rdn_nv12_internal.h"
+#include "util/os_time.h"
 
 
 
@@ -230,6 +233,7 @@ osmesa_unpublish_store(struct osmesa_buffer *buffer)
 struct osmesa_context
 {
    struct st_context *st;
+   struct rdn_nv12 *nv12;
 
    bool ever_used;     /*< Has this context ever been current? */
 
@@ -293,6 +297,9 @@ static struct pipe_frontend_screen *global_fscreen = NULL;
 static void
 destroy_st_manager(void)
 {
+   /* A timed-out pack still owns driver contexts and GPU-visible resources. */
+   if (rdn_nv12_has_quarantine())
+      return;
    if (global_fscreen) {
       if (global_fscreen->screen)
          global_fscreen->screen->destroy(global_fscreen->screen);
@@ -1487,6 +1494,7 @@ OSMesaDestroyContext(OSMesaContext osmesa)
        */
       if (osmesa->current_buffer && osmesa->current_buffer->store)
          osmesa_leave_store(osmesa, true);
+      rdn_nv12_destroy(osmesa->nv12);
       st_destroy_context(osmesa->st);
       if (osmesa->current_buffer)
          osmesa_destroy_buffer(osmesa->current_buffer);
@@ -1723,6 +1731,91 @@ OSMesaTexStoreImage(OSMesaContext osmesa, GLenum target, GLuint handle,
       return GL_FALSE;
    return osmesa_tex_store(osmesa, target, format, handle, stride, offset,
                            width, height, (flags & OSMESA_STORE_ALPHA) != 0);
+}
+
+
+
+GLAPI int GLAPIENTRY
+OSMesaCanPackNV12(OSMesaContext osmesa)
+{
+   if (!osmesa || !osmesa->st || OSMesaGetCurrentContext() != osmesa)
+      return 0;
+   osmesa_sync(osmesa);
+   if (!osmesa->nv12)
+      osmesa->nv12 = rdn_nv12_create(osmesa->st->pipe->screen);
+   return rdn_nv12_available(osmesa->nv12);
+}
+
+GLAPI int GLAPIENTRY
+OSMesaPackNV12Store(OSMesaContext osmesa, const struct OSMesaNV12Source *source,
+                    GLuint destination_y, GLuint destination_uv, uint32_t timeout_ms)
+{
+   struct pipe_resource *src[4] = {0}, *dst[2] = {0};
+   struct pipe_fence_handle *prior = NULL;
+   struct pipe_screen *screen;
+   struct pipe_context *pipe;
+   uint32_t names[2] = {destination_y, destination_uv};
+   uint32_t offsets[4], rows[4];
+   int result = OSMESA_NV12_RETIRED;
+   int64_t deadline, remaining;
+
+   if (!rdn_nv12_source_valid(source) || !destination_y || !destination_uv ||
+       destination_y == destination_uv || !timeout_ms || timeout_ms > 2000 ||
+       !OSMesaCanPackNV12(osmesa))
+      return OSMESA_NV12_UNSUPPORTED;
+   pipe = osmesa->st->pipe;
+   screen = pipe->screen;
+   deadline = os_time_get_nano() + (int64_t)timeout_ms * 1000000;
+   for (unsigned i = 0; i < 2; i++) {
+      struct gl_texture_object *object = _mesa_lookup_texture(osmesa->st->ctx, names[i]);
+      enum pipe_format format = i ? PIPE_FORMAT_R8G8_UNORM : PIPE_FORMAT_R8_UNORM;
+      if (!object || object->Target != GL_TEXTURE_2D || !object->pt ||
+          !object->Image[0][0] || object->Image[0][0]->pt != object->pt ||
+          object->Attrib.MinLevel || object->Attrib.MinLayer ||
+          object->Image[0][0]->Width != (GLint)(source->width / (i + 1)) ||
+          object->Image[0][0]->Height != (GLint)(source->height / (i + 1)) ||
+          object->pt->target != PIPE_TEXTURE_2D || object->pt->format != format ||
+          object->pt->width0 != source->width / (i + 1) ||
+          object->pt->height0 != source->height / (i + 1) ||
+          object->pt->nr_samples > 1 || object->pt->array_size != 1 ||
+          !(object->pt->bind & PIPE_BIND_RENDER_TARGET)) {
+         result = OSMESA_NV12_UNSUPPORTED;
+         goto done;
+      }
+      pipe_resource_reference(&dst[i], object->pt);
+   }
+   /* Retire the GL context's earlier accesses without changing its bound state. */
+   st_context_flush(osmesa->st, 0, &prior, NULL, NULL);
+   remaining = deadline - os_time_get_nano();
+   if (!prior || remaining <= 0 ||
+       !screen->fence_finish(screen, pipe, prior, remaining))
+      goto done;
+   offsets[0] = source->y_top; offsets[1] = source->y_bottom;
+   offsets[2] = source->uv_top; offsets[3] = source->uv_bottom;
+   rows[0] = rows[1] = source->height / 2;
+   rows[2] = (source->height / 2 + 1) / 2;
+   rows[3] = source->height / 4;
+   for (unsigned i = 0; i < 4; i++) {
+      src[i] = osmesa_import_store(screen, PIPE_TEXTURE_2D, PIPE_FORMAT_R8_UNORM,
+                                   PIPE_BIND_SAMPLER_VIEW, source->handle, source->pitch,
+                                   source->offset + offsets[i], source->width, rows[i]);
+      if (!src[i])
+         goto done;
+   }
+   remaining = deadline - os_time_get_nano();
+   if (remaining <= 0)
+      goto done;
+   result = rdn_nv12_run(osmesa->nv12, src, dst, remaining);
+   if (result == OSMESA_NV12_OK && pipe->texture_barrier)
+      pipe->texture_barrier(pipe, PIPE_TEXTURE_BARRIER_SAMPLER);
+done:
+   screen->fence_reference(screen, &prior, NULL);
+   /* The dedicated context owns additional references after PENDING. */
+   for (unsigned i = 0; i < 4; i++)
+      pipe_resource_reference(&src[i], NULL);
+   for (unsigned i = 0; i < 2; i++)
+      pipe_resource_reference(&dst[i], NULL);
+   return result;
 }
 
 
@@ -2424,6 +2517,8 @@ static struct name_function functions[] = {
    { "OSMesaGetDepthBuffer", (OSMESAproc) OSMesaGetDepthBuffer },
    { "OSMesaGetColorBuffer", (OSMESAproc) OSMesaGetColorBuffer },
    { "OSMesaGetProcAddress", (OSMESAproc) OSMesaGetProcAddress },
+   { "OSMesaCanPackNV12", (OSMESAproc) OSMesaCanPackNV12 },
+   { "OSMesaPackNV12Store", (OSMESAproc) OSMesaPackNV12Store },
    { "OSMesaColorClamp", (OSMESAproc) OSMesaColorClamp },
    { "OSMesaPostprocess", (OSMESAproc) OSMesaPostprocess },
    { NULL, NULL }

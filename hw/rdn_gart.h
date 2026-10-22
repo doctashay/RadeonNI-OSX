@@ -29,6 +29,8 @@ struct rdn_gart {
 	uint32_t table_offset;		/* in the aperture */
 	uint64_t dummy;			/* bus address of the dummy page */
 	bool ready;
+	uint32_t default_offset;		/* reserved VRAM fault page, if separate */
+	uint32_t separate_default;
 };
 
 /*
@@ -40,6 +42,12 @@ struct rdn_gart {
  */
 int rdn_gart_enable(struct rdn_gart *gart, struct rdn_accel *accel,
 		    uint32_t table_offset, uint64_t dummy);
+/* Keep the system-aperture default on a separate, permanently reserved page.
+ * Caller zeroes that VRAM page before enabling any engine. Resume preserves it.
+ */
+int rdn_gart_enable_with_scratch(struct rdn_gart *gart, struct rdn_accel *accel,
+				 uint32_t table_offset, uint64_t dummy,
+				 uint32_t default_offset);
 void rdn_gart_disable(struct rdn_gart *gart);
 /* Re-enable translation after the caller restores the saved page table. */
 int rdn_gart_resume(struct rdn_gart *gart);
@@ -49,6 +57,8 @@ void rdn_gart_set_page(struct rdn_gart *gart, uint32_t page, uint64_t bus_addr);
 void rdn_gart_clear_page(struct rdn_gart *gart, uint32_t page);
 /* After changing pages and before the GPU uses them. */
 void rdn_gart_flush(struct rdn_gart *gart);
+/* On error, keep affected mappings/pages pinned; no rollback is implied. */
+int rdn_gart_flush_checked(struct rdn_gart *gart);
 
 /* The GPU's address of a page of the range. */
 static inline uint64_t rdn_gart_addr(uint32_t page)

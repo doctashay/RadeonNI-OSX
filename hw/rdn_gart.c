@@ -42,6 +42,10 @@
 #define R600_PTE_READABLE	(1 << 5)
 #define R600_PTE_WRITEABLE	(1 << 6)
 
+#ifndef EIO
+#define EIO 5
+#endif
+
 #define FLUSH_TIMEOUT_US	100000
 
 /* An entry is 64 bits, little-endian, low word first. */
@@ -68,30 +72,65 @@ void rdn_gart_clear_page(struct rdn_gart *gart, uint32_t page)
 }
 
 /* evergreen_pcie_gart_tlb_flush() */
-void rdn_gart_flush(struct rdn_gart *gart)
+int rdn_gart_flush_checked(struct rdn_gart *gart)
 {
-	struct rdn_card *card = gart->accel->card;
-	uint32_t tmp;
-	int i;
+    struct rdn_card *card;
+    uint32_t response;
+    int i;
 
-	rdn_wreg(card, HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
-
-	rdn_wreg(card, VM_CONTEXT0_REQUEST_RESPONSE, REQUEST_TYPE(1));
-	for (i = 0; i < FLUSH_TIMEOUT_US; i++) {
-		tmp = rdn_rreg(card, VM_CONTEXT0_REQUEST_RESPONSE);
-		tmp = (tmp & RESPONSE_TYPE_MASK) >> RESPONSE_TYPE_SHIFT;
-		if (tmp == 2) {
-			rdn_log(card->os, RDN_LOG_ERROR, "GART: flushing the TLB failed");
-			return;
-		}
-		if (tmp)
-			return;
-		card->os->delay_us(card->os->cookie, 1);
-	}
+    if (!gart || !gart->accel || !gart->accel->card ||
+        !gart->accel->card->os || !gart->accel->card->os->mmio_read32 ||
+        !gart->accel->card->os->mmio_write32 || !gart->accel->card->os->delay_us ||
+        !gart->accel->card->os->log)
+        return -EINVAL;
+    card = gart->accel->card;
+    rdn_wreg(card, HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
+    rdn_wreg(card, VM_CONTEXT0_REQUEST_RESPONSE, REQUEST_TYPE(1));
+    for (i = 0; i < FLUSH_TIMEOUT_US; i++) {
+        response = rdn_rreg(card, VM_CONTEXT0_REQUEST_RESPONSE);
+        response = (response & RESPONSE_TYPE_MASK) >> RESPONSE_TYPE_SHIFT;
+        if (response == 1)
+            return 0;
+        if (response) {
+            rdn_log(card->os, RDN_LOG_ERROR, "GART: TLB flush response %u", response);
+            return -EIO;
+        }
+        card->os->delay_us(card->os->cookie, 1);
+    }
+    rdn_log(card->os, RDN_LOG_ERROR, "GART: TLB flush timed out");
+    return -ETIMEDOUT;
 }
 
-int rdn_gart_enable(struct rdn_gart *gart, struct rdn_accel *accel,
-		    uint32_t table_offset, uint64_t dummy)
+void rdn_gart_flush(struct rdn_gart *gart)
+{
+    (void)rdn_gart_flush_checked(gart);
+}
+
+static int scratch_valid(struct rdn_accel *accel, uint32_t table_offset,
+			 uint64_t dummy, uint32_t default_offset)
+{
+	uint64_t table_end = (uint64_t)table_offset + RDN_GART_TABLE_BYTES;
+	uint64_t default_end = (uint64_t)default_offset + RDN_GART_PAGE_SIZE;
+
+	if (!accel || !accel->card || !accel->card->os || !accel->aperture ||
+	    !accel->card->os->mmio_read32 || !accel->card->os->mmio_write32 ||
+	    !accel->card->os->delay_us || !accel->card->os->log ||
+	    ((uintptr_t)accel->aperture & 3) ||
+	    (table_offset & 4095) || (default_offset & 4095) || (dummy & 4095) ||
+	    !accel->vram_size || (accel->vram_base & 4095) || accel->vram_base >= (1ull << 40) ||
+	    accel->vram_size > (1ull << 40) - accel->vram_base ||
+	    table_end > accel->aperture_size || default_end > accel->aperture_size ||
+	    table_end > accel->vram_size || default_end > accel->vram_size ||
+	    (uintptr_t)accel->aperture > UINTPTR_MAX - table_end ||
+	    (uintptr_t)accel->aperture > UINTPTR_MAX - default_end ||
+	    (default_offset < table_end && table_offset < default_end))
+		return 0;
+	return 1;
+}
+
+static int enable_default(struct rdn_gart *gart, struct rdn_accel *accel,
+			  uint32_t table_offset, uint64_t dummy,
+			  uint32_t default_offset, uint32_t separate_default)
 {
 	uint64_t vram_end = accel->vram_base + accel->vram_size - 1;
 	uint32_t page;
@@ -105,9 +144,26 @@ int rdn_gart_enable(struct rdn_gart *gart, struct rdn_accel *accel,
 	gart->accel = accel;
 	gart->table_offset = table_offset;
 	gart->dummy = dummy;
+	gart->default_offset = default_offset;
+	gart->separate_default = separate_default;
 	for (page = 0; page < RDN_GART_PAGES; page++)
 		write_entry(gart, page, dummy);
 	return rdn_gart_resume(gart);
+}
+
+int rdn_gart_enable(struct rdn_gart *gart, struct rdn_accel *accel,
+		    uint32_t table_offset, uint64_t dummy)
+{
+	return enable_default(gart, accel, table_offset, dummy, table_offset, 0);
+}
+
+int rdn_gart_enable_with_scratch(struct rdn_gart *gart, struct rdn_accel *accel,
+				 uint32_t table_offset, uint64_t dummy,
+				 uint32_t default_offset)
+{
+	if (!gart || !scratch_valid(accel, table_offset, dummy, default_offset))
+		return -EINVAL;
+	return enable_default(gart, accel, table_offset, dummy, default_offset, 1);
 }
 
 int rdn_gart_resume(struct rdn_gart *gart)
@@ -127,6 +183,9 @@ int rdn_gart_resume(struct rdn_gart *gart)
 	    accel->aperture_size < RDN_GART_TABLE_BYTES ||
 	    table_offset > accel->aperture_size - RDN_GART_TABLE_BYTES)
 		return -EINVAL;
+	if (gart->separate_default &&
+	    !scratch_valid(accel, table_offset, dummy, gart->default_offset))
+		return -EINVAL;
 	vram_end = accel->vram_base + accel->vram_size - 1;
 	if (accel->vram_base < RDN_GART_GPU_START +
 	    (uint64_t)RDN_GART_PAGES * RDN_GART_PAGE_SIZE &&
@@ -140,7 +199,8 @@ int rdn_gart_resume(struct rdn_gart *gart)
 	rdn_wreg(card, MC_VM_SYSTEM_APERTURE_LOW_ADDR, (uint32_t)(accel->vram_base >> 12));
 	rdn_wreg(card, MC_VM_SYSTEM_APERTURE_HIGH_ADDR, (uint32_t)(vram_end >> 12));
 	rdn_wreg(card, MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR,
-		 (uint32_t)(rdn_vram_addr(accel, table_offset) >> 12));
+		 (uint32_t)(rdn_vram_addr(accel,
+			gart->separate_default ? gart->default_offset : table_offset) >> 12));
 
 	/* Setup L2 cache */
 	rdn_wreg(card, VM_L2_CNTL, ENABLE_L2_CACHE | ENABLE_L2_FRAGMENT_PROCESSING |

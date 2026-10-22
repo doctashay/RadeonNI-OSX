@@ -304,15 +304,6 @@ bool rdn_output_is_duallink(struct rdn_card *card, const struct rdn_mode *mode)
 	        out->connector_id == CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_D);
 }
 
-bool rdn_output_mode_supported(struct rdn_card *card, const struct rdn_mode *mode,
-			       bool hdmi)
-{
-	if (mode->clock > RDN_MODE_MAX_CLOCK)
-		return false;
-	return card_output(card)->displayport || mode->clock <= 165000 ||
-	       (!hdmi && rdn_output_is_duallink(card, mode));
-}
-
 /*
  * radeon_atom_pick_pll() for DCE5: the DCPLL clocks every DisplayPort link
  * when the board has no external clock for that, as this one has not.
@@ -1392,7 +1383,8 @@ int rdn_modeset(struct rdn_card *card, const struct rdn_mode *mode,
 	struct rdn_pll pll;
 	int r;
 
-	if (!rdn_output_mode_supported(card, mode, hdmi))
+	if (!dp && mode->clock > 165000 &&
+	    (hdmi || !rdn_output_is_duallink(card, mode) || mode->clock > 330000))
 		return -EINVAL;
 	if (rdn_output_is_duallink(card, mode))
 		rdn_log(card->os, RDN_LOG_INFO,

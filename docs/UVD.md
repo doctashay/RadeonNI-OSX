@@ -8,6 +8,158 @@ PowerVLC module and the QuickTime component (the consumers of `rdnvd.h`), field 
 kext. Older sections below are the paper check and the failed first attempts, kept for the record; the journal
 (`docs/JOURNAL.md`, 2026-10-18 and 2026-10-19) has the whole story. See also `docs/LEOPARD-VIDEO-DECODE.md`.
 
+## 2026-10-22: reconciled clients and GPU-output candidate
+
+This checkout reconciles the Aurora graphics/UVD work with upstream `cc3b943`.
+The register bring-up history below remains useful; the interfaces here describe
+this matched kernel and GL build. The native Turks packing probe now passes
+exact pixels, source guards and GL state preservation. The initial browser run
+failed at first-frame representation selection before GLD packing. The later
+correction and measured browser results are recorded below; packing tests alone
+do not establish a playback speedup.
+
+### Surface restoration and current native check
+
+The first reconciliation omitted the tested `RadeonNISurface.cpp/.h` backing
+changes;
+upstream had changed neither file since the common base. Restoring that delta
+recovers caller-memory backing, the compositor surface admission exception,
+and validated lock/fence handling. Legacy GL `readLock` still maps the checked
+read-only aperture; this restoration does not add CP DMA to that path.
+
+Seven extracted class-state scenarios passed on host, big-endian QEMU and
+sanitizer builds, with native SDK compilation and an independent 139-path
+source audit. After reboot at epoch 1792692400, kernel `78f2c2de90fe...` and
+matched GL `54a8704b1449...` were verified, with UVD ready and error 0. The
+native packing probe again matched all 4,535,634 bytes, source guards and GL
+state, without allocator warnings. Browser framework `82f71bfa50d5...` then
+passed a 720p smoke check: `RadeonUvdVideoDecoder`, GPU texture delivery and
+completed producer retirement, with a stable separate GPU process and clean
+exit. Subsequent software, SHMEM and GPU-output runs matched compositor RGBA
+exactly at 1 s for both 720p and 1080p sources, within a 1280x720 capture. The
+1080p source was scaled; this is not full-resolution decode or scanout proof.
+The broader lifecycle checks and matched measurements below subsequently completed.
+
+Evidence under `h264-validation-20261022`: `upstream-reconciliation/`
+`surface-backing-restoration/manifest.json`, `completeness-audit/final-review.json`,
+`surface-boot-verification.json`, `native-gpu-pixels-surface-restored.json`, and
+`gpu-delivery-browser-work/surface-smoke-1815/results.json` and
+`gpu-delivery-browser-work/surface-pixels-1815/results.json`.
+
+### Matched browser results after Surface restoration
+
+All twelve measurements completed on kernel `78f2c2de90fe...`, GL
+`54a8704b1449...` and browser framework
+`82f71bfa50d59b2c5d05e5c4d6cdd016968e73c1e1b188c724204cb718b7a332`.
+These measurements belong to that package, not the later UI-only package.
+Separate GPU processes remained enabled. Pixel checks and seek/loop,
+concurrent software fallback, release/reacquire and clean-exit checks passed.
+
+At 1080p30 all modes sustained about 30 video callbacks/s with zero drops.
+Only repeat 2 qualifies for the CPU comparison: each mode's first repeat lost
+an owned utility process. Core equivalents are cumulative CPU seconds divided
+by the sampled wall interval; Aurora sums browser/utility, renderer and GPU.
+
+| Mode | Aurora cores | Including WindowServer |
+| --- | ---: | ---: |
+| Software | 1.42034 | 1.50008 |
+| UVD + SHMEM | 1.21106 | 1.29479 |
+| UVD + GPU textures | 0.51734 | 0.59409 |
+
+GPU delivery used 63.6% less Aurora CPU than software and 57.3% less than SHMEM
+in this one qualified pair. This is a bounded result, not a confidence interval.
+The modes ran sequentially; endpoint sampling cannot count short-lived processes.
+
+Across the two 1080p60 trials, software averaged 1.000x playback and 54.89 video
+callbacks/s, SHMEM 0.519x and 28.70/s, and GPU delivery 0.667x and 37.04/s.
+Neither UVD path met 60 fps; lower CPU at those unequal work rates is not an
+efficiency comparison. Callbacks are not physical scanout measurements.
+The target still serializes decode through packing and lease retirement.
+Historical 18-19 ms UVD command/fence wall time includes sleeping polls and
+submission work; it is not a physical-engine throughput measurement.
+
+Evidence: `gpu-delivery-benchmarks/surface-ab-1820/results.json` and its
+`independent-review.json`, plus
+`gpu-delivery-browser-work/surface-lifetime-1818/results.json`, under the
+validation directory. No default in-process GPU mode was introduced.
+
+### Final package and normal-app verification
+
+Framework `eb539aafcc56a4b636eddeadfb6f2fee0b85ed07c239b4cec50b2b719161ac67`
+adds a UI-only change to the measured package: 42 of 43 frozen inputs match,
+including all video inputs. Its own smoke, four exact compositor-pixel
+comparisons and lifecycle checks passed, with clean 10-second shutdown grace
+checks and a visually checked native desktop. The earlier CPU/throughput
+measurements remain attributed to framework `82f71bfa...`, not this rebuild.
+
+The ordinary external-volume app already matched all 322 candidate members.
+Its existing `AuroraReleaseNotes.txt` was preserved; no app replacement was
+needed. The existing profile launched successfully as browser 1707 and separate
+GPU 1718, with only the app and YouTube URL in argv. Records are
+`gpu-delivery-browser-work/gpu-delivery-final-ui-20261022/runtime-gate.json`,
+`normal-app-observed-manifest.json` and `normal-launch.json` in that directory.
+This launch record verifies identity and startup, not a new playback benchmark.
+
+### Graphics user-client compatibility
+
+`hw/rdn_user.h` preserves the upstream `rdn1` selector prefix (0-31). The unified
+`rdn2` client accepts that prefix and appends these selectors:
+
+| Selector | Operation |
+| --- | --- |
+| 32 | `GART_BIND64` |
+| 33 | `SURFACE_BACKING` |
+| 34 | `SURFACE_QUERY` |
+| 35 | `UVD_DIAGNOSTIC_INFO` |
+| 36 | `UVD_DIAGNOSTIC_INIT` |
+| 37 | `UVD_FIXTURE_RUN` |
+| 38 | `UVD_FIXTURE_READ` |
+
+Mesa opens `rdn2`. The earlier Aurora WIP used a different `rdn2` table: deploy
+the reconciled kernel and GL bundle together, never mix those versions. Raw
+Mesa UVD and typed video sessions share one UVD core. Ownership is claimed
+before raw initialization/submission; typed CREATE rejects a raw owner, and
+an active guarded session excludes raw reset or mode changes. Failed waits
+must stop dependent submissions and retain storage whose completion is unknown.
+
+### Typed GPU-output lease
+
+The separate `rdnv` ABI in `hw/rdn_video.h` keeps QUERY/CREATE/DECODE/RELEASE/DESTROY
+at selectors 0-4 and appends DECODE_GPU (5), ACQUIRE_GPU (6), and RETIRE_GPU (7).
+Wire fields are fixed-width, in CPU byte order, with no user pointers. QUERY
+adds `RDN_VIDEO_CAP_GPU_OUTPUT` only when the existing readiness gate passes
+and the framebuffer personality has `EnableUVDGPUOutput=true`; absent that
+property, GPU output is not advertised. Production readiness still requires
+`EnableUVDSessions`, `UVDValidatedAPI=1`, and a healthy initialized engine.
+CREATE must explicitly request `RDN_VIDEO_CREATE_GPU_OUTPUT`.
+
+There is one target lease per stream. DECODE_GPU completes the UVD fence and
+feedback checks, then copies only the twelve 4 KiB guard pages (48 KiB) through
+CP DMA for CPU validation. It returns an opaque token bound to the creating
+video connection. ACQUIRE_GPU accepts that token once and resolves the owned
+VRAM extent, pitch, coded dimensions and top/bottom field offsets. No caller
+supplies a GPU address. Another decode is busy while the producer or importer
+holds the target.
+
+`gld/rdn_video_pack.h` defines the 96-byte version-1 GL bridge request.
+`OSMesaPackNV12Store` uses an isolated Gallium context and two fullscreen draws
+to weave the fields into existing R8 and RG8 textures. UV is fetched as adjacent
+R8 bytes, preserving U/V order without host-endian 16-bit interpretation. The
+importer retires only after checked GPU completion or a proven pre-submit
+failure; the producer retires its lease separately. The target becomes reusable
+only after both retire. A pending completion or close with an active importer
+quarantines the source, destination references and required context/device state.
+
+This path avoids full-frame CPU readback, CPU weaving and texture reupload; it
+still performs GPU copies and retains bounded CPU bookkeeping/staging storage.
+The existing CPU-output path remains available. Softpipe tests matched 4,535,634
+Y/UV bytes across four sizes, including odd chroma field height, and checked GL
+state preservation. The same public-wrapper probe passed all 4,535,634 bytes
+on native Turks with clean stderr after restricting the executable's exports
+to keep its static C++ runtime separate from Leopard's runtime. The kernel and
+GL driver were unchanged for that rerun. The Surface restoration and subsequent
+browser checks above record the later cross-context, lifetime and playback results.
+
 ## What it takes (found by bisecting radeon's own register stream on a card we POSTed)
 
 1. **Video memory below 4 GB**: `rdn_mc_relocate(card, 0)` (`hw/rdn_mc.c`; radeon's `evergreen_mc_stop`,

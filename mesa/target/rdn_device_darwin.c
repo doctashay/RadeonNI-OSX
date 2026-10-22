@@ -818,7 +818,7 @@ struct rdn_device *rdn_device_open(void)
 		fprintf(stderr, "rdn: no %s service\n", RDN_UC_SERVICE_CLASS);
 		goto fail;
 	}
-	kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE, &d->conn);
+	kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE_V2, &d->conn);
 	if (has_u4_pcie_parent(service))
 		d->base.info.cp_dma_gtt_copy_max_bytes = 128;
 	IOObjectRelease(service);

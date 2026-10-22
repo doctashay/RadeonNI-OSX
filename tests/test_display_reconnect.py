@@ -32,12 +32,8 @@ int rdn_output_detect(rdn_card *card, uint8_t *edid) {
 int rdn_edid_modes(const uint8_t *, int, rdn_mode *out, int, int *pref) {
     memset(out, 0, sizeof(*out));
     out[0].hdisplay = 800; out[0].vdisplay = 600;
-    out[1].hdisplay = 2560; out[1].vdisplay = 1600; out[1].clock = 268000;
     *pref = 0;
-    return 2;
-}
-bool rdn_output_mode_supported(rdn_card *, const rdn_mode *mode, bool) {
-    return mode->clock <= 165000;
+    return 1;
 }
 class RadeonNI {
 public:
@@ -49,7 +45,6 @@ public:
     UInt32 fSurfaceBytes = 1920 * 1080 * 4, fCurrentDepth = 0;
     int fEdidLen = 128, properties = 0;
     bool fModeSet = true, fConnected = false;
-    bool useHDMI() { return false; }
     void describeFb(const rdn_mode *mode, int, rdn_fb *fb) {
         fb->pitch_pixels = mode->hdisplay; fb->height = mode->vdisplay;
     }

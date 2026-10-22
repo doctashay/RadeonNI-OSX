@@ -350,15 +350,10 @@ static int rdn_cp_resume(struct rdn_accel *accel)
  * Fences
  */
 
-int rdn_fence_emit(struct rdn_accel *accel, uint32_t *seq)
+static void rdn_fence_emit_reserved(struct rdn_accel *accel, uint32_t *seq)
 {
 	uint32_t cp_coher_cntl = PACKET3_TC_ACTION_ENA | PACKET3_VC_ACTION_ENA |
 		PACKET3_SH_ACTION_ENA | PACKET3_FULL_CACHE_ENA;
-	int r;
-
-	r = rdn_ring_begin(accel, 13);
-	if (r)
-		return r;
 	accel->fence_emitted++;
 	/* flush read cache */
 	rdn_ring_emit(accel, PACKET3(PACKET3_SURFACE_SYNC, 3));
@@ -379,6 +374,15 @@ int rdn_fence_emit(struct rdn_accel *accel, uint32_t *seq)
 	rdn_ring_commit(accel);
 	if (seq)
 		*seq = accel->fence_emitted;
+}
+
+int rdn_fence_emit(struct rdn_accel *accel, uint32_t *seq)
+{
+	int r = rdn_ring_begin(accel, 13);
+
+	if (r)
+		return r;
+	rdn_fence_emit_reserved(accel, seq);
 	return 0;
 }
 
@@ -444,15 +448,10 @@ int rdn_fence_wait(struct rdn_accel *accel, uint32_t seq, uint32_t timeout_ms)
 	return 0;
 }
 
-int rdn_ib_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
-		  uint32_t *seq)
+static void rdn_ib_emit_reserved(struct rdn_accel *accel, uint64_t addr,
+				 uint32_t words)
 {
 	uint32_t next_rptr;
-	int r;
-
-	r = rdn_ring_begin(accel, 9);
-	if (r)
-		return r;
 
 	/* set to DX10/11 mode */
 	rdn_ring_emit(accel, PACKET3(PACKET3_MODE_CONTROL, 0));
@@ -473,8 +472,49 @@ int rdn_ib_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
 	rdn_ring_emit(accel, (uint32_t)(addr >> 32) & 0xFF);
 	rdn_ring_emit(accel, words);
 	rdn_ring_commit(accel);
+}
 
+int rdn_ib_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
+		  uint32_t *seq)
+{
+	int r = rdn_ring_begin(accel, 9);
+
+	if (r)
+		return r;
+	rdn_ib_emit_reserved(accel, addr, words);
 	return rdn_fence_emit(accel, seq);
+}
+
+int rdn_ib_try_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
+		     uint32_t *seq)
+{
+	const uint32_t need = ((9u + RDN_RING_ALIGN_MASK) & ~RDN_RING_ALIGN_MASK) +
+		((13u + RDN_RING_ALIGN_MASK) & ~RDN_RING_ALIGN_MASK);
+	uint32_t rptr, free_words;
+
+	if (!accel || !accel->ready || !accel->card || !accel->card->os ||
+	    !accel->card->os->mmio_read32 || !accel->card->os->mmio_write32 ||
+	    !accel->aperture || ((uintptr_t)accel->aperture & 3) ||
+	    accel->ring_words <= need ||
+	    (accel->ring_words & (accel->ring_words - 1)) ||
+	    (accel->ring_offset & 3) || accel->ring_offset > accel->aperture_size ||
+	    accel->ring_words > (accel->aperture_size - accel->ring_offset) / 4 ||
+	    accel->wptr >= accel->ring_words || (accel->wptr & RDN_RING_ALIGN_MASK) ||
+	    !words || (addr & 3) || addr >= (1ull << 40) ||
+	    (uint64_t)words * 4 > (1ull << 40) - addr)
+		return -EINVAL;
+
+	rptr = rdn_rreg(accel->card, CP_RB_RPTR);
+	if (rptr >= accel->ring_words)
+		return -EINVAL;
+	free_words = (rptr - accel->wptr - 1) & (accel->ring_words - 1);
+	if (free_words < need)
+		return -EBUSY;
+
+	/* Reserve both commits before publishing either; the caller holds the ring lock. */
+	rdn_ib_emit_reserved(accel, addr, words);
+	rdn_fence_emit_reserved(accel, seq);
+	return 0;
 }
 
 /*
@@ -485,6 +525,16 @@ int rdn_accel_init(struct rdn_accel *accel, struct rdn_card *card,
 		   volatile void *aperture, uint32_t aperture_size,
 		   const struct rdn_accel_fw *fw,
 		   uint32_t ring_offset, uint32_t ring_bytes, bool swapped)
+{
+	return rdn_accel_init_hook(accel, card, aperture, aperture_size, fw,
+				   ring_offset, ring_bytes, swapped, NULL, NULL);
+}
+
+int rdn_accel_init_hook(struct rdn_accel *accel, struct rdn_card *card,
+			volatile void *aperture, uint32_t aperture_size,
+			const struct rdn_accel_fw *fw,
+			uint32_t ring_offset, uint32_t ring_bytes, bool swapped,
+			void (*before_resume)(void *), void *cookie)
 {
 	uint32_t fb_location;
 	int r;
@@ -521,6 +571,8 @@ int rdn_accel_init(struct rdn_accel *accel, struct rdn_card *card,
 		rdn_log(card->os, RDN_LOG_ERROR, "CP microcode missing or of the wrong size");
 		return r;
 	}
+	if (before_resume)
+		before_resume(cookie);
 	return rdn_cp_resume(accel);
 }
 

@@ -18,7 +18,7 @@ int main(int argc, char **argv)
 
 	if (!service)
 		return 1;
-	kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE, &conn);
+	kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE_V2, &conn);
 	if (kr)
 		return 1;
 	{
@@ -58,7 +58,7 @@ int main(int argc, char **argv)
 			continue;
 		if (close_each) {
 			IOServiceClose(conn);
-			kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE, &conn);
+			kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE_V2, &conn);
 		} else {
 			kr = IOConnectMethodScalarIScalarO(conn, RDN_UC_SURFACE_BUFFER,
 				5, 0, id, 0xffffffffU, 0, 0, 0);

@@ -32,8 +32,10 @@ CFLAGS_UPSTREAM = $(CFLAGS_COMMON) -Wno-sign-compare -Wno-type-limits \
 
 HW_OBJS   = hw/rdn_uvd.o hw/rdn_gart.o hw/rdn_mc.o hw/rdn_watermark.o hw/rdn_pm.o hw/rdn_cursor.o hw/rdn_mem.o hw/rdn_gpu.o hw/rdn_cp.o hw/rdn_blit.o hw/rdn_selftest.o hw/rdn_pattern.o hw/rdn_modeset.o hw/rdn_dp.o hw/rdn_mode.o hw/rdn_dmt.o hw/rdn_i2c.o hw/rdn_post.o hw/rdn_atom.o hw/atom/atom.o
 HW_HDRS   = $(wildcard hw/*.h hw/atom/*.h hw/linux/*.h)
+HW_OBJS  += hw/rdn_mc_layout.o
 
-TESTS     = atom_replay edid_modes i2c_edid board_outputs dp_link modeset_replay accel_replay blit_ops mem_alloc pm_states mc_replay gart_replay handover engine_detect arb_alias uvd_model
+TESTS     = atom_replay edid_modes i2c_edid board_outputs dp_link modeset_replay accel_replay blit_ops mem_alloc pm_states mc_replay gart_replay handover engine_detect arb_alias
+TESTS    += uvd_model uvd_guarded_model mc_layout_model gart_scratch mem_segment mem_range_compat
 
 X86_TESTS = $(addprefix build/x86/,$(TESTS))
 PPC_TESTS = $(addprefix build/ppc/,$(TESTS))
@@ -82,7 +84,20 @@ run_test = \
 	[ "$$x86" = "$$ppc" ] || { echo "FAIL $(1): x86 and ppc differ"; exit 1; }; \
 	case "$$(echo "$$x86" | tail -1)" in PASS*) ;; *) echo "$$x86"; exit 1 ;; esac
 
-test: all
+test-uvd: build/x86/uvd_guarded_model build/ppc/uvd_guarded_model
+	@set -e; $(call run_test,uvd_guarded_model,)
+
+test-mc-layout: build/x86/mc_layout_model build/ppc/mc_layout_model
+	@set -e; $(call run_test,mc_layout_model,)
+
+test-gart-scratch: build/x86/gart_scratch build/ppc/gart_scratch
+	@set -e; $(call run_test,gart_scratch,)
+
+test-mem-segment: build/x86/mem_segment build/ppc/mem_segment build/x86/mem_range_compat build/ppc/mem_range_compat
+	@set -e; $(call run_test,mem_segment,); \
+		$(call run_test,mem_range_compat,)
+
+test: all test-uvd test-mc-layout test-gart-scratch test-mem-segment
 	@if [ ! -f $(VBIOS) ] || [ ! -f $(REF_PHASE) ]; then \
 		echo "SKIP: need $(VBIOS) and $(REF_PHASE)"; \
 	else \
@@ -125,4 +140,4 @@ build/x86/rdn_gltest: mesa/tests/rdn_gltest.c $(MESA_BUILD)/librdngl.so
 clean:
 	rm -rf build/x86 build/ppc
 
-.PHONY: all test clean
+.PHONY: all test test-uvd test-mc-layout test-gart-scratch test-mem-segment clean

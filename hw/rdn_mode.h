@@ -79,8 +79,6 @@ void rdn_output_select(struct rdn_card *card, const struct rdn_output *out);
 
 /* TMDS links required by the selected connector and timing. */
 bool rdn_output_is_duallink(struct rdn_card *card, const struct rdn_mode *mode);
-bool rdn_output_mode_supported(struct rdn_card *card, const struct rdn_mode *mode,
-			       bool hdmi);
 
 /*
  * Find the display: try each output in turn for an EDID and select the

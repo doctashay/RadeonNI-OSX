@@ -25,6 +25,7 @@ extern "C" {
 #include "rdn_cursor.h"
 #include "rdn_i2c.h"
 #include "rdn_mc.h"
+#include "rdn_mc_layout.h"
 #include "rdn_mode.h"
 #include "rdn_pattern.h"
 }
@@ -40,6 +41,12 @@ class RadeonNI : public IOFramebuffer
 public:
 	virtual bool start(IOService *provider);
 	virtual void stop(IOService *provider);
+	virtual bool terminate(IOOptionBits options = 0);
+	virtual bool requestTerminate(IOService *provider, IOOptionBits options);
+	virtual IOReturn newUserClient(task_t task, void *security, UInt32 type,
+				     IOUserClient **handler);
+	virtual IOReturn newUserClient(task_t task, void *security, UInt32 type,
+				     OSDictionary *properties, IOUserClient **handler);
 	virtual unsigned long maxCapabilityForDomainState(IOPMPowerFlags state);
 	virtual unsigned long initialPowerStateForDomainState(IOPMPowerFlags state);
 	virtual unsigned long powerStateForDomainState(IOPMPowerFlags state);
@@ -119,6 +126,8 @@ private:
 	bool fCardReady;
 	RadeonNIAccel *fAccel;
 	bool fModeSet;
+	bool fMCRebaseRequested, fMCProviderLocked, fMCProviderOpen;
+	bool fMCConsoleSuspended, fMCRebased, fMCFatal;
 
 	struct rdn_os fOS;
 	struct rdn_card fCard;
@@ -191,6 +200,10 @@ private:
 	bool biosFromPersonality();
 	void compareWithPersonality();
 	bool bringUp();
+	bool claimColdLayout();
+	bool rebaseColdLayout(int handover, bool unpostedEntry);
+	bool resumeColdConsole(bool newLayout);
+	bool failedColdStart(IOService *provider);
 	void checkFirmwareHook();
 	const struct rdn_mode *modeForID(IODisplayModeID id);
 	void describeFb(const struct rdn_mode *mode, IOIndex depth,

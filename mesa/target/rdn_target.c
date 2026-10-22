@@ -70,7 +70,6 @@ static void release_store(struct rdn_device *dev, void *reference)
    pthread_mutex_unlock(&external_lock);
 }
 
-
 #ifdef RDN_TARGET_SOFT
 #include "tests/rdn_soft.h"
 /* The screen is the software one, with ordinary memory for video memory. */

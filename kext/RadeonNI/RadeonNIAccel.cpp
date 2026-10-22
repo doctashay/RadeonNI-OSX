@@ -11,9 +11,11 @@
 #include <libkern/libkern.h>
 #include <stdarg.h>
 #include <IOKit/graphics/IOGraphicsInterfaceTypes.h>
+#include <sys/errno.h>
 
 #include "RadeonNI.h"
 #include "RadeonNIAccel.h"
+#include "RadeonNIVideo.h"
 #include "RadeonNISurface.h"
 #include "rdn_uvd_reg.h"
 #include "rdn_mc.h"
@@ -24,6 +26,10 @@ static inline void rdnStoreBarrier(void)
 #if defined(__ppc__) || defined(__ppc64__)
 	__asm__ __volatile__("sync" : : : "memory");
 #endif
+}
+
+extern "C" {
+#include "rdn_mc_layout.h"
 }
 
 OSDefineMetaClassAndStructors(RadeonNIAGPShim, IOAGPDevice)
@@ -73,6 +79,8 @@ OSDefineMetaClassAndStructors(RadeonNIAccel, IOAccelerator)
 
 RadeonNIAccel *RadeonNIAccel::withFramebuffer(RadeonNI *fb, IOService *provider)
 {
+	if (provider->getProperty(RDN_UVD_REBOOT_PROPERTY))
+		return 0;
 	RadeonNIAccel *accel = new RadeonNIAccel;
 	char path[512];
 	int len = sizeof(path);
@@ -144,7 +152,24 @@ RadeonNIAccel *RadeonNIAccel::withFramebuffer(RadeonNI *fb, IOService *provider)
 		return 0;
 	}
 	accel->fFramebuffer = fb;
+	accel->fUvdProvider = provider;
 	accel->fLock = IOLockAlloc();
+	accel->fUvdLock = IOLockAlloc();
+	accel->fVideoSession = 0;
+	accel->fVideoEpoch = 0;
+	accel->fVideoCpuBytes = 0;
+	accel->fVideoBusy = false;
+	if (!accel->fLock || !accel->fUvdLock) {
+		accel->detach(parent);
+		accel->release();
+		return 0;
+	}
+	accel->fRetiring = false;
+	accel->fUvdColdAttempted = false;
+	bzero(&accel->fUvdFixture, sizeof(accel->fUvdFixture));
+	accel->fUvdFixtureOffset = accel->fUvdFixtureBytes = 0;
+	accel->fUvdFixtureSnapshot = 0;
+	accel->fEngineUp = false;
 	accel->setName("RadeonNIAccel");
 	accel->setProperty("IOMatchCategory", "IOAccelerator");
 	accel->setProperty("IOGLBundleName", GL_BUNDLE_NAME);
@@ -164,7 +189,18 @@ RadeonNIAccel *RadeonNIAccel::withFramebuffer(RadeonNI *fb, IOService *provider)
 	accel->fSurfaceGate = fb->getProperty("SurfaceGate") == kOSBooleanTrue;
 	accel->setProperty("BackingSurfaces", fb->getProperty("BackingSurfaces") == kOSBooleanTrue);
 	accel->fEngineUp = accel->startEngine();
+	OSNumber *videoAPI = OSDynamicCast(OSNumber, fb->getProperty("UVDValidatedAPI"));
+	if (accel->fEngineUp && videoAPI && videoAPI->unsigned32BitValue() == RDN_VIDEO_API_VERSION &&
+	    fb->getProperty("EnableUVDSessions") == kOSBooleanTrue && accel->fUvd.prepared) {
+		UInt32 status = 0;
+		IOReturn result = accel->uvdDiagnosticInit(&status);
+		IOLog("RadeonNI: video startup result 0x%x status 0x%lx\n", result, (unsigned long)status);
+	}
 	accel->setProperty("RadeonNIEngine", accel->fEngineUp);
+	accel->setProperty("RadeonNIUVDDiagnosticVersion",
+		(UInt64)RDN_UVD_DIAGNOSTIC_VERSION, 32);
+	accel->setProperty("RadeonNIUVDFixtureVersion",
+		(UInt64)RDN_UVD_FIXTURE_VERSION, 32);
 
 	/*
 	 * The 2D accelerator plug-in the system loads for the framebuffer
@@ -213,6 +249,11 @@ void *RadeonNIAccel::copyFirmware(const char *key, UInt32 *size)
 
 bool RadeonNIAccel::startEngine(void)
 {
+	typedef char ScratchAfterScreenSlots[
+		SCREEN_OFFSET + kScreenSlots * SCREEN_SLOT_BYTES <=
+		RDN_MC_LAYOUT_SCRATCH_OFFSET ? 1 : -1];
+	typedef char ScratchBeforeHeap[
+		RDN_MC_LAYOUT_SCRATCH_OFFSET + 4096u <= HEAP_OFFSET ? 1 : -1];
 	struct rdn_accel_fw fw;
 	UInt32 pfpSize = 0, meSize = 0, apertureSize = fFramebuffer->apertureSize();
 	int r, keepBootClocks = 0, gart = 1;
@@ -230,16 +271,22 @@ bool RadeonNIAccel::startEngine(void)
 
 	if (!fFramebuffer->aperture() || apertureSize <= HEAP_OFFSET)
 		return false;
-	r = rdn_accel_init(&fAccel, fFramebuffer->card(), fFramebuffer->aperture(),
-			   apertureSize, &fw, RING_OFFSET, RING_BYTES,
-			   RDN_BIG_ENDIAN);
-	if (r) {
-		IOLog("RadeonNI: the 3D engine did not start (%d)\n", r);
-		return false;
-	}
 	if (rdn_mem_init(&fMem, fFramebuffer->os(), HEAP_OFFSET,
 			 apertureSize - HEAP_OFFSET))
 		return false;
+	const bool coldUvd =
+		fFramebuffer->getProperty("EnableUVDDiagnostics") == kOSBooleanTrue &&
+		fFramebuffer->getProperty("UVDDiagnosticsBeforeCP") == kOSBooleanTrue;
+	r = rdn_accel_init_hook(&fAccel, fFramebuffer->card(), fFramebuffer->aperture(),
+			   apertureSize, &fw, RING_OFFSET, RING_BYTES,
+			   RDN_BIG_ENDIAN, coldUvd ? prepareUvdBeforeCP : 0, this);
+	if (r) {
+		IOLog("RadeonNI: the 3D engine did not start (%d)\n", r);
+		if (fUvd.prepared)
+			rdn_uvd_fini(&fUvd);
+		rdn_mem_fini(&fMem);
+		return false;
+	}
 	/*
 	 * The card has more video memory than its aperture shows the CPU.
 	 * The rest is for what only the GPU touches.
@@ -346,7 +393,11 @@ void RadeonNIAccel::startGart(void)
 	fFramebuffer->device()->setBusMasterEnable(true);
 
 	IOLockLock(fLock);
-	r = rdn_gart_enable(&fGart, &fAccel, fGartTable, dummyBus);
+	if (fFramebuffer->getProperty("MCLayoutScratchVerified") == kOSBooleanTrue)
+		r = rdn_gart_enable_with_scratch(&fGart, &fAccel, fGartTable,
+						dummyBus, RDN_MC_LAYOUT_SCRATCH_OFFSET);
+	else
+		r = rdn_gart_enable(&fGart, &fAccel, fGartTable, dummyBus);
 	if (!r) {
 		rdn_gart_set_page(&fGart, 0, testBus);
 		rdn_gart_flush(&fGart);
@@ -483,6 +534,20 @@ void RadeonNIAccel::gartUnbindAll(void *owner)
 			gartUnbind(fGartBound[slot].offset, owner);
 }
 
+void RadeonNIAccel::retainClientMemory(const UInt32 *offsets,UInt32 count,void *owner)
+{
+ if(!owner) return;
+ IOLockLock(fLock);
+ for(UInt32 i=0;i<kMaxGartBindings;++i)
+  if(fGartBound[i].memory && fGartBound[i].owner==owner) fGartBound[i].owner=0;
+ for(UInt32 i=0;i<fShapeCapacity;++i) {
+  if(fShapes[i].used && fShapes[i].owner==owner) bzero(&fShapes[i],sizeof(fShapes[i]));
+  for(UInt32 j=0;fShapes[i].used && j<count;++j)
+   if(fShapes[i].bufWidth && fShapes[i].bufOffset==offsets[j]) bzero(&fShapes[i],sizeof(fShapes[i]));
+ }
+ IOLockUnlock(fLock);
+}
+
 void RadeonNIAccel::releaseClientMemory(const UInt32 *offsets, UInt32 count,
                                          void *owner)
 {
@@ -513,11 +578,7 @@ void RadeonNIAccel::releaseClientMemory(const UInt32 *offsets, UInt32 count,
 
 	if (!fenceWait(fence, 10000)) {
 		/* Keep GPU-visible memory pinned until reboot after a hang. */
-		IOLockLock(fLock);
-		for (i = 0; i < kMaxGartBindings; i++)
-			if (fGartBound[i].memory && fGartBound[i].owner == owner)
-				fGartBound[i].owner = 0;
-		IOLockUnlock(fLock);
+		retainClientMemory(offsets,count,owner);
 		IOLog("RadeonNI: client cleanup fence %lu timed out; retaining GPU memory\n", fence);
 		return;
 	}
@@ -526,8 +587,18 @@ void RadeonNIAccel::releaseClientMemory(const UInt32 *offsets, UInt32 count,
 	gartUnbindAll(owner);
 }
 
+void RadeonNIAccel::prepareToRetire(void)
+{
+	IOLockLock(fLock);
+	fRetiring = true;
+	IOLockUnlock(fLock);
+}
+
 void RadeonNIAccel::retire(IOService *provider)
 {
+	prepareToRetire();
+	videoClose(0);
+	releaseUvdFixtureSnapshot();
 	if (fFramebuffer) {
 		fFramebuffer->removeProperty(kIOAccelTypesKey);
 		fFramebuffer->removeProperty(kIOAccelIndexKey);
@@ -535,7 +606,10 @@ void RadeonNIAccel::retire(IOService *provider)
 	}
 	terminate(kIOServiceRequired | kIOServiceSynchronous);
 	if (fEngineUp) {
+		IOLockLock(fUvdLock);
 		IOLockLock(fLock);
+		if (fUvdBytes)
+			rdn_uvd_fini(&fUvd);
 		if (fUvdUp) {
 			rdn_uvd_fini(&fUvd);
 			fUvdUp = false;
@@ -558,6 +632,7 @@ void RadeonNIAccel::retire(IOService *provider)
 		fMoveBytes = 0;
 		fEngineUp = false;
 		IOLockUnlock(fLock);
+		IOLockUnlock(fUvdLock);
 	}
 	if (fAncestor) {
 		detach(fAncestor);
@@ -579,10 +654,220 @@ void RadeonNIAccel::retire(IOService *provider)
 		fShapes = 0;
 		fShapeCapacity = 0;
 	}
+	IOLockLock(fUvdLock);
 	if (fLock) {
 		IOLockFree(fLock);
 		fLock = 0;
 	}
+	IOLockUnlock(fUvdLock);
+}
+
+void RadeonNIAccel::free(void)
+{
+	if (fLock) IOLockFree(fLock);
+	if (fUvdLock) IOLockFree(fUvdLock);
+	super::free();
+}
+
+void RadeonNIAccel::uvdDiagnosticInfo(struct rdn_user_uvd_diagnostic *info)
+{
+	IOLockLock(fUvdLock);
+	IOLockLock(fLock);
+	bzero(info, sizeof(*info));
+	info->version = RDN_UVD_DIAGNOSTIC_VERSION;
+	if (!fRetiring) {
+		if (fFramebuffer->getProperty("EnableUVDDiagnostics") == kOSBooleanTrue)
+			info->flags |= RDN_UVD_DIAGNOSTIC_ALLOWED;
+		OSData *firmware = OSDynamicCast(OSData, fFramebuffer->getProperty("FW_UVD"));
+		if (firmware && firmware->getLength())
+			info->flags |= RDN_UVD_DIAGNOSTIC_FIRMWARE;
+		OSData *rlc = OSDynamicCast(OSData, fFramebuffer->getProperty("FW_RLC"));
+		if (rlc && rlc->getLength() == 3072)
+			info->flags |= RDN_UVD_DIAGNOSTIC_RLC_FIRMWARE;
+	}
+	info->state = fUvdState;
+	info->last_status = fUvdStatus;
+	info->last_error = fUvdError;
+	info->reserved_bytes = fUvdBytes;
+	IOLockUnlock(fLock);
+	IOLockUnlock(fUvdLock);
+}
+
+void RadeonNIAccel::prepareUvdBeforeCP(void *cookie)
+{
+	RadeonNIAccel *accel = static_cast<RadeonNIAccel *>(cookie);
+	UInt32 status = 0;
+
+	accel->fUvdColdAttempted = true;
+	IOReturn result = accel->uvdDiagnosticInitImpl(&status, true);
+	IOLog("RadeonNI: UVD preparation before CP: result 0x%x, prepared %u, reserved %lu\n",
+	      (unsigned)result, accel->fUvd.prepared ? 1u : 0u,
+	      (unsigned long)accel->fUvdBytes);
+}
+
+IOReturn RadeonNIAccel::uvdDiagnosticInit(UInt32 *status)
+{
+	return uvdDiagnosticInitImpl(status, false);
+}
+
+IOReturn RadeonNIAccel::uvdDiagnosticInitImpl(UInt32 *status, bool prepareOnly)
+{
+	const UInt32 ringBytes = 4096;
+	UInt32 fwSize = 0, rlcSize = 0, vcpuBytes = 0, bytes, offset, waited;
+	uint32_t refClock = 0, fence = 0;
+	uint64_t allocationOffset = 0;
+	void *firmware = 0;
+	void *rlcFirmware = 0;
+	IOReturn result = kIOReturnError;
+	bool startPrepared = false;
+	int r;
+
+	*status = 0;
+	IOLockLock(fUvdLock);
+	IOLockLock(fLock);
+	if (fRetiring || fVideoBusy || fUvdUsers || fUvdLive || (fUvdUp && !fUvd.guarded)) {
+		result = kIOReturnNotReady;
+		goto out;
+	}
+	if (fFramebuffer->getProperty("EnableUVDDiagnostics") != kOSBooleanTrue) {
+		result = kIOReturnNotPermitted;
+		goto out;
+	}
+	if ((!fEngineUp && !prepareOnly) || (fEngineUp && prepareOnly)) {
+		result = kIOReturnNotReady;
+		goto out;
+	}
+	if (fUvdState != RDN_UVD_DIAGNOSTIC_OFF) {
+		*status = fUvdStatus;
+		result = fUvdState == RDN_UVD_DIAGNOSTIC_RING_READY ?
+			kIOReturnSuccess : kIOReturnNotReady;
+		goto out;
+	}
+	if (!prepareOnly && fUvdColdAttempted) {
+		if (!fUvd.prepared || !fUvd.started || fUvd.failed || fUvd.stopped ||
+		    fUvdProvider->getProperty(RDN_UVD_REBOOT_PROPERTY) != kOSBooleanTrue) {
+			result = kIOReturnNotReady;
+			goto out;
+		}
+		startPrepared = true;
+	}
+	if (!startPrepared && fUvdProvider->getProperty(RDN_UVD_REBOOT_PROPERTY)) {
+		result = kIOReturnNotReady;
+		goto out;
+	}
+	if (startPrepared)
+		goto drainGraphics;
+	firmware = copyFirmware("FW_UVD", &fwSize);
+	if (!firmware) {
+		result = kIOReturnNotFound;
+		goto out;
+	}
+	rlcFirmware = copyFirmware("FW_RLC", &rlcSize);
+	if (!rlcFirmware) {
+		result = kIOReturnNotFound;
+		goto out;
+	}
+	if (rlcSize != 3072) {
+		result = kIOReturnBadArgument;
+		goto out;
+	}
+	vcpuBytes = rdn_uvd_vcpu_bytes(fwSize, RDN_UVD_DEFAULT_HANDLES);
+	if (!vcpuBytes || fwSize > (1u << 20) ||
+	    vcpuBytes > UINT32_MAX - ringBytes - RDN_UVD_RING_EXTRA) {
+		result = kIOReturnBadArgument;
+		goto out;
+	}
+	r = rdn_uvd_ref_clock(fAccel.card, &refClock);
+	if (r) {
+		fUvdError = r;
+		goto out;
+	}
+drainGraphics:
+	/* The cold callback runs with ME/PFP halted, before clients are published. */
+	if (!prepareOnly) {
+		r = rdn_fence_emit(&fAccel, &fence);
+		if (r) {
+			fUvdError = r;
+			result = kIOReturnNotReady;
+			goto out;
+		}
+		for (waited = 0; waited < 1000; waited++) {
+			if (rdn_fence_done(&fAccel, fence))
+				break;
+			IOSleep(1);
+		}
+		if (waited == 1000 && !rdn_fence_done(&fAccel, fence)) {
+			fUvdError = -ETIMEDOUT;
+			result = kIOReturnTimeout;
+			goto out;
+		}
+		rdn_hdp_flush(&fAccel);
+	}
+	if (startPrepared) {
+		r = rdn_uvd_start_prepared(&fUvd);
+		goto record;
+	}
+	/* Reserve internal storage while serialized; clients never own these offsets. */
+	bytes = vcpuBytes + ringBytes + RDN_UVD_RING_EXTRA;
+	if (rdn_mem_alloc(&fMem, bytes, 4096, &allocationOffset)) {
+		result = kIOReturnNoMemory;
+		goto out;
+	}
+	if (allocationOffset > fAccel.aperture_size ||
+	    bytes > fAccel.aperture_size - allocationOffset) {
+		rdn_mem_free(&fMem, allocationOffset);
+		result = kIOReturnBadArgument;
+		goto out;
+	}
+	offset = (UInt32)allocationOffset;
+	/* VRAM may remain in use after shutdown; block reuse until reboot. */
+	if (!fUvdProvider->setProperty(RDN_UVD_REBOOT_PROPERTY, true) ||
+	    fUvdProvider->getProperty(RDN_UVD_REBOOT_PROPERTY) != kOSBooleanTrue) {
+		rdn_mem_free(&fMem, offset);
+		result = kIOReturnNoMemory;
+		goto out;
+	}
+	fUvdOffset = offset;
+	fUvdBytes = bytes;
+	if (prepareOnly)
+		r = rdn_uvd_prepare_rlc(&fUvd, &fAccel, refClock,
+			(const uint8_t *)firmware, fwSize, RDN_UVD_DEFAULT_HANDLES,
+			offset, offset + vcpuBytes, ringBytes, 0,
+			(const uint8_t *)rlcFirmware, rlcSize);
+	else
+		r = rdn_uvd_init_rlc(&fUvd, &fAccel, refClock,
+			(const uint8_t *)firmware, fwSize, RDN_UVD_DEFAULT_HANDLES,
+			offset, offset + vcpuBytes, ringBytes, 0,
+			(const uint8_t *)rlcFirmware, rlcSize);
+record:
+	fUvdError = r;
+	fUvdStatus = fUvd.status_snapshot;
+	*status = fUvdStatus;
+	if (!r) {
+		if (!prepareOnly) {
+			fUvdState = RDN_UVD_DIAGNOSTIC_RING_READY;
+			fUvdUp = true; fUvdEpoch = 1; fUvdFlags = 0; fUvdRef=fUvd.ref_freq;
+		}
+		result = kIOReturnSuccess;
+	} else if (rdn_uvd_storage_releasable(&fUvd)) {
+		rdn_mem_free(&fMem, fUvdOffset);
+		fUvdOffset = fUvdBytes = 0;
+		bzero(&fUvd, sizeof(fUvd));
+		fUvdProvider->removeProperty(RDN_UVD_REBOOT_PROPERTY);
+	} else {
+		/* A stopped clock is not proof that DMA completed. Keep storage quarantined. */
+		fUvdState = RDN_UVD_DIAGNOSTIC_FAULTED;
+	}
+	IOLog("RadeonNI: UVD diagnostic init: result %d, status 0x%lx, state %lu\n",
+	      r, (unsigned long)fUvdStatus, (unsigned long)fUvdState);
+out:
+	if (rlcFirmware)
+		IOFree(rlcFirmware, rlcSize);
+	if (firmware)
+		IOFree(firmware, fwSize);
+	IOLockUnlock(fLock);
+	IOLockUnlock(fUvdLock);
+	return result;
 }
 
 IOReturn RadeonNIAccel::newUserClient(task_t owningTask, void *securityID,
@@ -590,6 +875,17 @@ IOReturn RadeonNIAccel::newUserClient(task_t owningTask, void *securityID,
 {
 	RadeonNIUserClient *client;
 
+	if (type == RDN_VIDEO_UC_TYPE) {
+		RadeonNIVideoUserClient *video = new RadeonNIVideoUserClient;
+		if (!video) return kIOReturnNoMemory;
+		if (!video->initWithTask(owningTask, securityID, type) || !video->attach(this)) {
+			video->release(); return kIOReturnError;
+		}
+		if (!video->start(this)) {
+			video->detach(this); video->release(); return kIOReturnError;
+		}
+		*handler = video; return kIOReturnSuccess;
+	}
 	/* The public surface client the window server asks for. */
 	if (type == kIOAccelSurfaceClientType && fSurfaces) {
 		RadeonNISurfaceClient *surface = new RadeonNISurfaceClient;
@@ -609,7 +905,7 @@ IOReturn RadeonNIAccel::newUserClient(task_t owningTask, void *securityID,
 		*handler = surface;
 		return kIOReturnSuccess;
 	}
-	if (type != RDN_UC_TYPE) {
+	if (type != RDN_UC_TYPE && type != RDN_UC_TYPE_V2) {
 		IOLog("RadeonNI: accelerator user client type %lu requested, not ours\n",
 		      (unsigned long)type);
 		return kIOReturnUnsupported;
@@ -738,8 +1034,43 @@ IOReturn RadeonNIAccel::submit(UInt32 offset, UInt32 words, UInt32 *fence)
  * personality carries the firmware (FW_UVD); the block is not touched at
  * start. A failed bring-up may be tried again (with other flags).
  */
+IOReturn RadeonNIAccel::uvdAcquireRaw(bool *claimed)
+{
+ IOLockLock(fUvdLock);
+ IOLockLock(fLock);
+ IOReturn result=kIOReturnSuccess;
+ if(*claimed) goto done;
+ if(fRetiring || fVideoBusy || fUvd.failed || fUvd.prepared || fUvdUsers==UINT32_MAX) {
+  result=kIOReturnBusy; goto done;
+ }
+ if(fUvd.guarded && !fUvd.ready) { result=kIOReturnNotReady; goto done; }
+ if(fUvd.guarded && !fUvdScratch) {
+  uint64_t offset=0, low=fUvd.vcpu_gpu&~((1ull<<28)-1), high=low+(1ull<<28);
+  low=low>fAccel.vram_base?low-fAccel.vram_base:0;
+  high=high>fAccel.vram_base?high-fAccel.vram_base:0;
+  if(high>fAccel.aperture_size) high=fAccel.aperture_size;
+  if(rdn_mem_alloc_in_range(&fMem,4096,4096,low,high,&offset)) {
+   result=kIOReturnNoMemory; goto done;
+  }
+  fUvdScratch=(UInt32)offset;
+  volatile UInt32 *words=(volatile UInt32 *)((UInt8 *)fAccel.aperture+offset);
+  for(unsigned i=0;i<1024;++i) words[i]=0;
+  rdnStoreBarrier();
+ }
+ ++fUvdUsers; *claimed=true;
+done:
+ IOLockUnlock(fLock); IOLockUnlock(fUvdLock);
+ return result;
+}
+
+IOReturn RadeonNIUserClient::claimUvd(void)
+{
+ return fAccel->uvdAcquireRaw(&fUvdUser);
+}
+
 IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 {
+	UInt32 requestedFlags=flags;
 	/*
 	 * No flags: the start that works (docs/UVD.md); other values select the older variants, for experiments. RDN_UVD_F_SEGMENT
 	 * alone asks for that start with the block in a segment beyond the aperture.
@@ -753,8 +1084,6 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	UInt32 nibbles = (flags >> 24) & 0xf;
 
 	/* tests: bits 24 to 27 say which nibbles of UVD_LMI_ADDR_EXT get the segment (0: all) */
-	rdn_uvd_set_ext_nibbles(nibbles ? nibbles : 0xf);
-	rdn_uvd_set_push_via_aperture((flags & RDN_UVD_F_PUSH_APERTURE) != 0);
 	bool noDma = (flags & RDN_UVD_F_NO_DMA) != 0;
 
 	flags &= ~(RDN_UVD_F_SEGMENT | RDN_UVD_F_APERTURE | (7u << RDN_UVD_F_SEGMENT_AT) | (0xfu << 24) | RDN_UVD_F_PUSH_APERTURE | RDN_UVD_F_NO_DMA | RDN_UVD_F_SPLIT);
@@ -768,10 +1097,19 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
 	int r;
 
 	IOLockLock(fLock);
+	if (fVideoBusy || fRetiring || fUvd.failed) { IOLockUnlock(fLock); return kIOReturnBusy; }
+	if (fUvd.guarded) {
+		*status=fUvdStatus;
+		IOReturn result=requestedFlags?kIOReturnUnsupported:fUvd.ready?kIOReturnSuccess:kIOReturnNotReady;
+		IOLockUnlock(fLock); return result;
+	}
+	rdn_uvd_set_ext_nibbles(nibbles ? nibbles : 0xf);
+	rdn_uvd_set_push_via_aperture((requestedFlags & RDN_UVD_F_PUSH_APERTURE) != 0);
+
 	if (fUvdUp && (wantSegment || wantSplit || wantAperture) &&
 	    !(wantSegment ? fUvdSeg && (!force || force == fUvdSeg) :
 	      wantSplit ? fUvdSplit && (!force || force == fUvdSplit) : !fUvdSeg && !fUvdSplit) &&
-	    !fUvdUsers && !fUvdLive) {
+	    fUvdUsers <= 1 && !fUvdLive) {
 		/*
 		 * Asked for the other place and nothing runs: start again there. The fence numbers go on and the epoch changes,
 		 * as at any restart; a program that kept buffers of the old place does not use them again (tests only).
@@ -1014,6 +1352,7 @@ IOReturn RadeonNIAccel::uvdInit(UInt32 flags, UInt32 *status)
  */
 void RadeonNIAccel::uvdRestart(UInt32 level)
 {
+	if (fUvd.guarded || fVideoBusy) return;
 	UInt32 fwSize = 0, fenceBase;
 	void *fw;
 	int r;
@@ -1534,19 +1873,23 @@ UInt32 RadeonNIAccel::uvdFind(const volatile UInt32 *w, UInt32 words, UvdMsg *ms
  * Linux's radeon_uvd_get_destroy_msg(): a message of 0xde4 bytes whose type is 2 and whose third word is the handle,
  * in a stream that only names it. Only for sessions of the epoch the firmware is in.
  */
-void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch)
+bool RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch)
 {
 	UInt32 i;
+	bool safe=true;
+	IOLockLock(fUvdLock);
 
 	IOLockLock(fLock);
-	if (!fUvdUp || !fUvdScratch || (fUvdFlags & RDN_UVD_F_GART) || epoch != fUvdEpoch) {
+	if (fVideoBusy || fUvd.failed || (count && (!fUvdUp || !fUvdScratch || (fUvdFlags & RDN_UVD_F_GART) || epoch != fUvdEpoch))) {
 		IOLockUnlock(fLock);
-		return;
+		IOLockUnlock(fUvdLock);
+		return false;
 	}
 	if (!fUvdClocksUp && count) {
 		fUvdClocksUp = rdn_uvd_wake(&fUvd) == 0;
+		if (!fUvdClocksUp) safe=false;
 	}
-	for (i = 0; i < count; i++) {
+	for (i = 0; safe && i < count; i++) {
 		UInt8 message[64];
 		UInt32 stream[16];
 		uint64_t addr = rdn_vram_addr(&fAccel, fUvdScratch);
@@ -1575,7 +1918,7 @@ void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch
 			if (rdn_vram_put(fAccel.card, fUvdScratch, message, 64) ||
 			    rdn_vram_put(fAccel.card, fUvdScratch + 1024, stream, 64)) {
 				IOLog("RadeonNI: UVD: could not write a program's session end\n");
-				break;
+				safe=false; break;
 			}
 		} else {
 			volatile UInt8 *m = (volatile UInt8 *)fAccel.aperture + fUvdScratch;
@@ -1589,17 +1932,28 @@ void RadeonNIAccel::uvdDestroy(const UInt32 *handles, UInt32 count, UInt32 epoch
 		}
 		if (rdn_uvd_ib_submit(&fUvd, rdn_vram_addr(&fAccel, fUvdScratch + 1024), 16, &seq)) {
 			IOLog("RadeonNI: UVD: could not end a program's session\n");
-			break;
+			safe=false; break;
 		}
 		fUvdLastSeq = seq;
 		fUvdDirty = true;
-		(void)rdn_uvd_fence_wait(&fUvd, seq, 100);
+		IOLockUnlock(fLock);
+		bool completed=uvdFenceWait(seq,1000);
+		IOLockLock(fLock);
+		if (!completed) { safe=false; break; }
 		if (fUvdLive)
 			fUvdLive--;
 	}
-	if (count)
+	if (safe && fUvdLastSeq) {
+		IOLockUnlock(fLock);
+		safe=uvdFenceWait(fUvdLastSeq,1000);
+		IOLockLock(fLock);
+	}
+	if (!safe) { fUvd.failed=true; fUvd.ready=false; fUvdState=RDN_UVD_DIAGNOSTIC_FAULTED; fUvdError=-ETIMEDOUT; }
+	if (count && safe)
 		IOLog("RadeonNI: UVD: ended %lu session(s) a program left\n", (unsigned long)count);
 	IOLockUnlock(fLock);
+	IOLockUnlock(fUvdLock);
+	return safe;
 }
 
 IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UInt32 *handles,
@@ -1608,12 +1962,12 @@ IOReturn RadeonNIAccel::uvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence, UI
 	UvdMsg msgs[kMaxUvdMsgs];
 	UInt32 n;
 
-	if (offset < HEAP_OFFSET || (offset & 3) || !words ||
+	if (offset < HEAP_OFFSET || offset >= fAccel.aperture_size || (offset & 3) || !words ||
 	    words > (fAccel.aperture_size - offset) / 4)
 		return kIOReturnBadArgument;
 	IOLockLock(fLock);
 	/* a block in a segment takes its streams by value (uvdSubmitWords) */
-	if (!fUvdUp || fUvdSeg) {
+	if (!fUvdUp || fUvdSeg || fVideoBusy || fUvd.failed || fRetiring) {
 		IOLockUnlock(fLock);
 		return kIOReturnNotReady;
 	}
@@ -1730,7 +2084,7 @@ IOReturn RadeonNIAccel::uvdSubmitWords(task_t task, UInt32 address, UInt32 words
 		return kIOReturnVMError;
 	}
 	IOLockLock(fLock);
-	if (!fUvdUp || !fUvdSeg) {
+	if (!fUvdUp || !fUvdSeg || fVideoBusy || fUvd.failed || fRetiring) {
 		IOLockUnlock(fLock);
 		IOFree(stream, words * 4);
 		return kIOReturnNotReady;
@@ -1972,6 +2326,7 @@ IOReturn RadeonNIAccel::debugOp(UInt32 op, UInt32 *srbmStatus)
 	IOReturn ret = kIOReturnSuccess;
 
 	IOLockLock(fLock);
+	if (fVideoBusy || fUvd.guarded || fRetiring) { IOLockUnlock(fLock); return kIOReturnBusy; }
 	switch (op) {
 	case 1:
 		rdn_display_hold(fAccel.card, true);
@@ -2061,11 +2416,12 @@ IOReturn RadeonNIAccel::uvdReset(UInt32 *epoch)
 	UInt32 waited = 0;
 
 	IOLockLock(fLock);
+	if (fVideoBusy || fUvd.guarded || fRetiring) { IOLockUnlock(fLock); return kIOReturnBusy; }
 	if (!fUvdUp) {
 		IOLockUnlock(fLock);
 		return kIOReturnNotReady;
 	}
-	while (!rdn_uvd_fence_done(&fUvd, fUvdLastSeq) && waited++ < 200) {
+	while (fUvdLastSeq && !rdn_uvd_fence_done(&fUvd, fUvdLastSeq) && waited++ < 200) {
 		IOLockUnlock(fLock);
 		IOSleep(1);
 		IOLockLock(fLock);
@@ -2126,15 +2482,15 @@ void RadeonNIAccel::uvdUser(bool add)
 	IOLockLock(fLock);
 	if (add) {
 		fUvdUsers++;
-	} else if (fUvdUsers && !--fUvdUsers && fUvdUp && fUvdClocksUp) {
+	} else if (fUvdUsers && !--fUvdUsers && fUvdUp && fUvdClocksUp && !fVideoBusy && !fUvd.failed) {
 		UInt32 waited = 0;
 
-		while (!rdn_uvd_fence_done(&fUvd, fUvdLastSeq) && waited++ < 200) {
+		while (fUvdLastSeq && !rdn_uvd_fence_done(&fUvd, fUvdLastSeq) && waited++ < 200) {
 			IOLockUnlock(fLock);
 			IOSleep(1);
 			IOLockLock(fLock);
 		}
-		if (!fUvdUsers && rdn_uvd_fence_done(&fUvd, fUvdLastSeq)) {
+		if (!fUvdUsers && !fVideoBusy && (!fUvdLastSeq || rdn_uvd_fence_done(&fUvd, fUvdLastSeq))) {
 			(void)rdn_uvd_idle(&fUvd);
 			fUvdClocksUp = false;
 			if (fUvd.flags & RDN_UVD_F_PLL)
@@ -2191,6 +2547,10 @@ IOReturn RadeonNIAccel::power(UInt32 state, UInt32 what, UInt32 *sclk,
 	if (!fEngineUp || !card)
 		return kIOReturnNotReady;
 	IOLockLock(fLock);
+	if (fVideoBusy && state != RDN_UC_POWER_QUERY) {
+		IOLockUnlock(fLock);
+		return kIOReturnBusy;
+	}
 	if (!fPowerKnown) {
 		r = rdn_pm_boot_state(card, &fPower);
 		fPowerKnown = !r;
@@ -2848,6 +3208,9 @@ bool RadeonNIUserClient::initWithTask(task_t owningTask, void *securityID,
 	if (!super::initWithTask(owningTask, securityID, type))
 		return false;
 	fTask = owningTask;
+	fProtocolV2 = type == RDN_UC_TYPE_V2;
+	fUvdAdministrator = clientHasPrivilege(securityID,
+		kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
 	fOffsets = (UInt32 *)IOMalloc(kMaxAllocations * sizeof(UInt32));
 	fCount = 0;
 	fUvdUser = false;
@@ -2867,12 +3230,12 @@ void RadeonNIUserClient::freeAll(void)
 {
 	if (!fAccel || !fOffsets)
 		return;
-	/* sessions this client made and never ended: the firmware has ten, and they would stay until the block is restarted */
-	if (fUvdHandleCount) {
-		fAccel->uvdDestroy(fUvdHandles, fUvdHandleCount, fUvdHandleEpoch);
-		fUvdHandleCount = 0;
-	}
-	fAccel->releaseClientMemory(fOffsets, fCount, this);
+	bool uvdSafe = !fUvdUser || fAccel->uvdDestroy(fUvdHandles, fUvdHandleCount, fUvdHandleEpoch);
+	if (uvdSafe)
+		fAccel->releaseClientMemory(fOffsets, fCount, this);
+	else
+		fAccel->retainClientMemory(fOffsets, fCount, this);
+	fUvdHandleCount = 0;
 	fCount = 0;
 	if (fUvdUser) {
 		fUvdUser = false;
@@ -2976,9 +3339,17 @@ IOExternalMethod *RadeonNIUserClient::getTargetAndMethodForIndex(
 		  kIOUCScalarIStructO, 1, sizeof(struct rdn_user_backing) },
 		{ 0, (IOMethod)&RadeonNIUserClient::methodSurfaceQuery,
 		  kIOUCScalarIStructO, 1, sizeof(struct rdn_user_surface_info) },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdDiagnosticInfo,
+		  kIOUCScalarIStructO, 0, sizeof(struct rdn_user_uvd_diagnostic) },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdDiagnosticInit,
+		  kIOUCScalarIScalarO, 1, 1 },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdFixtureRun,
+		  kIOUCScalarIStructO, 1, sizeof(struct rdn_user_uvd_fixture) },
+		{ 0, (IOMethod)&RadeonNIUserClient::methodUvdFixtureRead,
+		  kIOUCScalarIStructO, 2, RDN_UVD_FIXTURE_CHUNK_BYTES },
 	};
 
-	if (index >= RDN_UC_METHOD_COUNT)
+	if (index >= (fProtocolV2 ? RDN_UC_METHOD_COUNT : RDN_UC_V1_METHOD_COUNT))
 		return 0;
 	*target = this;
 	return (IOExternalMethod *)&methods[index];
@@ -3009,6 +3380,26 @@ IOReturn RadeonNIUserClient::methodGetInfo(struct rdn_user_info *info,
 	fAccel->getInfo(info);
 	*size = sizeof(*info);
 	return kIOReturnSuccess;
+}
+
+IOReturn RadeonNIUserClient::methodUvdDiagnosticInfo(
+	struct rdn_user_uvd_diagnostic *info, IOByteCount *size)
+{
+	if (!fAccel || !info || !size || *size < sizeof(*info))
+		return kIOReturnBadArgument;
+	fAccel->uvdDiagnosticInfo(info);
+	*size = sizeof(*info);
+	return kIOReturnSuccess;
+}
+
+IOReturn RadeonNIUserClient::methodUvdDiagnosticInit(UInt32 reserved, UInt32 *status)
+{
+	if (!status || reserved || !fAccel)
+		return kIOReturnBadArgument;
+	*status = 0;
+	if (!fUvdAdministrator)
+		return kIOReturnNotPrivileged;
+	return fAccel->uvdDiagnosticInit(status);
 }
 
 IOReturn RadeonNIUserClient::methodSurfaceQuery(UInt32 wid,
@@ -3076,13 +3467,11 @@ IOReturn RadeonNIUserClient::methodVramGet(UInt32 offset, UInt32 address, UInt32
 
 IOReturn RadeonNIUserClient::methodUvdSubmitWords(UInt32 address, UInt32 words, UInt32 *fence)
 {
+	IOReturn admission=claimUvd();
+	if (admission!=kIOReturnSuccess) return admission;
 	IOReturn ret = fAccel->uvdSubmitWords(fTask, address, words, fence, fUvdHandles, &fUvdHandleCount,
 					      &fUvdHandleEpoch);
 
-	if (ret == kIOReturnSuccess && !fUvdUser) {
-		fUvdUser = true;
-		fAccel->uvdUser(true);
-	}
 	return ret;
 }
 
@@ -3179,24 +3568,26 @@ IOReturn RadeonNIUserClient::methodPower(UInt32 state, UInt32 what,
 
 IOReturn RadeonNIUserClient::methodUvdInit(UInt32 flags, UInt32 *status)
 {
+	IOReturn admission=claimUvd();
+	if (admission!=kIOReturnSuccess) return admission;
 	return fAccel->uvdInit(flags, status);
 }
 
 IOReturn RadeonNIUserClient::methodUvdSubmit(UInt32 offset, UInt32 words,
 					     UInt32 *fence)
 {
+	IOReturn admission=claimUvd();
+	if (admission!=kIOReturnSuccess) return admission;
 	fAccel->ibRecord('U', this, offset, words);
 	IOReturn ret = fAccel->uvdSubmit(offset, words, fence, fUvdHandles, &fUvdHandleCount, &fUvdHandleEpoch);
 
-	if (ret == kIOReturnSuccess && !fUvdUser) {
-		fUvdUser = true;
-		fAccel->uvdUser(true);
-	}
 	return ret;
 }
 
 IOReturn RadeonNIUserClient::methodUvdReset(UInt32 *epoch)
 {
+	IOReturn admission=claimUvd();
+	if (admission!=kIOReturnSuccess) return admission;
 	IOReturn ret = fAccel->uvdReset(epoch);
 
 	if (ret == kIOReturnSuccess) {

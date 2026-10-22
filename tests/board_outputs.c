@@ -302,19 +302,11 @@ int main(int argc, char **argv)
 	card.output = &link_output;
 	link_output.connector_id = CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_I;
 	link_mode.clock = 165000;
-	if (rdn_output_is_duallink(&card, &link_mode) ||
-	    !rdn_output_mode_supported(&card, &link_mode, false))
+	if (rdn_output_is_duallink(&card, &link_mode))
 		return 1;
 	link_mode.clock = 268000;
 	if (!rdn_output_is_duallink(&card, &link_mode))
 		return 1;
-	if (!rdn_output_mode_supported(&card, &link_mode, false) ||
-	    rdn_output_mode_supported(&card, &link_mode, true))
-		return 1;
-	link_mode.clock = 340000;
-	if (rdn_output_mode_supported(&card, &link_mode, false))
-		return 1;
-	link_mode.clock = 268000;
 	link_output.displayport = true;
 	if (rdn_output_is_duallink(&card, &link_mode))
 		return 1;

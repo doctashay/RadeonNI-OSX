@@ -69,3 +69,5 @@ _gldObjectUnpurgeable
 _RDNGLRequestCompatibilityContext
 _RDNGLMakeCurrent
 _RDNGLGetProcAddress
+_RDNGLQueryVideoPackingV1
+_RDNGLPackVideoFrameV1

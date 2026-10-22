@@ -27,6 +27,7 @@ static struct rdn_mem_block *block_new(struct rdn_mem *mem, uint64_t start,
 	struct rdn_mem_block *b = mem->os->alloc(mem->os->cookie, sizeof(*b));
 
 	if (b) {
+		b->next = NULL;
 		b->start = start;
 		b->size = size;
 		b->used = used;
@@ -37,7 +38,11 @@ static struct rdn_mem_block *block_new(struct rdn_mem *mem, uint64_t start,
 int rdn_mem_init(struct rdn_mem *mem, struct rdn_os *os, uint64_t base,
 		 uint64_t size)
 {
+	if (!mem)
+		return -ENOMEM;
 	memset(mem, 0, sizeof(*mem));
+	if (!os || !os->alloc || !os->free || base > UINT64_MAX - size)
+		return -ENOMEM;
 	mem->os = os;
 	mem->base = base;
 	mem->size = size;
@@ -47,8 +52,11 @@ int rdn_mem_init(struct rdn_mem *mem, struct rdn_os *os, uint64_t base,
 
 void rdn_mem_fini(struct rdn_mem *mem)
 {
-	struct rdn_mem_block *b = mem->head, *next;
+	struct rdn_mem_block *b, *next;
 
+	if (!mem)
+		return;
+	b = mem->head;
 	for (; b; b = next) {
 		next = b->next;
 		mem->os->free(mem->os->cookie, b);
@@ -56,46 +64,48 @@ void rdn_mem_fini(struct rdn_mem *mem)
 	mem->head = NULL;
 }
 
-int rdn_mem_alloc_range(struct rdn_mem *mem, uint64_t size, uint64_t align,
-			uint64_t lo, uint64_t hi, uint64_t *offset)
+static int alloc_range(struct rdn_mem *mem, uint64_t size, uint64_t align,
+		       uint64_t lo, uint64_t hi, uint64_t *offset)
 {
-	struct rdn_mem_block *b, *tail;
-	uint64_t start, pad, end;
+	struct rdn_mem_block *b, *allocation, *tail;
+	uint64_t start, end, limit;
 
-	if (!size)
-		size = 1;
-	if (!align)
-		align = 1;
+	if (!mem || !offset || !size || !align || (align & (align - 1)) ||
+	    lo >= hi || size > hi - lo)
+		return -ENOMEM;
 	for (b = mem->head; b; b = b->next) {
-		if (b->used)
+		if (b->used || b->start > UINT64_MAX - b->size)
 			continue;
-		/* What of the free block lies in [lo, hi). */
+		end = b->start + b->size;
 		start = b->start > lo ? b->start : lo;
-		end = b->start + b->size < hi ? b->start + b->size : hi;
-		start = (start + align - 1) & ~(align - 1);
-		if (start >= end || end - start < size)
+		limit = end < hi ? end : hi;
+		if (start > UINT64_MAX - (align - 1))
 			continue;
-		pad = start - b->start;
-		/* Split off what is left behind the allocation ... */
-		if (b->start + b->size > start + size) {
-			tail = block_new(mem, start + size,
-					 b->start + b->size - (start + size), false);
-			if (!tail)
-				return -ENOMEM;
-			tail->next = b->next;
-			b->next = tail;
-			b->size = pad + size;
+		start = (start + align - 1) & ~(align - 1);
+		if (start >= limit || size > limit - start)
+			continue;
+		/* Allocate both split nodes before changing the free block. */
+		allocation = start == b->start ? NULL : block_new(mem, start, size, true);
+		if (start != b->start && !allocation)
+			return -ENOMEM;
+		tail = start + size == end ? NULL :
+			block_new(mem, start + size, end - start - size, false);
+		if (start + size != end && !tail) {
+			if (allocation)
+				mem->os->free(mem->os->cookie, allocation);
+			return -ENOMEM;
 		}
-		/* ... and the alignment gap in front of it. */
-		if (pad) {
-			tail = block_new(mem, start, size, true);
-			if (!tail)
-				return -ENOMEM;
+		if (tail)
 			tail->next = b->next;
-			b->next = tail;
-			b->size = pad;
+		if (allocation) {
+			allocation->next = tail ? tail : b->next;
+			b->next = allocation;
+			b->size = start - b->start;
 		} else {
 			b->used = true;
+			b->size = size;
+			if (tail)
+				b->next = tail;
 		}
 		*offset = start;
 		return 0;
@@ -103,9 +113,24 @@ int rdn_mem_alloc_range(struct rdn_mem *mem, uint64_t size, uint64_t align,
 	return -ENOMEM;
 }
 
+int rdn_mem_alloc_range(struct rdn_mem *mem, uint64_t size, uint64_t align,
+			uint64_t lo, uint64_t hi, uint64_t *offset)
+{
+	return alloc_range(mem, size ? size : 1, align ? align : 1,
+			   lo, hi, offset);
+}
+
+int rdn_mem_alloc_in_range(struct rdn_mem *mem, uint64_t size, uint64_t align,
+			  uint64_t minimum, uint64_t maximum, uint64_t *offset)
+{
+	return alloc_range(mem, size, align, minimum, maximum, offset);
+}
+
 int rdn_mem_alloc(struct rdn_mem *mem, uint64_t size, uint64_t align,
 		  uint64_t *offset)
 {
+	if (!mem || mem->base > UINT64_MAX - mem->size)
+		return -ENOMEM;
 	return rdn_mem_alloc_range(mem, size, align, mem->base,
 				   mem->base + mem->size, offset);
 }
@@ -114,6 +139,8 @@ void rdn_mem_free(struct rdn_mem *mem, uint64_t offset)
 {
 	struct rdn_mem_block *b, *prev = NULL, *next;
 
+	if (!mem)
+		return;
 	for (b = mem->head; b; prev = b, b = b->next)
 		if (b->used && b->start == offset)
 			break;
@@ -135,13 +162,7 @@ void rdn_mem_free(struct rdn_mem *mem, uint64_t offset)
 
 uint64_t rdn_mem_available(struct rdn_mem *mem)
 {
-	struct rdn_mem_block *b;
-	uint64_t total = 0;
-
-	for (b = mem->head; b; b = b->next)
-		if (!b->used)
-			total += b->size;
-	return total;
+	return rdn_mem_available_range(mem, 0, UINT64_MAX, NULL);
 }
 
 uint64_t rdn_mem_available_range(struct rdn_mem *mem, uint64_t lo, uint64_t hi,
@@ -150,11 +171,14 @@ uint64_t rdn_mem_available_range(struct rdn_mem *mem, uint64_t lo, uint64_t hi,
 	struct rdn_mem_block *b;
 	uint64_t total = 0, big = 0;
 
-	for (b = mem->head; b; b = b->next) {
-		uint64_t start = b->start > lo ? b->start : lo;
-		uint64_t end = b->start + b->size < hi ? b->start + b->size : hi;
+	for (b = mem && lo < hi ? mem->head : NULL; b; b = b->next) {
+		uint64_t start, end;
 
-		if (b->used || start >= end)
+		if (b->used || b->start > UINT64_MAX - b->size)
+			continue;
+		start = b->start > lo ? b->start : lo;
+		end = b->start + b->size < hi ? b->start + b->size : hi;
+		if (start >= end)
 			continue;
 		total += end - start;
 		if (end - start > big)
@@ -163,4 +187,11 @@ uint64_t rdn_mem_available_range(struct rdn_mem *mem, uint64_t lo, uint64_t hi,
 	if (largest)
 		*largest = big;
 	return total;
+}
+
+uint64_t rdn_mem_largest(struct rdn_mem *mem)
+{
+	uint64_t largest;
+	rdn_mem_available_range(mem, 0, UINT64_MAX, &largest);
+	return largest;
 }

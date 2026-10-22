@@ -313,7 +313,6 @@ void *RDNGLGetProcAddress(const char *name)
 	return (void *)OSMesaGetProcAddress(name);
 }
 
-
 static OSMesaContext mesa_for(struct context *c)
 {
 	OSMesaContext list = NULL;
@@ -964,14 +963,6 @@ int rdn_mesa_expect_surface(void *gld_ctx, unsigned long surface)
 		rdn_log("surface 0x%lx: Mesa context creation failed", surface);
 		return 0;
 	}
-	/*
-	 * A program that attaches the same surface again (a resized view,
-	 * VLC's) has its picture buffer in the kext already: announcing the
-	 * surface with width 0 would take that away, and the window server's
-	 * read lock would fail from then on (it draws nothing).
-	 */
-	if (c->stored && c->surface == surface)
-		return 1;
 	/* Rebinding must preserve the image used by the kernel's direct flush. */
 	if (!reserve_surface((uint32_t)surface)) {
 		rdn_log("surface 0x%lx: buffer announcement failed", surface);

@@ -68,6 +68,7 @@ struct rdn_fence {
    uint32_t number;
    bool submitted;
    bool reached;
+   bool failed;
    /* The video decoder's numbering. */
    bool uvd;
 };
@@ -83,6 +84,7 @@ struct rdn_busy {
    bool used;
    /* Of the video decoder's numbering. */
    bool uvd;
+   bool unknown;
 };
 
 struct rdn_bo {
@@ -137,6 +139,7 @@ struct rdn_cs {
    void (*flush_cs)(void *ctx, unsigned flags, struct pipe_fence_handle **fence);
    void *flush_data;
    struct rdn_fence *next_fence;
+   struct rdn_fence *error_fence;
    /* A stream of video decoder commands. */
    bool uvd;
 };
@@ -221,12 +224,14 @@ static bool rdn_number_wait(struct radeon_drm_winsys *ws, uint32_t number, bool 
 static bool rdn_busy_wait(struct radeon_drm_winsys *ws, const struct rdn_busy *busy,
                           uint64_t timeout_ns)
 {
-   return !busy->used || rdn_number_wait(ws, busy->number, busy->uvd, timeout_ns);
+   return !busy->unknown && (!busy->used || rdn_number_wait(ws, busy->number, busy->uvd, timeout_ns));
 }
 
 static bool rdn_fence_wait(struct radeon_drm_winsys *ws, struct rdn_fence *fence,
                            uint64_t timeout_ns)
 {
+   if (fence && fence->failed)
+      return false;
    if (!fence || fence->reached)
       return true;
    if (!fence->submitted)
@@ -305,8 +310,8 @@ static void rdn_cache_put(struct radeon_drm_winsys *ws, uint64_t offset,
    struct rdn_cached *c = CALLOC_STRUCT(rdn_cached);
 
    if (!c) {
-      rdn_busy_wait(ws, busy, OS_TIMEOUT_INFINITE);
-      rdn_region_free(ws, region, offset, size);
+      if (rdn_busy_wait(ws, busy, OS_TIMEOUT_INFINITE))
+         rdn_region_free(ws, region, offset, size);
       return;
    }
    c->offset = offset;
@@ -572,7 +577,7 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
    else if ((flags & RADEON_FLAG_NO_CPU_ACCESS) && ws->dev->alloc_hidden)
       want = RDN_HIDDEN;
    else if (domain == RADEON_DOMAIN_GTT && ws->dev->gart_alloc &&
-            (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING))
+            !(flags & RADEON_FLAG_NO_CPU_ACCESS) && (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING))
       want = RDN_GART;
    else
       want = RDN_VISIBLE;
@@ -584,7 +589,7 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
    }
    ws->mem_stats.creates++;
    if (want == RDN_SEGMENT) {
-      /* Nowhere else will do: the decoder reaches only its segment. What the cache holds may make room. */
+      /* Decoder-segment storage cannot fall back to another heap. */
       if (r) {
          r = ws->dev->uvd_alloc(ws->dev, size, alignment, &bo->offset);
          if (r) {
@@ -600,10 +605,7 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
       if (attempt)
          rdn_cache_trim(ws, true);
       if (want == RDN_HIDDEN) {
-         /*
-          * Debugging (docs/UVD.md, the decoder's second segment): RDN_HIDDEN_FILL_MB=n puts the next hidden buffer of 256 KB or
-          * more n MB further into the hidden memory, by allocating that much first and giving it back after.
-          */
+         /* Optional placement probe for the decoder's second segment. */
          const char *fill = getenv("RDN_HIDDEN_FILL_MB");
          uint64_t filler = 0;
          bool filled = false;
@@ -627,19 +629,9 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
       if (!r)
          bo->region = RDN_VISIBLE;
    }
-   if (r && want != RDN_GART && ws->dev->gart_alloc &&
-       (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING) && !(flags & RADEON_FLAG_NO_CPU_ACCESS)) {
-      /*
-       * Video memory is full. Nothing here can move a buffer out of it to
-       * make room, but a new one can live in the program's own memory
-       * behind the GART: slower for the GPU to read, and the program goes
-       * on instead of stopping. Not what r600 marks as shareable (the video
-       * decoder's buffers, the display's): the engines that use those
-       * cannot reach the GART, so the allocation fails, and whoever asked
-       * can do without (a second decoder: the first one has the memory).
-       * Nor tiled GPU-only storage, which cannot spill into system RAM on
-       * this backend.
-       */
+   /* GPU-only tiled storage and shareable video/display buffers stay in VRAM. */
+   if (r && want != RDN_GART && !(flags & RADEON_FLAG_NO_CPU_ACCESS) &&
+       (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING) && ws->dev->gart_alloc) {
       r = ws->dev->gart_alloc(ws->dev, size, alignment, &bo->offset);
       if (!r) {
          bo->region = RDN_GART;
@@ -685,9 +677,10 @@ static void rdn_buffer_destroy(struct radeon_winsys *rws, struct pb_buffer_lean 
    struct radeon_drm_winsys *ws = rdn_winsys(rws);
    struct rdn_bo *bo = rdn_bo(buf);
 
+   if (!rdn_busy_wait(ws, &bo->last_uvd, OS_TIMEOUT_INFINITE))
+      return; /* Do not recycle storage with unknown decoder completion. */
    if (bo->external_store) {
-      if (bo->last_use.used &&
-          !rdn_number_wait(ws, bo->last_use.number, false, OS_TIMEOUT_INFINITE))
+      if (!rdn_busy_wait(ws, &bo->last_use, OS_TIMEOUT_INFINITE))
          return; /* Keep the allocation pinned if completion is unknown. */
       ws->dev->release_external(ws->dev, bo->external_store);
    }
@@ -708,7 +701,6 @@ static void rdn_buffer_destroy(struct radeon_winsys *rws, struct pb_buffer_lean 
        * memory is kept, with the fence after which it is free. (The cache
        * notes one fence: the video decoder's is waited for.)
        */
-      rdn_busy_wait(ws, &bo->last_uvd, OS_TIMEOUT_INFINITE);
       simple_mtx_lock(&ws->lock);
       rdn_cache_put(ws, bo->offset, bo->base.size, bo->region, &bo->last_use);
       ws->allocated_bytes -= bo->base.size;
@@ -790,23 +782,20 @@ static bool rdn_buffer_wait(struct radeon_winsys *rws, struct pb_buffer_lean *bu
 {
    struct rdn_bo *bo = rdn_bo(buf);
    struct radeon_drm_winsys *ws = rdn_winsys(rws);
-   struct rdn_busy busy, uvd;
+   struct rdn_busy busy, uvd_busy;
 
-   /*
-    * Snapshot the fences under the submission lock; wait without it. A reader only has to wait for writers
-    * (the video decoder's work counts as both).
-    */
+   /* Snapshot both engines under the submission lock; wait without it. */
    simple_mtx_lock(&ws->lock);
    busy = (usage & RADEON_USAGE_WRITE) ? bo->last_use : bo->last_write;
-   uvd = bo->last_uvd;
+   uvd_busy = bo->last_uvd;
    simple_mtx_unlock(&ws->lock);
-   return rdn_busy_wait(ws, &busy, timeout) && rdn_busy_wait(ws, &uvd, timeout);
+   return rdn_busy_wait(ws, &busy, timeout) && rdn_busy_wait(ws, &uvd_busy, timeout);
 }
 
 static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
                         struct pipe_fence_handle **pfence);
 
-/* What a stream does before the CPU maps a buffer that it refers to. */
+/* A stream without a driver callback still has to submit before a CPU map. */
 static void rdn_cs_flush_for_map(struct radeon_cmdbuf *rcs, struct rdn_cs *cs, unsigned flags)
 {
    if (cs->flush_cs)
@@ -839,8 +828,11 @@ static void *rdn_buffer_map(struct radeon_winsys *rws, struct pb_buffer_lean *bu
          if (!rdn_buffer_wait(rws, buf, 0, wait_usage))
             return NULL;
       } else {
-         if (cs && rdn_cs_is_buffer_referenced(rcs, buf, conflicts))
+         if (cs && rdn_cs_is_buffer_referenced(rcs, buf, conflicts)) {
             rdn_cs_flush_for_map(rcs, cs, RADEON_FLUSH_START_NEXT_GFX_IB_NOW);
+            if (rdn_cs_is_buffer_referenced(rcs, buf, conflicts))
+               return NULL;
+         }
          if (!rdn_buffer_wait(rws, buf, OS_TIMEOUT_INFINITE, wait_usage))
             return NULL;
       }
@@ -1049,10 +1041,17 @@ static bool rdn_cs_create(struct radeon_cmdbuf *rcs, struct radeon_winsys_ctx *c
       return false;
    memset(rcs, 0, sizeof(*rcs));
    cs->ws = ws;
+   cs->error_fence = rdn_fence_new();
+   if (!cs->error_fence) {
+      FREE(cs);
+      return false;
+   }
+   cs->error_fence->failed = cs->error_fence->reached = true;
    cs->uvd = ip_type == AMD_IP_UVD;
    rcs->current.buf = MALLOC(max_dw * 4);
    if (!rcs->current.buf || !rdn_cs_hash_resize(cs, RDN_CS_HASH)) {
       FREE(rcs->current.buf);
+      rdn_fence_set(&cs->error_fence, NULL);
       FREE(cs);
       return false;
    }
@@ -1081,6 +1080,37 @@ static void rdn_cs_mark_busy(struct rdn_cs *cs, const struct rdn_busy *busy)
    }
 }
 
+/* Gallium callers may ignore the flush return code, but still wait on its fence. */
+static void rdn_cs_fail_fence(struct rdn_cs *cs, struct pipe_fence_handle **pfence)
+{
+   if (cs->next_fence) {
+      cs->next_fence->failed = true;
+      rdn_fence_set(&cs->next_fence, NULL);
+   }
+   if (pfence)
+      rdn_fence_set((struct rdn_fence **)pfence, cs->error_fence);
+}
+
+/* Failed cross-engine waits leave the stream and its references intact. */
+static bool rdn_cs_wait_dependencies(struct rdn_cs *cs)
+{
+   struct radeon_drm_winsys *ws = cs->ws;
+
+   for (unsigned i = 0; i < cs->num_buffers; i++) {
+      struct rdn_cs_buffer *b = &cs->buffers[i];
+      struct rdn_busy busy;
+
+      simple_mtx_lock(&ws->lock);
+      busy = cs->uvd ? ((b->usage & RADEON_USAGE_WRITE) ? b->bo->last_use : b->bo->last_write)
+                     : b->bo->last_uvd;
+      busy.unknown |= b->bo->last_use.unknown || b->bo->last_uvd.unknown;
+      simple_mtx_unlock(&ws->lock);
+      if (!rdn_busy_wait(ws, &busy, OS_TIMEOUT_INFINITE))
+         return false;
+   }
+   return true;
+}
+
 /* Release outside ws->lock: the final reference can enter the buffer cache. */
 static void rdn_cs_release_buffers(struct rdn_cs *cs)
 {
@@ -1103,6 +1133,7 @@ static void rdn_cs_destroy(struct radeon_cmdbuf *rcs)
       return;
    rdn_cs_release_buffers(cs);
    rdn_fence_set(&cs->next_fence, NULL);
+   rdn_fence_set(&cs->error_fence, NULL);
    FREE(cs->buffers);
    FREE(cs->hash);
    FREE(rcs->current.buf);
@@ -1525,11 +1556,16 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    struct radeon_drm_winsys *ws = cs->ws;
    struct rdn_pending_ib *ib;
    struct rdn_fence *fence;
-   struct rdn_busy busy = { 0, false, true };
+   struct rdn_busy busy = { 0, false, true, false };
    struct rdn_uvd_dbg dbg;
    uint64_t offset, ib_size;
+   bool submit_attempted = false;
    int r = 0;
 
+   if (!rdn_cs_wait_dependencies(cs)) {
+      rdn_cs_fail_fence(cs, pfence);
+      return -EIO;
+   }
    memset(&dbg, 0, sizeof(dbg));
    /* Pad to 16 words, as radeon_drm_cs.c does for the decoder. */
    while (rcs->current.cdw & 15)
@@ -1540,6 +1576,7 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    if (!fence || !ib) {
       FREE(ib);
       FREE(fence);
+      rdn_cs_fail_fence(cs, pfence);
       return -ENOMEM;
    }
    fence->uvd = true;
@@ -1552,16 +1589,9 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
       fprintf(stderr, "rdn: video decoder commands refused: they name memory it cannot reach\n");
       FREE(ib);
       fence->reached = true;
+      fence->failed = true;
       r = -EINVAL;
    } else {
-      /* What the 3D engine did to these buffers (or still reads of them) first. */
-      for (unsigned i = 0; i < cs->num_buffers; i++) {
-         struct rdn_bo *bo = cs->buffers[i].bo;
-
-         rdn_busy_wait(ws, (cs->buffers[i].usage & RADEON_USAGE_WRITE) ? &bo->last_use :
-                                                                         &bo->last_write,
-                       OS_TIMEOUT_INFINITE);
-      }
       ib_size = align64(rcs->current.cdw * 4, 4096);
       simple_mtx_lock(&ws->lock);
       /* Split mode: the segment's buffers the program filled go there first. */
@@ -1570,6 +1600,7 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
       if (!r)
          r = ws->uvd_seg ? 0 : rdn_ib_alloc(ws, ib_size, &offset);
       if (!r && ws->uvd_seg) {
+         submit_attempted = true;
          r = rdn_uvd_segment_submit(ws, cs, rcs, &dbg, fence);
       } else if (!r) {
          {
@@ -1592,15 +1623,28 @@ static int rdn_uvd_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
           * bitstream as soon as the doorbell rings; a stale read of any of them can wedge it.
           */
          __sync_synchronize();
+         submit_attempted = true;
          r = ws->dev->uvd_submit(ws->dev, offset, rcs->current.cdw, &fence->number);
-         if (r)
-            ws->dev->free(ws->dev, offset);
       }
       if (r) {
+         if (submit_attempted) {
+            busy.unknown = true;
+            rdn_cs_mark_busy(cs, &busy);
+            if (!ws->uvd_seg) {
+               ib->offset = offset;
+               ib->size = ib_size;
+               ib->busy = busy;
+               list_addtail(&ib->list, &ws->pending_ibs);
+            } else {
+               FREE(ib);
+            }
+         } else {
+            FREE(ib);
+         }
          simple_mtx_unlock(&ws->lock);
          fprintf(stderr, "rdn: video decoder command submission failed (%d)\n", r);
-         FREE(ib);
          fence->reached = true;
+         fence->failed = true;
       } else {
          fence->submitted = true;
          ws->uvd_used = true;
@@ -1813,16 +1857,21 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    struct radeon_drm_winsys *ws = cs->ws;
    struct rdn_pending_ib *ib;
    struct rdn_fence *fence;
-   struct rdn_busy busy = { 0, false, false };
+   struct rdn_busy busy = { 0, false, false, false };
    uint64_t offset, ib_size;
    uint32_t *traced = NULL;
    unsigned submit_words;
    const char *trace_mode = getenv("RDN_CAPTURE_MARKERS");
    bool trace_complete = trace_mode && !strcmp(trace_mode, "complete");
+   bool submit_attempted = false;
    int r;
 
    if (cs->uvd)
       return rdn_uvd_cs_flush(rcs, flags, pfence);
+   if (!rdn_cs_wait_dependencies(cs)) {
+      rdn_cs_fail_fence(cs, pfence);
+      return -EIO;
+   }
 
    /* Pad to 8 words, as the command processor fetches (radeon_drm_cs.c). */
    while (rcs->current.cdw & 7)
@@ -1843,6 +1892,10 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    ib = CALLOC_STRUCT(rdn_pending_ib);
    if (!fence || !ib) {
       FREE(ib);
+      if (fence)
+         fence->failed = true;
+      rdn_fence_set(&fence, NULL);
+      rdn_cs_fail_fence(cs, pfence);
       return -ENOMEM;
    }
 
@@ -1858,11 +1911,6 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
       }
    }
    ib_size = align64(submit_words * 4 + (traced ? 256 : 0), 64 * 1024);
-
-   /* What the video decoder is doing to these buffers comes first. */
-   if (ws->uvd_used)
-      for (unsigned i = 0; i < cs->num_buffers; i++)
-         rdn_busy_wait(ws, &cs->buffers[i].bo->last_uvd, OS_TIMEOUT_INFINITE);
 
    simple_mtx_lock(&ws->lock);
    r = rdn_ib_alloc(ws, ib_size, &offset);
@@ -1890,18 +1938,26 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
        */
       memcpy((uint8_t *)ws->dev->aperture + offset, words, submit_words * 4);
       FILE *capture = rdn_capture_submission(rcs, offset, words, submit_words, marker_offset);
+      submit_attempted = true;
       r = ws->dev->submit(ws->dev, offset, submit_words, &fence->number);
       rdn_capture_result(capture, r, r ? 0 : fence->number);
-      if (r)
-         ws->dev->free(ws->dev, offset);
    }
    FREE(traced);
    if (r) {
+      if (submit_attempted) {
+         busy.unknown = true;
+         rdn_cs_mark_busy(cs, &busy);
+         ib->offset = offset;
+         ib->size = ib_size;
+         ib->busy = busy;
+         list_addtail(&ib->list, &ws->pending_ibs);
+      } else {
+         FREE(ib);
+      }
       simple_mtx_unlock(&ws->lock);
       fprintf(stderr, "rdn: command submission failed (%d)\n", r);
-      FREE(ib);
-      /* Nothing ran: do not leave anyone waiting on this fence. */
       fence->reached = true;
+      fence->failed = true;
    } else {
       fence->submitted = true;
       busy.number = fence->number;

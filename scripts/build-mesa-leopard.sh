@@ -23,16 +23,16 @@ done
 for d in src/gallium/winsys/rdn src/gallium/frontends/rdn src/gallium/targets/rdn; do
     if [ -L "$d" ]; then rm "$d"; fi
 done
-rsync -a --delete "$root/mesa/winsys/" src/gallium/winsys/rdn/
-rsync -a --delete "$root/mesa/frontend/" src/gallium/frontends/rdn/
-rsync -a --delete --exclude hw --exclude tests --exclude gld "$root/mesa/target/" src/gallium/targets/rdn/
-rsync -a --delete "$root/hw/" src/gallium/targets/rdn/hw/
-rsync -a --delete "$root/mesa/tests/" src/gallium/targets/rdn/tests/
-rsync -a --delete --exclude build "$root/gld/" src/gallium/targets/rdn/gld/
-sed -i "s@/usr/local/MacOSX10.4u.sdk@$sdk@g" src/gallium/targets/rdn/meson.build
+rsync -ac --no-times --delete "$root/mesa/winsys/" src/gallium/winsys/rdn/
+rsync -ac --no-times --delete "$root/mesa/frontend/" src/gallium/frontends/rdn/
+rsync -ac --no-times --delete --exclude hw --exclude tests --exclude gld --exclude video "$root/mesa/target/" src/gallium/targets/rdn/
+rsync -ac --no-times --delete --exclude tests "$root/video/" src/gallium/targets/rdn/video/
+rsync -ac --no-times --delete "$root/hw/" src/gallium/targets/rdn/hw/
+rsync -ac --no-times --delete "$root/mesa/tests/" src/gallium/targets/rdn/tests/
+rsync -ac --no-times --delete --exclude build "$root/gld/" src/gallium/targets/rdn/gld/
 
 mkdir -p "$compat"
-rsync -a --delete "$root/mesa/darwin8/" "$compat/src/"
+rsync -ac --no-times --delete "$root/mesa/darwin8/" "$compat/src/"
 cat > "$root/third_party/mesa-darwin9-cross.ini" <<INI
 [binaries]
 c = '/opt/darwin-legacy-cross/ppc-darwin9-gcc14-objc/bin/powerpc-apple-darwin9-gcc'
@@ -42,6 +42,9 @@ ar = '/opt/darwin-legacy-cross/linux-ppc-darwin9-xtools/bin/powerpc-apple-darwin
 strip = '/opt/darwin-legacy-cross/linux-ppc-darwin9-xtools/bin/powerpc-apple-darwin9-strip'
 ranlib = '/opt/darwin-legacy-cross/linux-ppc-darwin9-xtools/bin/powerpc-apple-darwin9-ranlib'
 pkg-config = 'false'
+
+[properties]
+rdn_sdk = '$sdk'
 
 [built-in options]
 c_args = ['-isysroot', '$sdk', '-mmacosx-version-min=10.5', '-mlongcall', '-mcpu=970', '-mno-powerpc64', '-fno-strict-aliasing', '-isystem', '$compat/src/include']

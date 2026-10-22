@@ -45,12 +45,8 @@ int main() {
     int before=calls;
     assert(ga_fill(&g,0,0,4,4,0)==-42 && calls==before);
     assert(ga_gpu_wait(&g)==-42);
-    g.gpu_pending=1;
-    error=0;
-    before=calls;
-    assert(ga_gpu_wait(&g)==-42 && !g.gpu_pending && calls==before+1);
     for(auto p:pixels) assert(p==0x5a);
-    g.gpu=0; g.gpu_error=0; g.gpu_pending=1; error=-42;
+    g.gpu=0; g.gpu_error=0; g.gpu_pending=1;
     assert(ga_fill(&g,0,0,4,4,0)==-42 && g.gpu_pending);
     for(auto p:pixels) assert(p==0x5a);
     error=0; assert(ga_fill(&g,0,0,4,4,0)==0);

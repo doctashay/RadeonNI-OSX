@@ -114,6 +114,19 @@ skill (`scripts/mac.sh`).
   builds the same test static for big-endian PowerPC; run it with
   `sudo third_party/qemu/qemu-ppc -cpu 7447a .../build-ppc/.../rdn_gltest`.
   `-a`, `-b` and `-D` vary the scene so that runs can be told apart.
+- `scripts/build-mesa-leopard.sh` builds the Leopard PPC32 GL slice in
+  `build-darwin9`; `scripts/build-mesa-leopard64.sh` builds PPC64 in
+  `build-darwin9-ppc64`. These and the host script copy project inputs with
+  `rsync -ac --no-times`: changed bytes get a fresh timestamp even when a
+  restored source file is older than its object. After a build made with the
+  old timestamp-preserving copy, invalidate the affected copied-source objects
+  once; an unchanged sync cannot repair an already stale object.
+  Before packaging, compare project/prepared source hashes, check both slices
+  for unresolved own `OSMesa`/`rdn`/`RDNGL` symbols, and match extracted universal
+  slices to the fresh binaries. Dynamic lookup can otherwise hide missing
+  helper definitions. The `rdn_nv12_test` target exercises the public packing
+  API; `RDN_SOFT=1` selects the host oracle. Native execution requires the
+  matched kernel/GL pair and remains a separate pixel/lifetime validation gate.
 - `scripts/darwin.sh image` once, then `scripts/darwin.sh <command>`: run
   the cross toolchain for Tiger (GCC 14.2 for `powerpc-apple-darwin8`, the
   10.4u SDK) in a container that sees only the repository.
@@ -139,8 +152,7 @@ skill (`scripts/mac.sh`).
   linux-firmware or kernel.org when `firmware/` lacks it) and
   `g5/install.sh`, `g5/uninstall.sh`, `g5/README.txt` into
   `build/RadeonNI-g5.tar.gz`, to be unpacked and installed on the real
-  Mac. There, `sudo ./install.sh --accel` (the hardware cursor is always on
-  with it; `--hwcursor` is accepted and changes nothing) installs the kext
+  Mac. There, `sudo ./install.sh --accel [--hwcursor]` installs the kext
   with the Quartz Extreme personality `kext.sh` uses under QEMU, plus the
   bundle and the plug-in; without options, phase 1's. The installer's
   bundle and plug-in step has not run anywhere yet.

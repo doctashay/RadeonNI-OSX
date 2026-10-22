@@ -77,6 +77,29 @@ executable(
   install : false,
 )
 
+rdn_nv12_test_sources = [rdn_sources, files('tests/rdn_nv12_test.c')]
+rdn_nv12_test_link_args = rdn_device_link_args
+if host_machine.system() == 'darwin'
+  # Keep the static C++ runtime local, as for the Leopard GL bundle.
+  rdn_nv12_test_link_args += [
+    '-Wl,-exported_symbols_list,' + meson.current_source_dir() / 'rdn_nv12_test.exports',
+  ]
+endif
+if host_machine.system() != 'darwin' and with_gallium_softpipe
+  rdn_nv12_test_sources += files('tests/rdn_soft.c')
+endif
+executable(
+  'rdn_nv12_test',
+  rdn_nv12_test_sources,
+  c_args : rdn_gltest_args,
+  include_directories : rdn_inc,
+  link_args : rdn_nv12_test_link_args,
+  link_whole : rdn_link_whole,
+  link_with : rdn_link_with,
+  dependencies : rdn_gltest_deps,
+  install : false,
+)
+
 # rdnvd: the card's video decoder for programs (rdnvd.h): Mesa's r600 UVD code behind a plain C
 # interface, with the H.264 layer of video/. Only the rdnvd_* entry points are exported.
 rdnvd_sources = [rdn_sources, files('rdnvd.c', 'video/rdnvd_h264.c')]
@@ -127,7 +150,7 @@ if host_machine.system() == 'darwin'
   )
   shared_module(
     'RadeonNIGLDriver',
-    files('gld/RadeonNIGLDriver.c', 'gld/rdn_mesa.c', 'gld/rdn_hook.c', 'gld/rdn_arbtext.c'), rdn_dispatch_c,
+    files('gld/RadeonNIGLDriver.c', 'gld/rdn_mesa.c', 'gld/rdn_hook.c', 'gld/rdn_arbtext.c', 'gld/rdn_video.c'), rdn_dispatch_c,
     rdn_sources,
     c_args : ['-DRDN_MESA'],
     include_directories : [rdn_inc, include_directories('gld')],

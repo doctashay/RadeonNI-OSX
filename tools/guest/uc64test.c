@@ -18,7 +18,7 @@ int main(int argc, char **argv)
     service = IOServiceGetMatchingService(kIOMasterPortDefault,
                                          IOServiceMatching(RDN_UC_SERVICE_CLASS));
     if (!service) return 1;
-    kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE, &conn);
+    kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE_V2, &conn);
     IOObjectRelease(service);
     printf("open: %x\n", kr);
     if (kr) return 1;

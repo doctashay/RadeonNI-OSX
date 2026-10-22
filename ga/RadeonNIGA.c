@@ -81,10 +81,11 @@ static IOReturn ga_gpu_wait(struct ga *ga)
 {
 	UInt32 reached = 0;
 	IOReturn ret;
-	IOReturn error = ga->gpu_error;
 
+	if (ga->gpu_error)
+		return ga->gpu_error;
 	if (!ga->gpu_pending)
-		return error;
+		return kIOReturnSuccess;
 	ret = IOConnectMethodScalarIScalarO(ga->conn, RDN_UC_FENCE_WAIT, 2, 1,
 					 ga->gpu_fence, 2000, &reached);
 	if (ret)
@@ -92,7 +93,7 @@ static IOReturn ga_gpu_wait(struct ga *ga)
 	if (!reached)
 		return kIOReturnTimeout;
 	ga->gpu_pending = 0;
-	return error;
+	return kIOReturnSuccess;
 }
 
 static IOReturn ga_gpu_fill(struct ga *ga, SInt32 x, SInt32 y, SInt32 w, SInt32 h,
