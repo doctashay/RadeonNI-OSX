@@ -50,13 +50,13 @@ done
 for d in src/gallium/winsys/rdn src/gallium/frontends/rdn src/gallium/targets/rdn; do
     [ -L "$d" ] && rm "$d"
 done
-rsync -a --delete "$root/mesa/winsys/" src/gallium/winsys/rdn/
-rsync -a --delete "$root/mesa/frontend/" src/gallium/frontends/rdn/
-rsync -a --delete --exclude hw --exclude tests --exclude gld --exclude video "$root/mesa/target/" src/gallium/targets/rdn/
-rsync -a --delete --exclude tests "$root/video/" src/gallium/targets/rdn/video/
-rsync -a --delete "$root/hw/" src/gallium/targets/rdn/hw/
-rsync -a --delete "$root/mesa/tests/" src/gallium/targets/rdn/tests/
-rsync -a --delete --exclude build "$root/gld/" src/gallium/targets/rdn/gld/
+rsync -ac --no-times --delete "$root/mesa/winsys/" src/gallium/winsys/rdn/
+rsync -ac --no-times --delete "$root/mesa/frontend/" src/gallium/frontends/rdn/
+rsync -ac --no-times --delete --exclude hw --exclude tests --exclude gld --exclude video "$root/mesa/target/" src/gallium/targets/rdn/
+rsync -ac --no-times --delete --exclude tests "$root/video/" src/gallium/targets/rdn/video/
+rsync -ac --no-times --delete "$root/hw/" src/gallium/targets/rdn/hw/
+rsync -ac --no-times --delete "$root/mesa/tests/" src/gallium/targets/rdn/tests/
+rsync -ac --no-times --delete --exclude build "$root/gld/" src/gallium/targets/rdn/gld/
 
 common=(-Drdn=true -Dgallium-drivers=r600,softpipe -Dvulkan-drivers=
     -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dllvm=disabled
@@ -107,7 +107,7 @@ darwin)
     # code is larger than that.
     compat=$tp/darwin8-compat
     mkdir -p "$compat"
-    rsync -a --delete "$root/mesa/darwin8/" "$compat/src/"
+    rsync -ac --no-times --delete "$root/mesa/darwin8/" "$compat/src/"
     # tiger_emutls.o is named on the link line by itself, before libgcc,
     # so that its __emutls_get_address is the one that gets linked.
     "$root/scripts/darwin.sh" sh -c "powerpc-apple-darwin8-gcc -O2 -Wall \

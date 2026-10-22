@@ -1,5 +1,47 @@
 # Display modes, display power management and hot-plug
 
+## Leopard corrections (2026-10-18)
+
+Status: unqualified. The first candidate caused a boot panic. The working
+kernel was restored and the user confirmed recovery. Power registration now
+occurs in enableController in the candidate, which builds on Leopard but is
+not installed. Live display-power validation remains pending. See JOURNAL.md.
+
+The implementation now advertises high-level DDC so IODisplay can read its
+EDID, reports live connection availability, validates connection/block
+arguments, and derives detailed-timing link count from the same DVI decision
+used by modesetting. Geometry is published only after programming succeeds.
+
+Display power uses explicit framebuffer states and the usable-state bit of
+`kConnectionPower`. Requested power is separate from actual output state;
+mode changes while asleep are deferred, and hotplug polling ignores sleeping
+outputs. Connection callbacks run outside the display lock with the callback
+target retained during delivery.
+
+The framebuffer registers the standard three-state power model. All states
+carry `kIOPMPreventSystemSleep`: this is doze-only support, not complete system
+sleep. GPU quiescence, VRAM preservation, PCI/ASIC/CP/GART restoration and
+context resumption remain required before removing that capability flag.
+`SystemSleepSupported` is published as false. Do not qualify system sleep on
+the basis of display sleep tests.
+
+References: Apple IOGraphics-193.2 `IODisplay::readFramebufferEDID`,
+`IODisplay::setPowerState`, and `IONDRVFramebuffer::initForPM`. These replace
+the guessed power-state mapping described in the historical notes below.
+
+Multiple displays still require a shared card/accelerator owner and separate
+framebuffer instances with per-output EDID, CRTC, cursor, power and mode state.
+The current framebuffer exposes one connection; no second display is claimed.
+
+EDID queries now share the hotplug lock. A reconnect that fails modesetting
+restores the old mode table and leaves the connection unavailable for retry;
+EDID and preferred-mode properties are published after success. The host test
+`python3 tests/test_display_reconnect.py` executes the reconnect method with
+injected detection/modeset failures and a successful retry. It does not test
+hardware recovery from partial modesetting or live display sleep.
+
+## Historical investigation
+
 Written 2026-10-08. Status: **the mode list works on the G5 (54 modes; Quake 3
 and Doom 3 start from scratch). Hot-plug works on the DVI-I connector (user
 unplugged and replugged the cable: "the monitor was unplugged", "the monitor is

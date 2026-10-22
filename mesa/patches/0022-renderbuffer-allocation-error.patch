@@ -1,0 +1,10 @@
+--- a/src/mesa/main/fbobject.c
++++ b/src/mesa/main/fbobject.c
+@@ -2815,6 +2815,7 @@
+       assert(rb->_BaseFormat != 0);
+    }
+    else {
++      _mesa_error(ctx, GL_OUT_OF_MEMORY, "glRenderbufferStorage");
+       /* Probably ran out of memory - clear the fields */
+       rb->Width = 0;
+       rb->Height = 0;

@@ -37,6 +37,7 @@
 
 # Build output
 /build/
+/gld/build-leopard-universal/
 *.o
 *.a
 *.d

@@ -17,7 +17,8 @@
 #include <stdint.h>
 
 #define RDN_UC_SERVICE_CLASS		"RadeonNIAccel"
-#define RDN_UC_TYPE			0x72646e31	/* 'rdn1' */
+#define RDN_UC_TYPE			0x72646e31	/* upstream 'rdn1' */
+#define RDN_UC_TYPE_V2			0x72646e32	/* unified 'rdn2' */
 #define RDN_UC_MEMORY_APERTURE		0
 
 enum {
@@ -44,7 +45,8 @@ enum {
 	 * height. Where the surface's picture is kept: a linear buffer of
 	 * 32-bit pixels, top row first, which the kext shows to whoever
 	 * locks the surface for reading (the window server). Width 0 takes
-	 * the buffer away again.
+	 * the buffer away again. Offset UINT32_MAX with the other fields zero
+	 * releases the registration, including an unattached reservation.
 	 */
 	RDN_UC_SURFACE_BUFFER,
 	/* struct out: struct rdn_user_surfaces, every surface with a buffer */
@@ -188,7 +190,70 @@ enum {
 	 * out: fence. As RDN_UC_UVD_SUBMIT, with the indirect buffer given by value (the kext keeps it in its own slot of the segment).
 	 */
 	RDN_UC_UVD_SUBMIT_WORDS,
+	RDN_UC_V1_METHOD_COUNT,
+	/* scalars in: address low/high words, byte length; out: GART offset. */
+	RDN_UC_GART_BIND64 = RDN_UC_V1_METHOD_COUNT,
+	/* Surface backing metadata, restricted to its owning task. */
+	RDN_UC_SURFACE_BACKING,
+	/* scalar in: surface ID; out: metadata, with id 0 when absent. */
+	RDN_UC_SURFACE_QUERY,
+	/* Diagnostic only: does not advertise a hardware video decoder. */
+	RDN_UC_UVD_DIAGNOSTIC_INFO,
+	/* Admin only, EnableUVDDiagnostics personality opt-in; reserved input 0. */
+	RDN_UC_UVD_DIAGNOSTIC_INIT,
+	/* Admin-only fixed fixture; reserved input0, versioned status output. */
+	RDN_UC_UVD_FIXTURE_RUN,
+	/* Admin-only immutable CPU snapshot: generation, chunk index ->4096 bytes. */
+	RDN_UC_UVD_FIXTURE_READ,
 	RDN_UC_METHOD_COUNT
+};
+
+#define RDN_UVD_FIXTURE_VERSION 1u
+#define RDN_UVD_FIXTURE_ID 1u
+#define RDN_UVD_FIXTURE_CHUNK_BYTES 4096u
+#define RDN_UVD_FIXTURE_IDLE 0u
+#define RDN_UVD_FIXTURE_RUNNING 1u
+#define RDN_UVD_FIXTURE_COMPLETE 2u
+#define RDN_UVD_FIXTURE_FAILED 3u
+/* Complete CPU snapshot available, including diagnostic output from a failed check. */
+#define RDN_UVD_FIXTURE_OUTPUT_READY 1u
+#define RDN_UVD_FIXTURE_GUARDS_OK 2u
+#define RDN_UVD_FIXTURE_PACKED_MESSAGE 1u
+enum {
+	RDN_UVD_FIXTURE_PREPARE,
+	RDN_UVD_FIXTURE_CREATE_WAIT,
+	RDN_UVD_FIXTURE_DECODE_WAIT,
+	RDN_UVD_FIXTURE_SNAPSHOT,
+	RDN_UVD_FIXTURE_DESTROY_WAIT,
+	RDN_UVD_FIXTURE_FINISHED
+};
+
+struct rdn_user_uvd_fixture {
+	uint32_t version, fixture_id, state, stage;
+	int32_t error;
+	uint32_t generation, width, height, target_pitch, target_bytes;
+	uint32_t snapshot_bytes, feedback_offset, feedback_bytes;
+	uint32_t create_fence, decode_fence, destroy_fence, message_variant, flags;
+	int32_t idle_error;
+	uint32_t reserved[5];
+};
+
+#define RDN_UVD_DIAGNOSTIC_VERSION 1
+#define RDN_UVD_DIAGNOSTIC_ALLOWED 1
+#define RDN_UVD_DIAGNOSTIC_FIRMWARE 2
+#define RDN_UVD_DIAGNOSTIC_RLC_FIRMWARE 4
+#define RDN_UVD_DIAGNOSTIC_OFF 0
+#define RDN_UVD_DIAGNOSTIC_RING_READY 1
+#define RDN_UVD_DIAGNOSTIC_FAULTED 2
+
+struct rdn_user_uvd_diagnostic {
+	uint32_t version;
+	uint32_t flags;
+	uint32_t state;
+	uint32_t last_status;
+	int32_t last_error;
+	uint32_t reserved_bytes;
+	uint32_t reserved[2];
 };
 
 #define RDN_UC_POWER_QUERY		0
@@ -200,6 +265,14 @@ enum {
 #define RDN_UC_UVD_F_SEGMENT		(1u << 18)
 #define RDN_UC_UVD_F_APERTURE		(1u << 19)
 #define RDN_UC_UVD_F_SPLIT		(1u << 31)
+
+struct rdn_user_backing {
+	uint32_t address_lo, address_hi, row_bytes, width, height;
+};
+
+struct rdn_user_surface_info {
+	uint32_t id, offset, row_bytes, width, height;
+};
 
 struct rdn_user_info {
 	uint32_t version;		/* RDN_USER_VERSION */

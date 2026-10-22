@@ -34,6 +34,10 @@ void rdn_dispatch_kept_report(const char *when);
 /* rdn_mesa.c: the engine context whose Mesa context is current. */
 /* Per thread: Mesa's current context is too. */
 extern __thread void *rdn_current_rend;
+extern int rdn_modern_contexts;
+int RDNGLRequestCompatibilityContext(int major, int minor);
+int RDNGLMakeCurrent(void *cgl_context);
+void *RDNGLGetProcAddress(const char *name);
 void rdn_make_current(void *rend);
 
 /* rdn_mesa.c: what the bundle tells it about, as the gld* calls go by. */
@@ -58,24 +62,28 @@ void rdn_hook_set_current(void (*after)(void *cgl_ctx));
  * when the program cannot be hooked.
  */
 int rdn_hook_function_lookup(void *(*own)(const char *name));
+void *rdn_mesa_lookup_missing(const char *name, void *cgl_ctx);
 /*
  * rdn_hook.c: let `handler` answer CGLTexImagePBuffer (it returns 1 and
  * the CGL error in *result, or 0 to leave the call to OpenGL).
  */
 void rdn_hook_tex_image_pbuffer(int (*handler)(void *cgl_ctx, void *pbuffer,
-					       long source, long *result));
+					       int source, int *result));
 /* rdn_hook.c: log CGLCreatePBuffer, CGLSetPBuffer and CGLChoosePixelFormat. */
 void rdn_hook_cgl_log(void);
+void rdn_hook_prepare_pbuffer(void (*prepare)(void *ctx, void *pbuffer));
+void rdn_mesa_prepare_pbuffer(void *ctx, void *pbuffer);
 /* rdn_hook.c: the same for the window server's cglsTexImagePBuffer. */
-void rdn_hook_cgls_tex_image(int (*handler)(void *ctx, void *pbuffer, long source,
-					    long *result));
+void rdn_hook_cgls_tex_image(int (*handler)(void *ctx, void *pbuffer, int source,
+					    int *result));
 /*
  * rdn_hook.c: let `handler` see the window server's cglsSetInteger (ctx,
  * parameter, values); it returns 1 and the result for a call that is
  * ours, 0 to leave it to OpenGL's engine. 0 when it cannot be hooked.
  */
-int rdn_hook_cgls_set_integer(int (*handler)(void *ctx, long pname, long *vals, long *result));
-int rdn_mesa_cgls_set_integer(void *ctx, long pname, long *vals, long *result);
+void rdn_hook_set_parameter(int (*handler)(void *, int, int *, int *));
+int rdn_hook_cgls_set_integer(int (*handler)(void *ctx, int pname, int *vals, int *result));
+int rdn_mesa_cgls_set_integer(void *ctx, int pname, int *vals, int *result);
 /*
  * rdn_hook.c: `handler` is called with a pbuffer object just before
  * CGLDestroyPBuffer (or the window server's cglsDestroyPBuffer) destroys it.
@@ -98,9 +106,9 @@ void rdn_flush_surface(void *rend);
 /* The pbuffer records are the window server's (size in words 8 and 9). */
 void rdn_mesa_pbuffer_layout(int window_server);
 int rdn_mesa_is_pbuffer(void *gld_ctx);
-int rdn_mesa_tex_image_pbuffer_ws(void *cgls_ctx, void *pbuffer, long source, long *result);
+int rdn_mesa_tex_image_pbuffer_ws(void *cgls_ctx, void *pbuffer, int source, int *result);
 /* CGLTexImagePBuffer for a context of ours (rdn_mesa.c). */
-int rdn_mesa_tex_image_pbuffer(void *cgl_ctx, void *pbuffer, long source, long *result);
+int rdn_mesa_tex_image_pbuffer(void *cgl_ctx, void *pbuffer, int source, int *result);
 /* 0 if a pbuffer's memory cannot be had: the attach is to fail. */
 int rdn_mesa_attach(void *gld_ctx, long type, const void *drawable);
 /*
@@ -194,6 +202,7 @@ int rdn_swap(void *rend);
  * them). See rdn_watch_end() in rdn_mesa.c.
  */
 extern int rdn_watch;
+extern int rdn_surface_texture_hook;
 /* Set by the bundle when the process is the window server. */
 extern int rdn_window_server;
 void rdn_watch_ortho(double left, double right, double bottom, double top,
@@ -224,5 +233,9 @@ void rdn_mesa_double(int yes);
 
 /* RadeonNIGLDriver.c: one line into the bundle's log, if it has one. */
 void rdn_log(const char *fmt, ...);
+
+void rdn_mesa_backing_viewport(void *rend, int x, int y, int width, int height);
+
+int rdn_mesa_unpack_row_bytes(void *rend, int value);
 
 #endif /* RDN_GLUE_H */

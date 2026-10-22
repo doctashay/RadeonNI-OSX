@@ -61,6 +61,10 @@
 #define RDN_UVD_F_APERTURE	(1 << 19)	/* (kext) a started block that idles is started again in the aperture (tests: to compare the two) */
 #define RDN_UVD_F_GART		(1 << 9)	/* (kext) the VCPU region and ring in GART memory: addresses with bits 32-39 zero */
 
+#define RDN_UVD_MAX_RING_BYTES (1u << 20)
+#define RDN_UVD_MAX_TIMEOUT_MS 10000u
+#define RDN_UVD_RLC_BYTES 3072u
+
 struct rdn_uvd {
 	struct rdn_accel *accel;
 	uint32_t ref_freq;	/* the PLL's reference clock, 10 kHz units */
@@ -91,6 +95,14 @@ struct rdn_uvd {
 	uint32_t fence_emitted;
 	bool swapped;
 	bool ready;
+	bool guarded; /* Cold-start policy retains storage after hardware access. */
+	bool started; /* Sticky: hardware has been given these buffers. */
+	bool failed;
+	bool stopped;
+	uint32_t status_snapshot; /* Last boot status read while clocked. */
+	uint32_t rlc_cntl_snapshot;
+	bool rlc_loaded;
+	bool prepared;
 };
 
 /*
@@ -227,5 +239,41 @@ void rdn_uvd_set_reset_level(unsigned level);
 
 /* For debugging: 1 reset every sub-block (with the memory controller and the register bus stalled around it), 2 reset the whole block (SRBM_SOFT_RESET). */
 void rdn_uvd_debug_reset(struct rdn_uvd *uvd, unsigned what);
+
+/* Diagnostic only: caller drains graphics and serializes all engine access.
+ * Requires the exact BTC_rlc image and an initially disabled RLC. RLC remains
+ * enabled after UVD failure/fini; restoring its prior state is not proven safe.
+ */
+int rdn_uvd_init_rlc(struct rdn_uvd *uvd, struct rdn_accel *accel,
+		     uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
+		     uint32_t handles, uint32_t vcpu_offset, uint32_t ring_offset,
+		     uint32_t ring_bytes, uint32_t flags,
+		     const uint8_t *rlc_fw, uint32_t rlc_size);
+/* Split cold startup: prepare windows/RLC, initialize CP, then start VCPU.
+ * Keep accel and its VRAM mapping stable across both calls. Prepared storage
+ * remains quarantined; fini cancels preparation without accessing UVD MMIO.
+ */
+int rdn_uvd_prepare_rlc(struct rdn_uvd *uvd, struct rdn_accel *accel,
+		     uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
+		     uint32_t handles, uint32_t vcpu_offset, uint32_t ring_offset,
+		     uint32_t ring_bytes, uint32_t flags,
+		     const uint8_t *rlc_fw, uint32_t rlc_size);
+int rdn_uvd_start_prepared(struct rdn_uvd *uvd);
+/* True only before hardware access; reset does not prove DMA quiescence. */
+bool rdn_uvd_storage_releasable(const struct rdn_uvd *uvd);
+
+
+int rdn_uvd_init_mem_checked(struct rdn_uvd *uvd, struct rdn_accel *accel,
+		     uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
+		     uint32_t handles, volatile uint8_t *vcpu_cpu, uint64_t vcpu_gpu,
+		     volatile uint8_t *ring_cpu, uint64_t ring_gpu,
+		     uint32_t ring_bytes, uint32_t flags);
+
+int rdn_uvd_init_checked(struct rdn_uvd *uvd, struct rdn_accel *accel,
+		 uint32_t ref_freq, const uint8_t *fw, uint32_t fw_size,
+		 uint32_t handles, uint32_t vcpu_offset, uint32_t ring_offset,
+		 uint32_t ring_bytes, uint32_t flags);
+
+int rdn_uvd_ib_try_submit(struct rdn_uvd *uvd, uint64_t gpu_addr, uint32_t words, uint32_t *seq);
 
 #endif /* RDN_UVD_H */

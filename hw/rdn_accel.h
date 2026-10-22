@@ -108,6 +108,12 @@ int rdn_accel_init(struct rdn_accel *accel, struct rdn_card *card,
 		   volatile void *aperture, uint32_t aperture_size,
 		   const struct rdn_accel_fw *fw,
 		   uint32_t ring_offset, uint32_t ring_bytes, bool swapped);
+/* Called once after firmware load while ME/PFP are halted, before CP resume. */
+int rdn_accel_init_hook(struct rdn_accel *accel, struct rdn_card *card,
+			volatile void *aperture, uint32_t aperture_size,
+			const struct rdn_accel_fw *fw,
+			uint32_t ring_offset, uint32_t ring_bytes, bool swapped,
+			void (*before_resume)(void *), void *cookie);
 void rdn_accel_fini(struct rdn_accel *accel);
 
 /* rdn_gpu.c */
@@ -154,6 +160,9 @@ int rdn_ib_selftest(struct rdn_accel *accel, uint64_t gpu_addr, uint32_t *cpu);
  */
 int rdn_ib_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
 		  uint32_t *seq);
+/* Caller holds the ring lock. No waits; any error leaves ring, fence and seq unchanged. */
+int rdn_ib_try_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
+		     uint32_t *seq);
 
 /*
  * rdn_blit.c: copy rectangles from one surface to another with the 3D

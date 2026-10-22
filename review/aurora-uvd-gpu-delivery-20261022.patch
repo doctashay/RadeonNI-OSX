@@ -1,0 +1,1602 @@
+diff --git a/media/gpu/mac/BUILD.gn b/media/gpu/mac/BUILD.gn
+--- a/media/gpu/mac/BUILD.gn
++++ b/media/gpu/mac/BUILD.gn
+@@ -26,6 +26,9 @@
+       "radeon_uvd/annex_b_replay.h",
+       "radeon_uvd/annex_b_replay.cc",
+       "radeon_uvd/radeon_uvd_backend.h",
++      "radeon_uvd/radeon_uvd_gl_bridge.h",
++      "radeon_uvd/radeon_uvd_frame_converter.h",
++      "radeon_uvd/radeon_uvd_frame_converter.cc",
+       "radeon_uvd/radeon_uvd_iokit_backend.cc",
+       "radeon_uvd/radeon_uvd_iokit_backend.h",
+       "radeon_uvd/radeon_uvd_session.cc",
+@@ -42,9 +45,14 @@
+       "//base",
+       "//media",
+       "//media/gpu:common",
++      "//components/viz/common:shared_image_format",
++      "//gpu/command_buffer/service",
++      "//gpu/command_buffer/service:gles2",
++      "//gpu/ipc/service",
++      "//ui/gl",
+       "//ui/gfx/geometry",
+     ]
+-    frameworks = [ "IOKit.framework" ]
++    frameworks = [ "IOKit.framework", "OpenGL.framework" ]
+   }
+   if ((current_cpu != "ppc" && current_cpu != "ppc64")) {
+     sources += [
+@@ -115,11 +123,16 @@
+     deps += [ "//third_party/ffmpeg" ]
+   }
+ 
+-  sources = [
+-    "video_toolbox_decompression_interface_unittest.cc",
+-    "video_toolbox_h264_accelerator_unittest.cc",
+-    "video_toolbox_output_queue_unittest.cc",
+-    "vp9_super_frame_bitstream_filter_unittest.cc",
+-    "vt_config_util_unittest.cc",
+-  ]
++  if ((current_cpu == "ppc" || current_cpu == "ppc64") &&
++      enable_ffmpeg_video_decoders) {
++    sources = [ "radeon_uvd/radeon_uvd_frame_converter_unittest.cc" ]
++  } else {
++    sources = [
++      "video_toolbox_decompression_interface_unittest.cc",
++      "video_toolbox_h264_accelerator_unittest.cc",
++      "video_toolbox_output_queue_unittest.cc",
++      "vp9_super_frame_bitstream_filter_unittest.cc",
++      "vt_config_util_unittest.cc",
++    ]
++  }
+ }
+diff --git a/media/mojo/services/gpu_mojo_media_client_mac.cc b/media/mojo/services/gpu_mojo_media_client_mac.cc
+--- a/media/mojo/services/gpu_mojo_media_client_mac.cc
++++ b/media/mojo/services/gpu_mojo_media_client_mac.cc
+@@ -44,7 +44,11 @@
+   if (!RadeonUvdEnabled(traits.gpu_preferences)) return nullptr;
+   return std::make_unique<aurora_uvd::ReplayVideoDecoder>(
+       std::make_unique<aurora_uvd::RadeonUvdVideoDecoder>(
+-          aurora_uvd::CreateIOKitBackend()),
++          aurora_uvd::CreateIOKitBackend(),
++          base::CommandLine::ForCurrentProcess()->HasSwitch("disable-radeon-uvd-gpu-output")
++              ? aurora_uvd::ConvertGpuFrameCB()
++              : aurora_uvd::CreateGpuFrameConverter(
++                    traits.gpu_task_runner, traits.get_command_buffer_stub_cb)),
+       base::BindRepeating(&aurora_uvd::CreateWorkerFFmpegDecoder),
+       traits.media_log->Clone());
+ #elif defined(ARCH_CPU_PPC_FAMILY)
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_backend.h b/media/gpu/mac/radeon_uvd/radeon_uvd_backend.h
+--- a/media/gpu/mac/radeon_uvd/radeon_uvd_backend.h
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_backend.h
+@@ -11,11 +11,18 @@
+   bool ready = false;
+   uint32_t profile_mask = 0;  // Baseline=1, Main=2, High=4; not a wire format.
+   uint32_t max_width = 0, max_height = 0, max_bitstream_bytes = 0;
++  bool gpu_output = false;
+ };
+ struct LinearNV12 {
+   uint32_t width = 0, height = 0, y_stride = 0, uv_stride = 0;
+   size_t y_offset = 0, uv_offset = 0;
+   std::vector<uint8_t> bytes;
++};
++
++struct GpuOutput {
++  uint32_t video_connection = 0;
++  uint32_t source_token[8] = {};
++  uint32_t width = 0, height = 0;
+ };
+ 
+ // All calls and destruction run on the decoder worker. No GPU pointers escape.
+@@ -32,6 +39,18 @@
+                                    const std::vector<uint8_t>& annex_b,
+                                    uint8_t* destination, size_t capacity);
+   // Failure must retain/quarantine uncertain GPU storage, including on destruction.
++  virtual BackendStatus CreateGpu(const rdn_uvd_h264_config&) {
++    return BackendStatus::kUnsupported;
++  }
++  // Additive output-lease API. Unsupported until the kernel bridge is ready.
++  virtual BackendStatus DecodeGpu(const Metadata&, const std::vector<uint8_t>&,
++                                  GpuOutput*) {
++    return BackendStatus::kUnsupported;
++  }
++  // false requires quarantine; it must never recycle the source target.
++  virtual BackendStatus RetireGpu(const GpuOutput&, bool completed) {
++    return BackendStatus::kUnsupported;
++  }
+   virtual BackendStatus Destroy() = 0;
+ };
+ }  // namespace aurora_uvd
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_session.h b/media/gpu/mac/radeon_uvd/radeon_uvd_session.h
+--- a/media/gpu/mac/radeon_uvd/radeon_uvd_session.h
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_session.h
+@@ -34,10 +34,15 @@
+   BackendStatus DecodeInto(const Metadata& metadata, bool idr,
+                            const std::vector<uint8_t>& annex_b,
+                            uint8_t* destination, size_t capacity);
++  BackendStatus DecodeGpu(const Metadata&, bool idr,
++                           const std::vector<uint8_t>&, GpuOutput*);
++  BackendStatus RetireGpu(const GpuOutput&, bool completed);
+   BackendStatus Reset();
+   bool faulted() const { return faulted_; }
+ 
+  private:
++  BackendStatus Prepare(const Metadata&, bool idr,
++                         const std::vector<uint8_t>&, bool gpu);
+   BackendStatus DecodeCommon(const Metadata& metadata, bool idr,
+                              const std::vector<uint8_t>& annex_b,
+                              LinearNV12* output, uint8_t* destination,
+@@ -46,6 +51,9 @@
+   rdn_uvd_h264_config config_ = {};
+   bool opened_ = false;
+   bool faulted_ = false;
++  bool gpu_created_ = false;
++  bool gpu_pending_ = false;
++  GpuOutput gpu_output_;
+ };
+ }  // namespace aurora_uvd
+ #endif
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_session.cc b/media/gpu/mac/radeon_uvd/radeon_uvd_session.cc
+--- a/media/gpu/mac/radeon_uvd/radeon_uvd_session.cc
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_session.cc
+@@ -71,7 +71,10 @@
+                   destination, capacity) ? BackendStatus::kOk : BackendStatus::kFailure;
+ }
+ Session::Session(std::unique_ptr<Backend> backend) : backend_(std::move(backend)) {}
+-Session::~Session() { Reset(); }
++Session::~Session() {
++  if (gpu_pending_) RetireGpu(gpu_output_, false);
++  Reset();
++}
+ BackendStatus Session::Query(Capabilities* actual) {
+   if (!backend_ || faulted_ || !actual) return BackendStatus::kFailure;
+   Capabilities candidate;
+@@ -88,6 +91,7 @@
+   return BackendStatus::kOk;
+ }
+ BackendStatus Session::Reset() {
++  if (gpu_pending_) return BackendStatus::kFailure;
+   if (opened_) {
+     opened_ = false;
+     BackendStatus status = backend_->Destroy();
+@@ -109,14 +113,13 @@
+   if (!ValidDestination(metadata, destination, capacity)) return BackendStatus::kFailure;
+   return DecodeCommon(metadata, idr, bytes, nullptr, destination, capacity);
+ }
+-BackendStatus Session::DecodeCommon(const Metadata& metadata, bool idr,
+-                                    const std::vector<uint8_t>& bytes,
+-                                    LinearNV12* output, uint8_t* destination,
+-                                    size_t capacity) {
+-  if (faulted_ || bytes.empty()) return BackendStatus::kFailure;
++BackendStatus Session::Prepare(const Metadata& metadata, bool idr,
++                                const std::vector<uint8_t>& bytes, bool gpu) {
++  if (faulted_ || gpu_pending_ || bytes.empty()) return BackendStatus::kFailure;
+   Capabilities caps;
+   BackendStatus status = Query(&caps);
+   if (status != BackendStatus::kOk) return status;
++  if (gpu && !caps.gpu_output) return BackendStatus::kUnsupported;
+   const auto& c = metadata.config;
+   rdn_uvd_h264_layout layout;
+   uint8_t message[RDN_UVD_H264_MESSAGE_BYTES];
+@@ -128,20 +131,66 @@
+                               static_cast<uint32_t>(bytes.size()), message, sizeof(message)))
+     return BackendStatus::kUnsupported;
+   // A changed firmware DPB cannot retain references from the previous session.
+-  const bool changed = !opened_ || memcmp(&config_, &c, sizeof(c)) != 0;
++  const bool changed = !opened_ || gpu_created_ != gpu ||
++      memcmp(&config_, &c, sizeof(c)) != 0;
+   if (changed) {
+     if (!idr || metadata.picture.reference_count) return BackendStatus::kUnsupported;
+     status = Reset();
+     if (status != BackendStatus::kOk) return status;
+-    status = backend_->Create(c);
++    status = gpu ? backend_->CreateGpu(c) : backend_->Create(c);
+     if (status != BackendStatus::kOk) {
+       // Create owns cleanup for partial allocation/submission; uncertain failure is terminal.
+       faulted_ = status != BackendStatus::kUnsupported;
+       return status;
+     }
+     opened_ = true;
++    gpu_created_ = gpu;
+     config_ = c;
+   }
++  return BackendStatus::kOk;
++}
++BackendStatus Session::DecodeGpu(const Metadata& metadata, bool idr,
++                                  const std::vector<uint8_t>& bytes,
++                                  GpuOutput* output) {
++  if (!output) return BackendStatus::kFailure;
++  auto status = Prepare(metadata, idr, bytes, true);
++  if (status != BackendStatus::kOk) return status;
++  GpuOutput candidate;
++  status = backend_->DecodeGpu(metadata, bytes, &candidate);
++  if (status != BackendStatus::kOk) {
++    faulted_ = true;
++    return status;
++  }
++  uint32_t token = 0;
++  for (uint32_t word : candidate.source_token) token |= word;
++  if (!candidate.video_connection || !token ||
++      candidate.width != config_.coded_width ||
++      candidate.height != config_.coded_height) {
++    backend_->RetireGpu(candidate, false);
++    faulted_ = true;
++    return BackendStatus::kFailure;
++  }
++  gpu_output_ = candidate;
++  gpu_pending_ = true;
++  *output = candidate;
++  return BackendStatus::kOk;
++}
++BackendStatus Session::RetireGpu(const GpuOutput& output, bool completed) {
++  if (!gpu_pending_ || memcmp(&output, &gpu_output_, sizeof(output)))
++    return BackendStatus::kFailure;
++  gpu_pending_ = false;
++  auto status = backend_->RetireGpu(output, completed);
++  if (!completed || status != BackendStatus::kOk) faulted_ = true;
++  gpu_output_ = {};
++  return status;
++}
++BackendStatus Session::DecodeCommon(const Metadata& metadata, bool idr,
++                                    const std::vector<uint8_t>& bytes,
++                                    LinearNV12* output, uint8_t* destination,
++                                    size_t capacity) {
++  auto status = Prepare(metadata, idr, bytes, false);
++  if (status != BackendStatus::kOk) return status;
++  const auto& c = metadata.config;
+   if (destination) {
+     status = backend_->DecodeInto(metadata, bytes, destination, capacity);
+     if (status != BackendStatus::kOk) faulted_ = true;
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.h b/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.h
+--- a/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.h
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.h
+@@ -5,11 +5,13 @@
+ #include "base/threading/sequence_bound.h"
+ #include "media/base/video_decoder.h"
+ #include "radeon_uvd_backend.h"
++#include "radeon_uvd_frame_converter.h"
+ 
+ namespace aurora_uvd {
+ class RadeonUvdVideoDecoder final : public media::VideoDecoder {
+  public:
+   explicit RadeonUvdVideoDecoder(std::unique_ptr<Backend> backend);
++  RadeonUvdVideoDecoder(std::unique_ptr<Backend>, ConvertGpuFrameCB);
+   ~RadeonUvdVideoDecoder() override;
+   void Initialize(const media::VideoDecoderConfig&, bool low_delay,
+                   media::CdmContext*, InitCB, const OutputCB&,
+@@ -18,7 +20,7 @@
+   void Reset(base::OnceClosure) override;
+   bool NeedsBitstreamConversion() const override { return true; }
+   int GetMaxDecodeRequests() const override { return 1; }
+-  bool FramesHoldExternalResources() const override { return false; }
++  bool FramesHoldExternalResources() const override { return !!convert_gpu_; }
+   bool IsPlatformDecoder() const override { return true; }
+   media::VideoDecoderType GetDecoderType() const override {
+     return media::VideoDecoderType::kRadeonUvd;
+@@ -31,6 +33,7 @@
+   void Output(uint64_t generation, scoped_refptr<media::VideoFrame> frame);
+   OutputCB WorkerOutput();
+   std::unique_ptr<Backend> initial_backend_;
++  ConvertGpuFrameCB convert_gpu_;
+   std::unique_ptr<base::SequenceBound<Core>> core_;
+   OutputCB output_;
+   DecodeCB pending_decode_;
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.cc b/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.cc
+--- a/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.cc
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.cc
+@@ -5,6 +5,7 @@
+ #endif
+ #include <utility>
+ #include "base/functional/bind.h"
++#include "base/logging.h"
+ #include "base/memory/read_only_shared_memory_region.h"
+ #include "base/task/bind_post_task.h"
+ #include "base/task/single_thread_task_runner.h"
+@@ -47,6 +48,7 @@
+   base::TimeDelta timestamp, duration;
+   gfx::Size natural_size;
+   scoped_refptr<media::VideoFrame> frame;
++  bool gpu_attempted = false;
+  private:
+   ~Picture() override = default;
+ };
+@@ -70,16 +72,51 @@
+   frame->set_hdr_metadata(picture.hdr_metadata());
+   return frame;
+ }
++class SessionOwner : public base::RefCountedDeleteOnSequence<SessionOwner> {
++ public:
++  explicit SessionOwner(std::unique_ptr<Backend> backend)
++      : base::RefCountedDeleteOnSequence<SessionOwner>(
++            base::SequencedTaskRunner::GetCurrentDefault()),
++        session(std::move(backend)) {}
++  Session session;
++ private:
++  friend class base::DeleteHelper<SessionOwner>;
++  friend class base::RefCountedDeleteOnSequence<SessionOwner>;
++  ~SessionOwner() = default;
++};
++
++class GpuLease : public base::RefCountedDeleteOnSequence<GpuLease> {
++ public:
++  GpuLease(scoped_refptr<SessionOwner> owner, GpuOutput source)
++      : base::RefCountedDeleteOnSequence<GpuLease>(
++            base::SequencedTaskRunner::GetCurrentDefault()),
++        owner_(std::move(owner)), source_(source) {}
++  BackendStatus Retire(bool completed) {
++    if (retired_) return BackendStatus::kFailure;
++    retired_ = true;
++    return owner_->session.RetireGpu(source_, completed);
++  }
++ private:
++  friend class base::DeleteHelper<GpuLease>;
++  friend class base::RefCountedDeleteOnSequence<GpuLease>;
++  ~GpuLease() { if (!retired_) Retire(false); }
++  scoped_refptr<SessionOwner> owner_;
++  const GpuOutput source_;
++  bool retired_ = false;
++};
+ }  // namespace
+ 
+ class RadeonUvdVideoDecoder::Core {
+  public:
+-  explicit Core(std::unique_ptr<Backend> backend) : session_(std::move(backend)) {}
++  Core(std::unique_ptr<Backend> backend, ConvertGpuFrameCB converter)
++      : owner_(base::MakeRefCounted<SessionOwner>(std::move(backend))),
++        session_(owner_->session), convert_gpu_(std::move(converter)) {}
+   ~Core() {
+     decoder_.reset();
+     session_.Reset();
+   }
+   Status Initialize(media::VideoDecoderConfig config, OutputCB output) {
++    if (gpu_pending_) return Code::kPlatformDecodeFailure;
+     decoder_.reset();
+     Status status = ToStatus(session_.Reset());
+     if (!status.is_ok()) return status;
+@@ -93,6 +130,9 @@
+         size.width() > static_cast<int>(caps_.max_width) ||
+         size.height() > static_cast<int>(caps_.max_height))
+       return Code::kUnsupportedConfig;
++    logged_gpu_frame_ = false;
++    LOG(WARNING) << "Radeon UVD output mode: "
++                 << (caps_.gpu_output && convert_gpu_ ? "GPU textures" : "SHMEM NV12");
+     failed_ = false;
+     last_error_ = Code::kOk;
+     stream_id_ = 0;
+@@ -101,7 +141,15 @@
+         config_.color_space_info());
+     return Code::kOk;
+   }
+-  Status Decode(scoped_refptr<media::DecoderBuffer> buffer) {
++  void Decode(scoped_refptr<media::DecoderBuffer> buffer, DecodeCB done) {
++    DCHECK(!decode_done_);
++    decode_done_ = std::move(done);
++    buffer_ = std::move(buffer);
++    Status status = StartDecode();
++    if (!gpu_pending_) CompleteDecode(status);
++  }
++  Status StartDecode() {
++    const auto& buffer = buffer_;
+     if (!decoder_) return Code::kNotInitialized;
+     if (failed_ || session_.faulted()) return Code::kPlatformDecodeFailure;
+     last_error_ = Code::kOk;
+@@ -119,6 +167,9 @@
+     timestamp_ = buffer->timestamp();
+     duration_ = buffer->duration();
+     decoder_->SetStream(++stream_id_, *buffer);
++    return ContinueDecode();
++  }
++  Status ContinueDecode() {
+     // Parsing and blocking backend calls stay on this dedicated worker.
+     for (unsigned changes = 0; changes < 256; ++changes) {
+       const auto result = decoder_->Decode();
+@@ -132,24 +183,59 @@
+               decoder_->GetChromaSampling() != media::VideoChromaSampling::k420)
+             return Fail(Code::kUnsupportedConfig);
+           continue;
+-        default:
+-          // This synchronous backend never requests resource/context retries.
++        case media::AcceleratedVideoDecoder::kTryAgain:
++          if (gpu_pending_) return Code::kOk;
+           failed_ = true;
+           return Error();
++        default:
++          failed_ = true;
++          return Error();
+       }
+     }
+     return Fail(Code::kUnsupportedConfig);
+   }
+-  void Reset(OutputCB output) {
++  void Reset(OutputCB output, base::OnceClosure done) {
+     output_ = std::move(output);
++    reset_done_ = std::move(done);
++    if (gpu_pending_) return;
++    FinishReset();
++  }
++  void FinishReset() {
++    decode_done_.Reset();
++    buffer_.reset();
+     if (decoder_) decoder_->Reset();
+     else session_.Reset();
+     failed_ = session_.faulted();
+     last_error_ = Code::kOk;
+     stream_id_ = 0;
++    if (reset_done_) std::move(reset_done_).Run();
+   }
+ 
+  private:
++  void CompleteDecode(Status status) {
++    buffer_.reset();
++    if (decode_done_) std::move(decode_done_).Run(status);
++  }
++  void GpuReady(scoped_refptr<Picture> picture, BackendStatus retirement,
++                scoped_refptr<media::VideoFrame> frame) {
++    gpu_pending_ = false;
++    if (reset_done_) { FinishReset(); return; }
++    if (retirement == BackendStatus::kOk && frame) {
++      picture->frame = std::move(frame);
++      if (!logged_gpu_frame_ && picture->frame->HasTextures()) {
++        logged_gpu_frame_ = true;
++        LOG(WARNING) << "Radeon UVD GPU delivery completed";
++      }
++      picture->frame->set_hdr_metadata(picture->hdr_metadata());
++      if (picture->duration.is_positive())
++        picture->frame->metadata().frame_duration = picture->duration;
++    } else {
++      last_error_ = Code::kPlatformDecodeFailure;
++    }
++    Status status = ContinueDecode();
++    if (!gpu_pending_) CompleteDecode(status);
++  }
++
+   class Accelerator final : public media::H264Decoder::H264Accelerator {
+    public:
+     explicit Accelerator(Core* core) : core_(core) {}
+@@ -209,6 +295,38 @@
+     AccelStatus SubmitDecode(scoped_refptr<media::H264Picture> picture) override {
+       if (!current_ || current_ != picture || !slices_)
+         return Reject(Code::kMalformedBitstream);
++      auto target = scoped_refptr<Picture>(static_cast<Picture*>(picture.get()));
++      if (target->gpu_attempted) {
++        if (core_->gpu_pending_) return AccelStatus::kTryAgain;
++        Clear();
++        return target->frame ? AccelStatus::kOk : Reject(Code::kPlatformDecodeFailure);
++      }
++      if (core_->caps_.gpu_output && core_->convert_gpu_) {
++        GpuOutput source;
++        auto status = core_->session_.DecodeGpu(metadata_, current_->idr, bitstream_, &source);
++        if (status != BackendStatus::kOk) {
++          core_->last_error_ = ToStatus(status);
++          Clear();
++          return AccelStatus::kFail;
++        }
++        auto lease = base::MakeRefCounted<GpuLease>(core_->owner_, source);
++        GpuFrameMetadata metadata;
++        metadata.visible_rect = target->visible_rect();
++        metadata.natural_size = target->natural_size;
++        metadata.color_space = target->get_colorspace().ToGfxColorSpace();
++        metadata.timestamp = target->timestamp;
++        target->gpu_attempted = true;
++        core_->gpu_pending_ = true;
++        core_->convert_gpu_.Run(source, metadata,
++            base::BindPostTaskToCurrentDefault(base::BindOnce(
++                [](scoped_refptr<GpuLease> held, base::WeakPtr<Core> core,
++                   scoped_refptr<Picture> picture, bool retired,
++                   scoped_refptr<media::VideoFrame> frame) {
++                  auto status = held->Retire(retired);
++                  if (core) core->GpuReady(std::move(picture), status, std::move(frame));
++                }, std::move(lease), core_->weak_factory_.GetWeakPtr(), target)));
++        return AccelStatus::kTryAgain;
++      }
+       const uint32_t width = metadata_.config.coded_width;
+       const uint32_t height = metadata_.config.coded_height;
+       const size_t bytes = size_t(width) * height * 3 / 2;
+@@ -224,7 +342,6 @@
+         Clear();
+         return AccelStatus::kFail;
+       }
+-      auto* target = static_cast<Picture*>(picture.get());
+       target->frame = SharedFrame(std::move(memory), width, height, *target);
+       Clear();
+       return target->frame ? AccelStatus::kOk : Reject(Code::kFailedToGetVideoFrame);
+@@ -273,7 +390,14 @@
+   Status Error() {
+     return last_error_.is_ok() ? Status(Code::kMalformedBitstream) : last_error_;
+   }
+-  Session session_;
++  scoped_refptr<SessionOwner> owner_;
++  Session& session_;
++  ConvertGpuFrameCB convert_gpu_;
++  DecodeCB decode_done_;
++  base::OnceClosure reset_done_;
++  scoped_refptr<media::DecoderBuffer> buffer_;
++  bool gpu_pending_ = false;
++  bool logged_gpu_frame_ = false;
+   media::VideoDecoderConfig config_;
+   Capabilities caps_;
+   OutputCB output_;
+@@ -282,10 +406,14 @@
+   int32_t stream_id_ = 0;
+   bool failed_ = false;
+   std::unique_ptr<media::H264Decoder> decoder_;
++  base::WeakPtrFactory<Core> weak_factory_{this};
+ };
+ 
+ RadeonUvdVideoDecoder::RadeonUvdVideoDecoder(std::unique_ptr<Backend> backend)
+-    : initial_backend_(std::move(backend)) {}
++    : RadeonUvdVideoDecoder(std::move(backend), {}) {}
++RadeonUvdVideoDecoder::RadeonUvdVideoDecoder(
++    std::unique_ptr<Backend> backend, ConvertGpuFrameCB converter)
++    : initial_backend_(std::move(backend)), convert_gpu_(std::move(converter)) {}
+ RadeonUvdVideoDecoder::~RadeonUvdVideoDecoder() = default;
+ void RadeonUvdVideoDecoder::Initialize(
+     const media::VideoDecoderConfig& config, bool low_delay, media::CdmContext*,
+@@ -297,10 +425,10 @@
+       config.codec() != media::VideoCodec::kH264 || config.is_encrypted() ||
+       !ProfileId(config.profile())) {
+     if (core_) {
+-      core_->AsyncCall(&Core::Reset).WithArgs(WorkerOutput()).Then(
+-          base::BindOnce(&RadeonUvdVideoDecoder::Initialized,
+-                         weak_factory_.GetWeakPtr(), generation_, std::move(callback),
+-                         Status(Code::kUnsupportedConfig)));
++      core_->AsyncCall(&Core::Reset).WithArgs(WorkerOutput(),
++          base::BindPostTaskToCurrentDefault(base::BindOnce(
++              &RadeonUvdVideoDecoder::Initialized, weak_factory_.GetWeakPtr(),
++              generation_, std::move(callback), Status(Code::kUnsupportedConfig))));
+     } else {
+       std::move(callback).Run(Code::kUnsupportedConfig);
+     }
+@@ -312,7 +440,7 @@
+          base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
+         base::SingleThreadTaskRunnerThreadMode::DEDICATED);
+     core_ = std::make_unique<base::SequenceBound<Core>>(
+-        worker, std::move(initial_backend_));
++        worker, std::move(initial_backend_), convert_gpu_);
+   }
+   core_->AsyncCall(&Core::Initialize).WithArgs(config, WorkerOutput()).Then(
+       base::BindOnce(&RadeonUvdVideoDecoder::Initialized,
+@@ -340,9 +468,9 @@
+     return;
+   }
+   pending_decode_ = std::move(callback);
+-  core_->AsyncCall(&Core::Decode).WithArgs(std::move(buffer)).Then(
+-      base::BindOnce(&RadeonUvdVideoDecoder::Decoded,
+-                     weak_factory_.GetWeakPtr(), generation_));
++  core_->AsyncCall(&Core::Decode).WithArgs(std::move(buffer),
++      base::BindPostTaskToCurrentDefault(base::BindOnce(
++          &RadeonUvdVideoDecoder::Decoded, weak_factory_.GetWeakPtr(), generation_)));
+ }
+ void RadeonUvdVideoDecoder::Decoded(uint64_t generation, Status status) {
+   if (generation == generation_ && pending_decode_)
+@@ -357,10 +485,10 @@
+     base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE, std::move(closure));
+     return;
+   }
+-  core_->AsyncCall(&Core::Reset).WithArgs(WorkerOutput()).Then(
+-      base::BindOnce(
++  core_->AsyncCall(&Core::Reset).WithArgs(WorkerOutput(),
++      base::BindPostTaskToCurrentDefault(base::BindOnce(
+           [](base::WeakPtr<RadeonUvdVideoDecoder> self, base::OnceClosure done) {
+             if (self) std::move(done).Run();
+-          }, weak_factory_.GetWeakPtr(), std::move(closure)));
++          }, weak_factory_.GetWeakPtr(), std::move(closure))));
+ }
+ }  // namespace aurora_uvd
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_iokit_backend.cc b/media/gpu/mac/radeon_uvd/radeon_uvd_iokit_backend.cc
+--- a/media/gpu/mac/radeon_uvd/radeon_uvd_iokit_backend.cc
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_iokit_backend.cc
+@@ -14,6 +14,21 @@
+ static_assert(sizeof(rdn_video_output) == 128);
+ static_assert(sizeof(rdn_video_release) == 32);
+ static_assert(sizeof(rdn_video_destroy) == 32);
++static_assert(sizeof(rdn_video_gpu_output) == 64);
++static_assert(sizeof(rdn_video_gpu_acquire) == 64);
++static_assert(sizeof(rdn_video_gpu_source) == 96);
++static_assert(sizeof(rdn_video_gpu_retire) == 64);
++
++bool ValidGpuSession(const rdn_video_session& v, size_t bytes,
++                     const rdn_uvd_h264_config& c) {
++  return ValidHeader(v, bytes) && (v.session.high || v.session.low) &&
++      v.coded_width == c.coded_width && v.coded_height == c.coded_height &&
++      v.upload_bytes && v.upload_bytes <= RDN_VIDEO_MAX_UPLOAD_BYTES &&
++      v.upload_memory_type == RDN_VIDEO_MEMORY_UPLOAD && !v.output_slots &&
++      !v.output0_memory_type && !v.output1_memory_type &&
++      ValidPlanes(v.coded_width, v.coded_height, v.format, v.y_stride,
++                  v.uv_stride, v.y_offset, v.uv_offset, v.output_bytes);
++}
+ 
+ BackendStatus Status(kern_return_t result) {
+   if (result == KERN_SUCCESS) return BackendStatus::kOk;
+@@ -47,7 +62,7 @@
+     kern_return_t result = IOConnectCallStructMethod(connection_, RDN_VIDEO_QUERY,
+         nullptr, 0, &response, &bytes);
+     if (result) return Status(result);
+-    if (!ValidHeader(response, bytes) || (response.flags & ~15u))
++    if (!ValidHeader(response, bytes) || (response.flags & ~31u))
+       return BackendStatus::kFailure;
+     const uint32_t allowed = validation_ ? RDN_VIDEO_CAP_VALIDATION :
+                                           RDN_VIDEO_CAP_PRODUCTION;
+@@ -63,6 +78,7 @@
+         response.output_slots != RDN_VIDEO_OUTPUT_SLOTS)
+       return BackendStatus::kFailure;
+     actual->ready = true;
++    actual->gpu_output = (response.flags & RDN_VIDEO_CAP_GPU_OUTPUT) != 0;
+     actual->profile_mask = response.profile_mask;
+     actual->max_width = response.max_width;
+     actual->max_height = response.max_height;
+@@ -71,25 +87,35 @@
+   }
+ 
+   BackendStatus Create(const rdn_uvd_h264_config& config) override {
++    return CreateCommon(config, false);
++  }
++  BackendStatus CreateGpu(const rdn_uvd_h264_config& config) override {
++    return CreateCommon(config, true);
++  }
++  BackendStatus CreateCommon(const rdn_uvd_h264_config& config, bool gpu) {
+     if (created_) return BackendStatus::kFailure;
+     Capabilities caps;
+     BackendStatus status = Query(&caps);
+     if (status != BackendStatus::kOk) return status;
++    if (gpu && !caps.gpu_output) return BackendStatus::kUnsupported;
+     rdn_video_create request = {};
+     request.version = RDN_VIDEO_API_VERSION;
+     request.bytes = sizeof(request);
+     request.config = config;
+-    request.flags = validation_ ? RDN_VIDEO_CREATE_VALIDATION : 0;
++    request.flags = (validation_ ? RDN_VIDEO_CREATE_VALIDATION : 0) |
++        (gpu ? RDN_VIDEO_CREATE_GPU_OUTPUT : 0);
+     size_t bytes = sizeof(session_);
+     kern_return_t result = IOConnectCallStructMethod(connection_, RDN_VIDEO_CREATE,
+         &request, sizeof(request), &session_, &bytes);
+     if (result) return Fail(Status(result));
+     created_ = true;
+-    if (!ValidSession(session_, bytes, config)) return Fail(BackendStatus::kFailure);
++    gpu_mode_ = gpu;
++    if (!(gpu ? ValidGpuSession(session_, bytes, config) :
++                ValidSession(session_, bytes, config))) return Fail(BackendStatus::kFailure);
+     config_ = config;
+     if (!Map(0, RDN_VIDEO_MEMORY_UPLOAD, session_.upload_bytes, false) ||
+-        !Map(1, RDN_VIDEO_MEMORY_OUTPUT0, session_.output_bytes, true) ||
+-        !Map(2, RDN_VIDEO_MEMORY_OUTPUT1, session_.output_bytes, true))
++        (!gpu && (!Map(1, RDN_VIDEO_MEMORY_OUTPUT0, session_.output_bytes, true) ||
++                  !Map(2, RDN_VIDEO_MEMORY_OUTPUT1, session_.output_bytes, true))))
+       return Fail(BackendStatus::kFailure);
+     next_request_ = next_output_ = 1;
+     return BackendStatus::kOk;
+@@ -122,7 +148,7 @@
+                             const std::vector<uint8_t>& annex_b,
+                             LinearNV12* completed_copy, uint8_t* destination,
+                             size_t capacity) {
+-    if (!created_ || annex_b.empty() ||
++    if (!created_ || gpu_mode_ || annex_b.empty() ||
+         annex_b.size() > session_.upload_bytes ||
+         next_request_ == UINT32_MAX || next_output_ == UINT32_MAX ||
+         memcmp(&metadata.config, &config_, sizeof(config_)))
+@@ -186,8 +212,76 @@
+     return BackendStatus::kOk;
+   }
+ 
++  BackendStatus DecodeGpu(const Metadata& metadata,
++                           const std::vector<uint8_t>& annex_b,
++                           GpuOutput* output) override {
++    if (!output || !created_ || !gpu_mode_ || gpu_pending_ || annex_b.empty() ||
++        annex_b.size() > session_.upload_bytes || next_request_ == UINT32_MAX ||
++        memcmp(&metadata.config, &config_, sizeof(config_)))
++      return BackendStatus::kFailure;
++    rdn_video_decode request = {};
++    request.version = RDN_VIDEO_API_VERSION;
++    request.bytes = sizeof(request);
++    request.session = session_.session;
++    request.request_sequence = next_request_;
++    request.bitstream_bytes = static_cast<uint32_t>(annex_b.size());
++    request.picture = metadata.picture;
++    memcpy(reinterpret_cast<void*>(maps_[0].address), annex_b.data(), annex_b.size());
++    rdn_video_gpu_output response = {};
++    size_t bytes = sizeof(response);
++    auto result = IOConnectCallStructMethod(connection_, RDN_VIDEO_DECODE_GPU,
++        &request, sizeof(request), &response, &bytes);
++    if (result) return Fail(Status(result));
++    if (!ValidHeader(response, bytes) || ZeroWords(response.source_token) ||
++        response.request_sequence != next_request_ ||
++        response.coded_width != config_.coded_width ||
++        response.coded_height != config_.coded_height ||
++        response.layout != RDN_VIDEO_LAYOUT_FIELD_NV12)
++      return Fail(BackendStatus::kFailure);
++    gpu_source_ = {};
++    gpu_source_.video_connection = connection_;
++    memcpy(gpu_source_.source_token, response.source_token, sizeof(response.source_token));
++    gpu_source_.width = response.coded_width;
++    gpu_source_.height = response.coded_height;
++    gpu_pending_ = true;
++    ++next_request_;
++    *output = gpu_source_;
++    return BackendStatus::kOk;
++  }
++  BackendStatus RetireGpu(const GpuOutput& source, bool completed) override {
++    if (!gpu_pending_ || memcmp(&source, &gpu_source_, sizeof(source)))
++      return BackendStatus::kFailure;
++    rdn_video_gpu_retire request = {};
++    request.version = RDN_VIDEO_API_VERSION;
++    request.bytes = sizeof(request);
++    memcpy(request.source_token, source.source_token, sizeof(request.source_token));
++    request.role = RDN_VIDEO_GPU_PRODUCER;
++    request.outcome = completed ? RDN_VIDEO_GPU_RETIRED : RDN_VIDEO_GPU_PENDING;
++    size_t bytes = 0;
++    auto result = IOConnectCallStructMethod(connection_, RDN_VIDEO_RETIRE_GPU,
++        &request, sizeof(request), nullptr, &bytes);
++    gpu_pending_ = false;
++    gpu_source_ = {};
++    if (result || bytes) return Fail(result ? Status(result) : BackendStatus::kFailure);
++    return completed ? BackendStatus::kOk : BackendStatus::kFailure;
++  }
++
+   BackendStatus Destroy() override {
+     kern_return_t result = KERN_SUCCESS;
++    if (gpu_pending_) {
++      // Closing a connection with an unresolved import also quarantines in-kernel.
++      rdn_video_gpu_retire request = {};
++      request.version = RDN_VIDEO_API_VERSION;
++      request.bytes = sizeof(request);
++      memcpy(request.source_token, gpu_source_.source_token, sizeof(request.source_token));
++      request.role = RDN_VIDEO_GPU_PRODUCER;
++      request.outcome = RDN_VIDEO_GPU_PENDING;
++      size_t bytes = 0;
++      result = IOConnectCallStructMethod(connection_, RDN_VIDEO_RETIRE_GPU,
++          &request, sizeof(request), nullptr, &bytes);
++      if (!result && bytes) result = kIOReturnError;
++      gpu_pending_ = false;
++    }
+     // Leopard resolves memory type through the live user-client session.
+     for (auto& map : maps_) {
+       if (connection_ && map.address) {
+@@ -210,6 +304,8 @@
+           no_output ? kIOReturnError : KERN_SUCCESS;
+     }
+     created_ = false;
++    gpu_mode_ = false;
++    gpu_source_ = {};
+     if (connection_) {
+       kern_return_t closed = IOServiceClose(connection_);
+       if (!result) result = closed;
+@@ -236,6 +332,9 @@
+   const bool validation_;
+   io_connect_t connection_ = IO_OBJECT_NULL;
+   bool created_ = false;
++  bool gpu_mode_ = false;
++  bool gpu_pending_ = false;
++  GpuOutput gpu_source_;
+   Mapping maps_[3];
+   rdn_video_session session_ = {};
+   rdn_uvd_h264_config config_ = {};
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_gl_bridge.h b/media/gpu/mac/radeon_uvd/radeon_uvd_gl_bridge.h
+new file mode 100644
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_gl_bridge.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_GPU_MAC_RADEON_UVD_RADEON_UVD_GL_BRIDGE_H_
++#define MEDIA_GPU_MAC_RADEON_UVD_RADEON_UVD_GL_BRIDGE_H_
++
++#include <stdint.h>
++
++#define RDN_GL_VIDEO_PACK_VERSION_1 1u
++#define RDN_GL_VIDEO_PACK_CAP_NV12_COMPLETED 1u
++#define RDN_GL_VIDEO_PACK_MAX_TIMEOUT_MS 2000u
++
++enum RDNGLVideoPackResult {
++  RDN_GL_VIDEO_PACK_OK = 0,
++  RDN_GL_VIDEO_PACK_UNSUPPORTED = 1,
++  RDN_GL_VIDEO_PACK_FAILED_RETIRED = 2,
++  RDN_GL_VIDEO_PACK_FAILED_PENDING = 3
++};
++
++struct RDNGLVideoPackRequestV1 {
++  uint32_t version;
++  uint32_t bytes;
++  uint32_t flags;
++  uint32_t video_connection;
++  uint32_t source_token[8];
++  uint32_t coded_width;
++  uint32_t coded_height;
++  uint32_t destination_y;
++  uint32_t destination_uv;
++  uint32_t timeout_ms;
++  uint32_t reserved[7];
++};
++
++// Native Mesa names in the current context; Y is R8 and UV is RG8.
++// The kernel resolves the token and validates dimensions and ownership.
++// OK means the entire GPU write completed, with no CPU pixel-copy fallback.
++// On PENDING the bridge retains submitted BOs until completion or quarantine;
++// the caller must abandon the source lease, never release it for reuse.
++typedef int (*RDNGLQueryVideoPackingV1Proc)(uint32_t version,
++                                         uint32_t* capabilities);
++typedef int (*RDNGLPackVideoFrameV1Proc)(
++    const struct RDNGLVideoPackRequestV1* request);
++
++#endif  // MEDIA_GPU_MAC_RADEON_UVD_RADEON_UVD_GL_BRIDGE_H_
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter.h b/media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter.h
+new file mode 100644
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter.h
+@@ -0,0 +1,74 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_GPU_MAC_RADEON_UVD_RADEON_UVD_FRAME_CONVERTER_H_
++#define MEDIA_GPU_MAC_RADEON_UVD_RADEON_UVD_FRAME_CONVERTER_H_
++
++#include "base/functional/callback.h"
++#include "base/memory/ref_counted_delete_on_sequence.h"
++#include "base/task/sequenced_task_runner.h"
++#include "gpu/ipc/service/command_buffer_stub.h"
++#include "media/base/video_frame.h"
++#include "media/gpu/mac/radeon_uvd/radeon_uvd_backend.h"
++#include "media/gpu/mac/radeon_uvd/radeon_uvd_gl_bridge.h"
++
++namespace gpu {
++class SharedImageStub;
++}
++
++namespace aurora_uvd {
++
++struct GpuPackingFunctions {
++  RDNGLQueryVideoPackingV1Proc query = nullptr;
++  RDNGLPackVideoFrameV1Proc pack = nullptr;
++  int (*make_current)(void*) = nullptr;
++};
++
++struct GpuFrameMetadata {
++  gfx::Rect visible_rect;
++  gfx::Size natural_size;
++  gfx::ColorSpace color_space;
++  base::TimeDelta timestamp;
++};
++
++using GpuFrameReadyCB =
++    base::OnceCallback<void(bool source_retired, scoped_refptr<media::VideoFrame>)>;
++using ConvertGpuFrameCB = base::RepeatingCallback<void(
++    GpuOutput, GpuFrameMetadata, GpuFrameReadyCB)>;
++
++class RadeonUvdFrameConverter
++    : public gpu::CommandBufferStub::DestructionObserver,
++      public base::RefCountedDeleteOnSequence<RadeonUvdFrameConverter> {
++ public:
++  using GetStubCB = base::RepeatingCallback<gpu::CommandBufferStub*()>;
++  RadeonUvdFrameConverter(scoped_refptr<base::SequencedTaskRunner>, GetStubCB,
++                           GpuPackingFunctions);
++  void Convert(GpuOutput source, GpuFrameMetadata metadata, GpuFrameReadyCB done);
++
++ private:
++  friend class base::DeleteHelper<RadeonUvdFrameConverter>;
++  friend class base::RefCountedDeleteOnSequence<RadeonUvdFrameConverter>;
++  ~RadeonUvdFrameConverter() override;
++  void OnWillDestroyStub(bool have_context) override;
++  bool Initialize();
++
++  const scoped_refptr<base::SequencedTaskRunner> gpu_runner_;
++  GetStubCB get_stub_;
++  const GpuPackingFunctions bridge_;
++  gpu::CommandBufferStub* stub_ = nullptr;
++  gpu::SharedImageStub* images_ = nullptr;
++  bool initialized_ = false;
++};
++
++// Returns an empty callback when the versioned driver bridge is absent.
++ConvertGpuFrameCB CreateGpuFrameConverter(
++    scoped_refptr<base::SequencedTaskRunner> gpu_runner,
++    RadeonUvdFrameConverter::GetStubCB get_stub);
++
++ConvertGpuFrameCB CreateGpuFrameConverterForTesting(
++    scoped_refptr<base::SequencedTaskRunner> gpu_runner,
++    RadeonUvdFrameConverter::GetStubCB get_stub, GpuPackingFunctions functions);
++
++}  // namespace aurora_uvd
++#endif  // MEDIA_GPU_MAC_RADEON_UVD_RADEON_UVD_FRAME_CONVERTER_H_
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter.cc b/media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter.cc
+new file mode 100644
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter.cc
+@@ -0,0 +1,215 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter.h"
++
++#include <dlfcn.h>
++#include <array>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/task/bind_post_task.h"
++#include "gpu/command_buffer/common/mailbox_holder.h"
++#include "gpu/command_buffer/common/shared_image_usage.h"
++#include "gpu/command_buffer/service/shared_context_state.h"
++#include "gpu/command_buffer/service/shared_image/shared_image_factory.h"
++#include "gpu/command_buffer/service/shared_image/shared_image_representation.h"
++#include "gpu/command_buffer/service/texture_base.h"
++#include "gpu/ipc/service/gpu_channel.h"
++#include "gpu/ipc/service/gpu_channel_manager.h"
++#include "gpu/ipc/service/shared_image_stub.h"
++#include "media/gpu/mac/radeon_uvd/radeon_uvd_gl_bridge.h"
++#include "ui/gl/gl_bindings.h"
++#include "ui/gl/scoped_binders.h"
++#include <OpenGL/OpenGL.h>
++
++namespace aurora_uvd {
++namespace {
++static_assert(sizeof(RDNGLVideoPackRequestV1) == 96, "GL bridge ABI");
++
++struct Bridge : public GpuPackingFunctions {
++  Bridge() {
++    void* driver = dlopen("/System/Library/Extensions/RadeonNIGLDriver.bundle/"
++                          "Contents/MacOS/RadeonNIGLDriver", RTLD_LAZY | RTLD_LOCAL);
++    if (!driver) return;
++    query = reinterpret_cast<RDNGLQueryVideoPackingV1Proc>(
++        dlsym(driver, "RDNGLQueryVideoPackingV1"));
++    pack = reinterpret_cast<RDNGLPackVideoFrameV1Proc>(
++        dlsym(driver, "RDNGLPackVideoFrameV1"));
++    make_current = reinterpret_cast<int (*)(void*)>(
++        dlsym(driver, "RDNGLMakeCurrent"));
++  }
++};
++Bridge& GetBridge() {
++  static Bridge bridge;
++  return bridge;
++}
++
++bool ValidSource(const GpuOutput& source, const GpuFrameMetadata& metadata) {
++  uint32_t token = 0;
++  for (uint32_t word : source.source_token) token |= word;
++  return source.video_connection && token &&
++      source.width >= 64 && source.height >= 64 &&
++      source.width <= 1920 && source.height <= 1088 &&
++      !(source.width & 1) && !(source.height & 1) &&
++      !metadata.visible_rect.IsEmpty() && !metadata.natural_size.IsEmpty() &&
++      gfx::Rect(source.width, source.height).Contains(metadata.visible_rect);
++}
++}  // namespace
++
++RadeonUvdFrameConverter::RadeonUvdFrameConverter(
++    scoped_refptr<base::SequencedTaskRunner> runner, GetStubCB get_stub,
++    GpuPackingFunctions functions)
++    : base::RefCountedDeleteOnSequence<RadeonUvdFrameConverter>(runner),
++      gpu_runner_(std::move(runner)), get_stub_(std::move(get_stub)), bridge_(functions) {}
++
++RadeonUvdFrameConverter::~RadeonUvdFrameConverter() {
++  DCHECK(gpu_runner_->RunsTasksInCurrentSequence());
++  if (stub_) stub_->RemoveDestructionObserver(this);
++}
++void RadeonUvdFrameConverter::OnWillDestroyStub(bool) {
++  DCHECK(gpu_runner_->RunsTasksInCurrentSequence());
++  stub_->RemoveDestructionObserver(this);
++  stub_ = nullptr;
++  images_ = nullptr;
++}
++bool RadeonUvdFrameConverter::Initialize() {
++  if (!initialized_) {
++    initialized_ = true;
++    stub_ = get_stub_.Run();
++    if (stub_) {
++      stub_->AddDestructionObserver(this);
++      images_ = stub_->channel()->shared_image_stub();
++    }
++  }
++  return stub_ && images_ && images_->factory();
++}
++
++void RadeonUvdFrameConverter::Convert(GpuOutput source,
++                                       GpuFrameMetadata metadata,
++                                       GpuFrameReadyCB done) {
++  DCHECK(gpu_runner_->RunsTasksInCurrentSequence());
++  if (!ValidSource(source, metadata) || !Initialize()) {
++    std::move(done).Run(true, nullptr);
++    return;
++  }
++  auto* factory = images_->factory();
++  auto* context = factory->GetSharedContextState();
++  if (!context || context->context_lost() || !context->MakeCurrent(nullptr, true)) {
++    std::move(done).Run(true, nullptr);
++    return;
++  }
++
++  auto* native_context = CGLGetCurrentContext();
++  uint32_t caps = 0;
++  if (!native_context || !bridge_.make_current(native_context) ||
++      bridge_.query(RDN_GL_VIDEO_PACK_VERSION_1, &caps) != 0 ||
++      !(caps & RDN_GL_VIDEO_PACK_CAP_NV12_COMPLETED)) {
++    std::move(done).Run(true, nullptr);
++    return;
++  }
++
++  gpu::SharedImageRepresentationFactory representations(
++      stub_->channel()->gpu_channel_manager()->shared_image_manager(), images_);
++  std::array<gpu::Mailbox, 2> mailboxes;
++  std::array<std::unique_ptr<gpu::GLTextureImageRepresentationBase>, 2> planes;
++  std::array<std::unique_ptr<gpu::GLTextureImageRepresentationBase::ScopedAccess>, 2>
++      access;
++  std::array<gpu::SharedImageStub::SharedImageDestructionCallback, 2> destroy;
++  unsigned created = 0;
++  RDNGLVideoPackRequestV1 request = {};
++  request.version = RDN_GL_VIDEO_PACK_VERSION_1;
++  request.bytes = sizeof(request);
++  request.video_connection = source.video_connection;
++  std::copy(std::begin(source.source_token), std::end(source.source_token),
++            std::begin(request.source_token));
++  request.coded_width = source.width;
++  request.coded_height = source.height;
++  request.timeout_ms = RDN_GL_VIDEO_PACK_MAX_TIMEOUT_MS;
++  const bool use_passthrough =
++      stub_->channel()->gpu_channel_manager()->use_passthrough_cmd_decoder();
++  bool valid = true;
++  for (unsigned i = 0; i < 2 && valid; ++i) {
++    const auto format = i ? viz::SinglePlaneFormat::kRG_88 : viz::SinglePlaneFormat::kR_8;
++    const gfx::Size size(source.width >> i, source.height >> i);
++    mailboxes[i] = gpu::Mailbox::GenerateForSharedImage();
++    valid = factory->CreateSharedImage(
++        mailboxes[i], format, size, metadata.color_space, kTopLeft_GrSurfaceOrigin,
++        kOpaque_SkAlphaType, gpu::kNullSurfaceHandle,
++        gpu::SHARED_IMAGE_USAGE_GLES2 | gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
++        "RadeonUvdVideoDecoder");
++    if (!valid) break;
++    ++created;
++    destroy[i] = images_->GetSharedImageDestructionCallback(mailboxes[i]);
++    if (use_passthrough)
++      planes[i] = representations.ProduceGLTexturePassthrough(mailboxes[i]);
++    else
++      planes[i] = representations.ProduceGLTexture(mailboxes[i]);
++    auto* texture = planes[i] ? planes[i]->GetTextureBase() : nullptr;
++    if (!texture || !texture->service_id()) { valid = false; break; }
++    access[i] = planes[i]->BeginScopedAccess(
++        GL_SHARED_IMAGE_ACCESS_MODE_READWRITE_CHROMIUM,
++        gpu::SharedImageRepresentation::AllowUnclearedAccess::kYes);
++    if (!access[i]) { valid = false; break; }
++    gl::ScopedTextureBinder bind(GL_TEXTURE_2D, texture->service_id());
++    GLint native_name = 0;
++    glGetTexParameteriv(GL_TEXTURE_2D, 0x3481 /* GL_TEXTURE_NATIVE_ID_ANGLE */, &native_name);
++    valid = native_name != 0 && glGetError() == GL_NO_ERROR;
++    if (i) request.destination_uv = static_cast<uint32_t>(native_name);
++    else request.destination_y = static_cast<uint32_t>(native_name);
++  }
++  int result = RDN_GL_VIDEO_PACK_FAILED_RETIRED;
++  if (valid) {
++    auto* current = CGLGetCurrentContext();
++    if (current && bridge_.make_current(current)) result = bridge_.pack(&request);
++  }
++  const bool retired = result == RDN_GL_VIDEO_PACK_OK ||
++      result == RDN_GL_VIDEO_PACK_UNSUPPORTED || result == RDN_GL_VIDEO_PACK_FAILED_RETIRED;
++  if (result == RDN_GL_VIDEO_PACK_OK) {
++    for (auto& plane : planes) plane->SetCleared();
++  }
++  for (auto& scoped : access) scoped.reset();
++  for (auto& plane : planes) plane.reset();
++  if (result != RDN_GL_VIDEO_PACK_OK) {
++    for (unsigned i = 0; i < created; ++i) std::move(destroy[i]).Run(gpu::SyncToken());
++    std::move(done).Run(retired, nullptr);
++    return;
++  }
++  gpu::MailboxHolder holders[media::VideoFrame::kMaxPlanes];
++  for (unsigned i = 0; i < 2; ++i)
++    holders[i] = gpu::MailboxHolder(mailboxes[i], gpu::SyncToken(), GL_TEXTURE_2D);
++  auto release = base::BindPostTask(gpu_runner_, base::BindOnce(
++      [](decltype(destroy) callbacks, const gpu::SyncToken& token) {
++        for (auto& callback : callbacks) std::move(callback).Run(token);
++      }, std::move(destroy)));
++  auto frame = media::VideoFrame::WrapNativeTextures(
++      media::PIXEL_FORMAT_NV12, holders, std::move(release),
++      gfx::Size(source.width, source.height), metadata.visible_rect,
++      metadata.natural_size, metadata.timestamp);
++  if (!frame) {
++    for (const auto& mailbox : mailboxes) factory->DestroySharedImage(mailbox);
++  } else {
++    frame->set_color_space(metadata.color_space);
++    frame->metadata().read_lock_fences_enabled = true;
++    frame->metadata().power_efficient = true;
++  }
++  std::move(done).Run(true, std::move(frame));
++}
++
++ConvertGpuFrameCB CreateGpuFrameConverter(
++    scoped_refptr<base::SequencedTaskRunner> gpu_runner,
++    RadeonUvdFrameConverter::GetStubCB get_stub) {
++  return CreateGpuFrameConverterForTesting(std::move(gpu_runner), std::move(get_stub), GetBridge());
++}
++ConvertGpuFrameCB CreateGpuFrameConverterForTesting(
++    scoped_refptr<base::SequencedTaskRunner> gpu_runner,
++    RadeonUvdFrameConverter::GetStubCB get_stub, GpuPackingFunctions functions) {
++  if (!gpu_runner || !get_stub || !functions.query || !functions.pack ||
++      !functions.make_current) return {};
++  auto converter = base::MakeRefCounted<RadeonUvdFrameConverter>(
++      gpu_runner, std::move(get_stub), functions);
++  return base::BindPostTask(gpu_runner, base::BindRepeating(
++      &RadeonUvdFrameConverter::Convert, std::move(converter)));
++}
++}  // namespace aurora_uvd
+diff --git a/media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter_unittest.cc b/media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter_unittest.cc
+new file mode 100644
+--- /dev/null
++++ b/media/gpu/mac/radeon_uvd/radeon_uvd_frame_converter_unittest.cc
+@@ -0,0 +1,265 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/gpu/mac/radeon_uvd/radeon_uvd_session.h"
++#include "media/gpu/mac/radeon_uvd/radeon_uvd_gl_bridge.h"
++
++#include <atomic>
++#include <cstring>
++#include "testing/gtest/include/gtest/gtest.h"
++
++#if !defined(AURORA_UVD_SESSION_ONLY_TEST)
++#include "base/functional/bind.h"
++#include "base/task/bind_post_task.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "media/base/test_helpers.h"
++#include "media/base/test_data_util.h"
++#include "media/gpu/mac/radeon_uvd/radeon_uvd_video_decoder.h"
++#endif
++
++namespace aurora_uvd {
++namespace {
++struct State {
++  std::atomic<unsigned> creates{0}, decodes{0}, retires{0}, destroys{0}, quarantines{0};
++  bool gpu = true;
++  bool bad_geometry = false;
++};
++class MockBackend final : public Backend {
++ public:
++  explicit MockBackend(State* state) : state_(state) {}
++  BackendStatus Query(Capabilities* caps) override {
++    *caps = {true, 7, 1920, 1088, 4u * 1024u * 1024u, state_->gpu};
++    return BackendStatus::kOk;
++  }
++  BackendStatus Create(const rdn_uvd_h264_config&) override {
++    ++state_->creates;
++    return BackendStatus::kOk;
++  }
++  BackendStatus CreateGpu(const rdn_uvd_h264_config& config) override {
++    return Create(config);
++  }
++  BackendStatus Decode(const Metadata&, const std::vector<uint8_t>&, LinearNV12*) override {
++    return BackendStatus::kUnsupported;
++  }
++  BackendStatus DecodeGpu(const Metadata& m, const std::vector<uint8_t>&, GpuOutput* out) override {
++    *out = {};
++    out->video_connection = 123;
++    out->source_token[0] = ++state_->decodes;
++    out->source_token[7] = 0xfedcba98;
++    out->width = m.config.coded_width + (state_->bad_geometry ? 16 : 0);
++    out->height = m.config.coded_height;
++    return BackendStatus::kOk;
++  }
++  BackendStatus RetireGpu(const GpuOutput&, bool complete) override {
++    ++state_->retires;
++    if (!complete) ++state_->quarantines;
++    return BackendStatus::kOk;
++  }
++  BackendStatus Destroy() override {
++    ++state_->destroys;
++    return BackendStatus::kOk;
++  }
++ private:
++  State* state_;
++};
++
++Metadata TestMetadata() {
++  Metadata m = {};
++  m.config.version = m.picture.version = RDN_UVD_H264_VERSION;
++  m.config.profile_idc = 66;
++  m.config.level_idc = 30;
++  m.config.coded_width = m.config.coded_height = 64;
++  m.config.max_num_ref_frames = 1;
++  m.config.chroma_format_idc = 1;
++  m.config.frame_mbs_only_flag = 1;
++  m.picture.sps_info_flags = 4;
++  memset(m.picture.scaling_list_4x4, 16, sizeof(m.picture.scaling_list_4x4));
++  memset(m.picture.scaling_list_8x8, 16, sizeof(m.picture.scaling_list_8x8));
++  return m;
++}
++const std::vector<uint8_t> kSlice = {0, 0, 0, 1, 0x65, 0x80};
++
++TEST(RadeonUvdGpuSessionTest, CapabilityIsRequiredBeforeCreate) {
++  State state;
++  state.gpu = false;
++  Session session(std::make_unique<MockBackend>(&state));
++  GpuOutput output;
++  EXPECT_EQ(session.DecodeGpu(TestMetadata(), true, kSlice, &output), BackendStatus::kUnsupported);
++  EXPECT_EQ(state.creates, 0u);
++  EXPECT_EQ(state.decodes, 0u);
++}
++TEST(RadeonUvdGpuSessionTest, TargetCannotBeReusedBeforeRetirement) {
++  State state;
++  Session session(std::make_unique<MockBackend>(&state));
++  GpuOutput first, second;
++  ASSERT_EQ(session.DecodeGpu(TestMetadata(), true, kSlice, &first), BackendStatus::kOk);
++  EXPECT_EQ(session.DecodeGpu(TestMetadata(), false, kSlice, &second), BackendStatus::kFailure);
++  EXPECT_EQ(session.Reset(), BackendStatus::kFailure);
++  EXPECT_EQ(state.decodes, 1u);
++  EXPECT_EQ(state.destroys, 0u);
++  ASSERT_EQ(session.RetireGpu(first, true), BackendStatus::kOk);
++  ASSERT_EQ(session.DecodeGpu(TestMetadata(), false, kSlice, &second), BackendStatus::kOk);
++  EXPECT_NE(first.source_token[0], second.source_token[0]);
++  EXPECT_EQ(session.RetireGpu(second, true), BackendStatus::kOk);
++  EXPECT_EQ(session.Reset(), BackendStatus::kOk);
++  EXPECT_EQ(state.retires, 2u);
++  EXPECT_EQ(state.destroys, 1u);
++}
++TEST(RadeonUvdGpuSessionTest, StaleTokenCannotReleaseCurrentTarget) {
++  State state;
++  Session session(std::make_unique<MockBackend>(&state));
++  GpuOutput output;
++  ASSERT_EQ(session.DecodeGpu(TestMetadata(), true, kSlice, &output), BackendStatus::kOk);
++  auto stale = output;
++  ++stale.source_token[7];
++  EXPECT_EQ(session.RetireGpu(stale, true), BackendStatus::kFailure);
++  EXPECT_EQ(state.retires, 0u);
++  EXPECT_EQ(session.RetireGpu(output, true), BackendStatus::kOk);
++  EXPECT_EQ(session.RetireGpu(output, true), BackendStatus::kFailure);
++  EXPECT_EQ(state.retires, 1u);
++}
++TEST(RadeonUvdGpuSessionTest, UnknownGpuCompletionIsTerminal) {
++  State state;
++  Session session(std::make_unique<MockBackend>(&state));
++  GpuOutput output;
++  ASSERT_EQ(session.DecodeGpu(TestMetadata(), true, kSlice, &output), BackendStatus::kOk);
++  session.RetireGpu(output, false);
++  EXPECT_TRUE(session.faulted());
++  EXPECT_EQ(state.quarantines, 1u);
++  EXPECT_EQ(session.DecodeGpu(TestMetadata(), true, kSlice, &output), BackendStatus::kFailure);
++  EXPECT_EQ(state.decodes, 1u);
++}
++TEST(RadeonUvdGpuSessionTest, InvalidResolvedGeometryIsQuarantined) {
++  State state;
++  state.bad_geometry = true;
++  Session session(std::make_unique<MockBackend>(&state));
++  GpuOutput output;
++  EXPECT_EQ(session.DecodeGpu(TestMetadata(), true, kSlice, &output), BackendStatus::kFailure);
++  EXPECT_TRUE(session.faulted());
++  EXPECT_EQ(state.quarantines, 1u);
++}
++TEST(RadeonUvdGpuSessionTest, DestructionDoesNotRecycleUnresolvedOutput) {
++  State state;
++  {
++    Session session(std::make_unique<MockBackend>(&state));
++    GpuOutput output;
++    ASSERT_EQ(session.DecodeGpu(TestMetadata(), true, kSlice, &output), BackendStatus::kOk);
++  }
++  EXPECT_EQ(state.quarantines, 1u);
++  EXPECT_EQ(state.destroys, 1u);
++}
++TEST(RadeonUvdGpuSessionTest, BridgeLayoutHasNoNativeSizedFields) {
++  EXPECT_EQ(sizeof(RDNGLVideoPackRequestV1), 96u);
++  EXPECT_EQ(offsetof(RDNGLVideoPackRequestV1, source_token), 16u);
++  EXPECT_EQ(offsetof(RDNGLVideoPackRequestV1, destination_y), 56u);
++  EXPECT_EQ(offsetof(RDNGLVideoPackRequestV1, reserved), 68u);
++}
++
++#if !defined(AURORA_UVD_SESSION_ONLY_TEST)
++TEST(RadeonUvdFrameConverterTest, FactoryDoesNotQueryWithoutCurrentContext) {
++  base::test::TaskEnvironment tasks;
++  GpuPackingFunctions functions;
++  functions.query = [](uint32_t, uint32_t*) -> int {
++    ADD_FAILURE() << "Factory queried context-dependent capabilities";
++    return -1;
++  };
++  functions.pack = [](const RDNGLVideoPackRequestV1*) { return 0; };
++  functions.make_current = [](void*) { return 0; };
++  auto converter = CreateGpuFrameConverterForTesting(
++      base::SequencedTaskRunner::GetCurrentDefault(),
++      base::BindRepeating([]() -> gpu::CommandBufferStub* { return nullptr; }), functions);
++  EXPECT_TRUE(converter);
++  converter.Reset();
++  tasks.RunUntilIdle();
++}
++
++class RadeonUvdGpuContinuationTest : public testing::Test {
++ public:
++  void SetUp() override {
++    auto convert = base::BindPostTaskToCurrentDefault(base::BindRepeating(
++        &RadeonUvdGpuContinuationTest::Convert, base::Unretained(this)));
++    decoder_ = std::make_unique<RadeonUvdVideoDecoder>(
++        std::make_unique<MockBackend>(&state_), std::move(convert));
++    media::VideoDecoderConfig config(
++        media::VideoCodec::kH264, media::H264PROFILE_BASELINE,
++        media::VideoDecoderConfig::AlphaMode::kIsOpaque, media::VideoColorSpace::REC709(),
++        media::VideoTransformation(), gfx::Size(320, 192), gfx::Rect(320, 192),
++        gfx::Size(320, 192), {}, media::EncryptionScheme::kUnencrypted);
++    base::test::TestFuture<media::DecoderStatus> initialized;
++    decoder_->Initialize(config, false, nullptr, initialized.GetCallback(),
++        base::BindRepeating([](scoped_refptr<media::VideoFrame>) {}), {});
++    ASSERT_TRUE(initialized.Get().is_ok());
++    auto buffer = media::ReadTestDataFile("bear-320x192-baseline-frame-0.h264");
++    buffer->set_timestamp(base::TimeDelta());
++    decoder_->Decode(buffer, decoded_.GetCallback());
++    ASSERT_TRUE(converted_.Wait());
++    EXPECT_FALSE(decoded_.IsReady());
++  }
++  void TearDown() override {
++    decoder_.reset();
++    pending_.Reset();
++    tasks_.RunUntilIdle();
++  }
++  void Convert(GpuOutput source, GpuFrameMetadata metadata, GpuFrameReadyCB done) {
++    source_ = source;
++    metadata_ = metadata;
++    pending_ = std::move(done);
++    converted_.SetValue();
++  }
++  void Complete() {
++    auto frame = media::VideoFrame::CreateFrame(media::PIXEL_FORMAT_NV12,
++        gfx::Size(source_.width, source_.height), metadata_.visible_rect,
++        metadata_.natural_size, metadata_.timestamp);
++    std::move(pending_).Run(true, std::move(frame));
++  }
++ protected:
++  base::test::TaskEnvironment tasks_;
++  State state_;
++  std::unique_ptr<RadeonUvdVideoDecoder> decoder_;
++  base::test::TestFuture<media::DecoderStatus> decoded_;
++  base::test::TestFuture<void> converted_;
++  GpuOutput source_;
++  GpuFrameMetadata metadata_;
++  GpuFrameReadyCB pending_;
++};
++TEST_F(RadeonUvdGpuContinuationTest, ConversionCompletionResumesParserOnce) {
++  EXPECT_EQ(state_.decodes, 1u);
++  Complete();
++  EXPECT_TRUE(decoded_.Get().is_ok());
++  EXPECT_EQ(state_.decodes, 1u);
++  EXPECT_EQ(state_.retires, 1u);
++  EXPECT_EQ(state_.quarantines, 0u);
++}
++TEST_F(RadeonUvdGpuContinuationTest, ResetWaitsForSourceRetirement) {
++  base::test::TestFuture<void> reset;
++  decoder_->Reset(reset.GetCallback());
++  tasks_.RunUntilIdle();
++  EXPECT_FALSE(reset.IsReady());
++  EXPECT_EQ(state_.destroys, 0u);
++  Complete();
++  EXPECT_TRUE(reset.Wait());
++  EXPECT_EQ(decoded_.Get().code(), media::DecoderStatus::Codes::kAborted);
++  EXPECT_EQ(state_.retires, 1u);
++  EXPECT_EQ(state_.destroys, 1u);
++}
++TEST_F(RadeonUvdGpuContinuationTest, DestructionRetainsConnectionThroughGpuCallback) {
++  decoder_.reset();
++  tasks_.RunUntilIdle();
++  EXPECT_EQ(state_.destroys, 0u);
++  Complete();
++  tasks_.RunUntilIdle();
++  EXPECT_EQ(state_.retires, 1u);
++  EXPECT_EQ(state_.destroys, 1u);
++}
++TEST_F(RadeonUvdGpuContinuationTest, DroppedConversionQuarantinesAfterDestruction) {
++  decoder_.reset();
++  pending_.Reset();
++  tasks_.RunUntilIdle();
++  EXPECT_EQ(state_.quarantines, 1u);
++  EXPECT_EQ(state_.destroys, 1u);
++}
++#endif
++}  // namespace
++}  // namespace aurora_uvd
+diff --git a/media/gpu/mac/radeon_uvd/replay_video_decoder.h b/media/gpu/mac/radeon_uvd/replay_video_decoder.h
+--- a/media/gpu/mac/radeon_uvd/replay_video_decoder.h
++++ b/media/gpu/mac/radeon_uvd/replay_video_decoder.h
+@@ -25,7 +25,7 @@
+   void Reset(base::OnceClosure) override;
+   bool NeedsBitstreamConversion() const override { return true; }
+   int GetMaxDecodeRequests() const override { return 1; }
+-  bool FramesHoldExternalResources() const override { return false; }
++  bool FramesHoldExternalResources() const override { return external_resources_; }
+   bool IsPlatformDecoder() const override {
+     return platform_decoder_;
+   }
+@@ -56,6 +56,7 @@
+   Factory software_factory_;
+   std::unique_ptr<media::MediaLog> media_log_;
+   const bool platform_decoder_;
++  const bool external_resources_;
+   AnnexBReplay parser_;
+   media::VideoDecoderConfig config_;
+   media::WaitingCB waiting_;
+diff --git a/media/gpu/mac/radeon_uvd/replay_video_decoder.cc b/media/gpu/mac/radeon_uvd/replay_video_decoder.cc
+--- a/media/gpu/mac/radeon_uvd/replay_video_decoder.cc
++++ b/media/gpu/mac/radeon_uvd/replay_video_decoder.cc
+@@ -19,7 +19,8 @@
+                                        std::unique_ptr<media::MediaLog> media_log)
+     : decoder_(std::move(hardware)), software_factory_(std::move(software)),
+       media_log_(std::move(media_log)),
+-      platform_decoder_(decoder_ && decoder_->IsPlatformDecoder()) {}
++      platform_decoder_(decoder_ && decoder_->IsPlatformDecoder()),
++      external_resources_(decoder_ && decoder_->FramesHoldExternalResources()) {}
+ ReplayVideoDecoder::~ReplayVideoDecoder() = default;
+ media::VideoDecoderType ReplayVideoDecoder::GetDecoderType() const {
+   return decoder_ ? decoder_->GetDecoderType() : media::VideoDecoderType::kUnknown;
+diff --git a/media/gpu/mac/radeon_uvd/rdn_video.h b/media/gpu/mac/radeon_uvd/rdn_video.h
+--- a/media/gpu/mac/radeon_uvd/rdn_video.h
++++ b/media/gpu/mac/radeon_uvd/rdn_video.h
+@@ -1,68 +1,94 @@
+-/* Bounded H.264 video user-client interface. */
+-#ifndef RDN_VIDEO_API_H
+-#define RDN_VIDEO_API_H
+-#include <stdint.h>
+-#include "rdn_uvd_h264.h"
+-#define RDN_VIDEO_UC_TYPE 0x72646e76u /* rdnv */
+-#define RDN_VIDEO_API_VERSION 1u
+-#define RDN_VIDEO_MEMORY_UPLOAD 0x100u
+-#define RDN_VIDEO_MEMORY_OUTPUT0 0x101u
+-#define RDN_VIDEO_MEMORY_OUTPUT1 0x102u
+-#define RDN_VIDEO_MAX_UPLOAD_BYTES (4u * 1024u * 1024u)
+-#define RDN_VIDEO_OUTPUT_SLOTS 2u
+-#define RDN_VIDEO_CREATE_VALIDATION 1u
+-#define RDN_VIDEO_CAP_READY 1u
+-#define RDN_VIDEO_CAP_PRODUCTION 2u
+-#define RDN_VIDEO_CAP_VALIDATION 4u
+-#define RDN_VIDEO_CAP_BUSY 8u
+-#define RDN_VIDEO_FORMAT_NV12 1u
+-#define RDN_VIDEO_PROFILE_BASELINE 1u
+-#define RDN_VIDEO_PROFILE_MAIN 2u
+-#define RDN_VIDEO_PROFILE_HIGH 4u
+-enum { RDN_VIDEO_QUERY, RDN_VIDEO_CREATE, RDN_VIDEO_DECODE,
+-       RDN_VIDEO_RELEASE, RDN_VIDEO_DESTROY, RDN_VIDEO_METHOD_COUNT };
+-/* All fields use CPU byte order; no pointers, size_t or compiler bool. */
+-struct rdn_video_token { uint32_t high, low; };
+-struct rdn_video_query {
+- uint32_t version, bytes, flags, unavailable_reason;
+- uint32_t max_width, max_height, max_refs, profile_mask, level_mask;
+- uint32_t max_upload_bytes, max_sessions, max_inflight, output_slots;
+- uint32_t max_vram_bytes, max_cpu_bytes, reserved[17];
+-};
+-struct rdn_video_create {
+- uint32_t version, bytes;
+- struct rdn_uvd_h264_config config;
+- uint32_t flags, reserved[7];
+-};
+-struct rdn_video_session {
+- uint32_t version, bytes;
+- struct rdn_video_token session;
+- uint32_t coded_width, coded_height, format, y_stride, uv_stride;
+- uint32_t y_offset, uv_offset, output_bytes, upload_bytes;
+- uint32_t output_slots, upload_memory_type, output0_memory_type;
+- uint32_t output1_memory_type, reserved[15];
+-};
+-struct rdn_video_decode {
+- uint32_t version, bytes;
+- struct rdn_video_token session;
+- uint32_t request_sequence, bitstream_bytes, reserved[2];
+- struct rdn_uvd_h264_picture picture;
+-};
+-struct rdn_video_output {
+- uint32_t version, bytes;
+- struct rdn_video_token session;
+- uint32_t request_sequence, output_sequence, slot, flags;
+- uint32_t coded_width, coded_height, format, y_stride, uv_stride;
+- uint32_t y_offset, uv_offset, output_bytes, reserved[16];
+-};
+-struct rdn_video_release {
+- uint32_t version, bytes;
+- struct rdn_video_token session;
+- uint32_t output_sequence, slot, reserved[2];
+-};
+-struct rdn_video_destroy {
+- uint32_t version, bytes;
+- struct rdn_video_token session;
+- uint32_t reserved[4];
+-};
+-#endif
++/* Bounded H.264 video user-client interface. */
++#ifndef RDN_VIDEO_API_H
++#define RDN_VIDEO_API_H
++#include <stdint.h>
++#include "rdn_uvd_h264.h"
++#define RDN_VIDEO_UC_TYPE 0x72646e76u /* rdnv */
++#define RDN_VIDEO_API_VERSION 1u
++#define RDN_VIDEO_MEMORY_UPLOAD 0x100u
++#define RDN_VIDEO_MEMORY_OUTPUT0 0x101u
++#define RDN_VIDEO_MEMORY_OUTPUT1 0x102u
++#define RDN_VIDEO_MAX_UPLOAD_BYTES (4u * 1024u * 1024u)
++#define RDN_VIDEO_OUTPUT_SLOTS 2u
++#define RDN_VIDEO_CREATE_VALIDATION 1u
++#define RDN_VIDEO_CREATE_GPU_OUTPUT 2u
++#define RDN_VIDEO_CAP_READY 1u
++#define RDN_VIDEO_CAP_PRODUCTION 2u
++#define RDN_VIDEO_CAP_VALIDATION 4u
++#define RDN_VIDEO_CAP_BUSY 8u
++#define RDN_VIDEO_CAP_GPU_OUTPUT 16u
++#define RDN_VIDEO_LAYOUT_FIELD_NV12 1u
++#define RDN_VIDEO_GPU_PRODUCER 1u
++#define RDN_VIDEO_GPU_IMPORTER 2u
++#define RDN_VIDEO_GPU_RETIRED 0u
++#define RDN_VIDEO_GPU_PENDING 1u
++#define RDN_VIDEO_FORMAT_NV12 1u
++#define RDN_VIDEO_PROFILE_BASELINE 1u
++#define RDN_VIDEO_PROFILE_MAIN 2u
++#define RDN_VIDEO_PROFILE_HIGH 4u
++enum { RDN_VIDEO_QUERY, RDN_VIDEO_CREATE, RDN_VIDEO_DECODE,
++       RDN_VIDEO_RELEASE, RDN_VIDEO_DESTROY, RDN_VIDEO_DECODE_GPU,
++       RDN_VIDEO_ACQUIRE_GPU, RDN_VIDEO_RETIRE_GPU, RDN_VIDEO_METHOD_COUNT };
++/* All fields use CPU byte order; no pointers, size_t or compiler bool. */
++struct rdn_video_token { uint32_t high, low; };
++struct rdn_video_query {
++ uint32_t version, bytes, flags, unavailable_reason;
++ uint32_t max_width, max_height, max_refs, profile_mask, level_mask;
++ uint32_t max_upload_bytes, max_sessions, max_inflight, output_slots;
++ uint32_t max_vram_bytes, max_cpu_bytes, reserved[17];
++};
++struct rdn_video_create {
++ uint32_t version, bytes;
++ struct rdn_uvd_h264_config config;
++ uint32_t flags, reserved[7];
++};
++struct rdn_video_session {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t coded_width, coded_height, format, y_stride, uv_stride;
++ uint32_t y_offset, uv_offset, output_bytes, upload_bytes;
++ uint32_t output_slots, upload_memory_type, output0_memory_type;
++ uint32_t output1_memory_type, reserved[15];
++};
++struct rdn_video_decode {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t request_sequence, bitstream_bytes, reserved[2];
++ struct rdn_uvd_h264_picture picture;
++};
++struct rdn_video_output {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t request_sequence, output_sequence, slot, flags;
++ uint32_t coded_width, coded_height, format, y_stride, uv_stride;
++ uint32_t y_offset, uv_offset, output_bytes, reserved[16];
++};
++struct rdn_video_release {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t output_sequence, slot, reserved[2];
++};
++struct rdn_video_destroy {
++ uint32_t version, bytes;
++ struct rdn_video_token session;
++ uint32_t reserved[4];
++};
++/* Tokens are opaque and valid only on the creating video connection. */
++struct rdn_video_gpu_output {
++ uint32_t version, bytes, source_token[8];
++ uint32_t request_sequence, coded_width, coded_height, layout, reserved[2];
++};
++struct rdn_video_gpu_acquire {
++ uint32_t version, bytes, source_token[8], reserved[6];
++};
++/* Offsets are relative to target; vram_offset names the allocation, not a BO. */
++struct rdn_video_gpu_source {
++ uint32_t version, bytes, source_token[8];
++ uint32_t vram_offset, target_bytes, pitch, coded_width, coded_height;
++ uint32_t y_top, y_bottom, uv_top, uv_bottom, layout, reserved[4];
++};
++/* RETIRED requires no submission or a completed GPU fence; PENDING quarantines. */
++struct rdn_video_gpu_retire {
++ uint32_t version, bytes, source_token[8], role, outcome, reserved[4];
++};
++#endif
+diff --git a/content/browser/gpu/gpu_process_host.cc b/content/browser/gpu/gpu_process_host.cc
+--- a/content/browser/gpu/gpu_process_host.cc
++++ b/content/browser/gpu/gpu_process_host.cc
+@@ -234,6 +234,7 @@
+     "disable-leopard-command-batch-budget",
+       "disable-leopard-consumer-pacing",
+       "disable-leopard-gpu-presentation",
++      "disable-radeon-uvd-gpu-output",
+       "enable-leopard-gpu-presentation",
+       "enable-leopard-gpu-presentation-test",
+ #endif
