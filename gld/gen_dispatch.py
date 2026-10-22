@@ -1741,6 +1741,119 @@ static int leopard_gl_compat(void)
 	return known && !rdn_modern_contexts;
 }
 
+/*
+ * The Sims 2 (Aspyr's 1.0) copies the extension string into a buffer of
+ * 4096 bytes without looking at its length; Mesa's 290 names are 7.8 KB and
+ * overwrite its stack (return address "ject", from GL_ARB_uniform_buffer_
+ * object at byte 4124). That program gets what an OpenGL 2.0 card of its
+ * day had (a Radeon X800 or X1600, a GeForce 6 or 7 on Tiger) that Mesa
+ * also has, then Apple's names, in under SIMS_EXT_MAX bytes.
+ * RDN_EXT_FULL=1: Mesa's whole list.
+ */
+#define SIMS_EXT_MAX 4000
+
+static const char *const sims_ext[] = {
+	"GL_ARB_multisample", "GL_EXT_abgr", "GL_EXT_bgra", "GL_EXT_blend_color",
+	"GL_EXT_blend_minmax", "GL_EXT_blend_subtract", "GL_EXT_copy_texture",
+	"GL_EXT_subtexture", "GL_EXT_texture_object", "GL_EXT_vertex_array",
+	"GL_EXT_compiled_vertex_array", "GL_EXT_texture", "GL_EXT_texture3D",
+	"GL_ARB_point_parameters", "GL_EXT_draw_range_elements", "GL_EXT_packed_pixels",
+	"GL_EXT_point_parameters", "GL_EXT_rescale_normal", "GL_EXT_separate_specular_color",
+	"GL_EXT_texture_edge_clamp", "GL_SGIS_generate_mipmap", "GL_SGIS_texture_edge_clamp",
+	"GL_SGIS_texture_lod", "GL_ARB_multitexture", "GL_EXT_blend_func_separate",
+	"GL_EXT_fog_coord", "GL_EXT_multi_draw_arrays", "GL_EXT_secondary_color",
+	"GL_EXT_texture_env_add", "GL_EXT_texture_filter_anisotropic", "GL_EXT_texture_lod_bias",
+	"GL_NV_blend_square", "GL_NV_texgen_reflection", "GL_ARB_texture_cube_map",
+	"GL_ARB_texture_env_add", "GL_ARB_transpose_matrix", "GL_ARB_texture_border_clamp",
+	"GL_ARB_texture_compression", "GL_EXT_framebuffer_object",
+	"GL_EXT_texture_compression_s3tc", "GL_EXT_texture_env_combine",
+	"GL_EXT_texture_env_dot3", "GL_ARB_depth_texture", "GL_ARB_occlusion_query",
+	"GL_ARB_shadow", "GL_ARB_texture_env_combine", "GL_ARB_texture_env_crossbar",
+	"GL_ARB_texture_env_dot3", "GL_ARB_texture_mirrored_repeat", "GL_ARB_window_pos",
+	"GL_EXT_stencil_two_side", "GL_EXT_texture_cube_map", "GL_ARB_draw_buffers",
+	"GL_ARB_fragment_program", "GL_ARB_fragment_shader", "GL_ARB_shader_objects",
+	"GL_ARB_vertex_program", "GL_ARB_vertex_shader", "GL_ARB_shading_language_100",
+	"GL_ARB_point_sprite", "GL_ARB_texture_non_power_of_two", "GL_ARB_vertex_buffer_object",
+	"GL_EXT_blend_equation_separate", "GL_EXT_shadow_funcs", "GL_EXT_stencil_wrap",
+	"GL_ARB_texture_rectangle", "GL_EXT_texture_rectangle", "GL_ARB_pixel_buffer_object",
+	"GL_EXT_pixel_buffer_object", "GL_ARB_half_float_pixel", "GL_ARB_texture_float",
+	"GL_ARB_color_buffer_float", "GL_EXT_framebuffer_blit", "GL_EXT_framebuffer_multisample",
+	"GL_EXT_packed_depth_stencil", "GL_EXT_texture_sRGB", "GL_EXT_gpu_program_parameters",
+	"GL_ATI_texture_float", "GL_ATI_texture_env_combine3", "GL_ATI_separate_stencil",
+	"GL_NV_texture_rectangle",
+	NULL
+};
+
+static int ext_capped(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *name = getprogname();
+
+		on = name && !strcmp(name, "The Sims 2") && !getenv("RDN_EXT_FULL");
+	}
+	return on;
+}
+
+static int ext_listed(const char *at, size_t len, const char *const *names)
+{
+	for (; *names; names++)
+		if (strlen(*names) == len && !strncmp(*names, at, len))
+			return 1;
+	return 0;
+}
+
+/* The list cut to sims_ext's names, in Mesa's order, and the APPLE ones last. */
+static void ext_cap(char *list)
+{
+	char *kept = malloc(strlen(list) + 1);
+	const char *at, *end;
+	size_t apple = 0;
+	int pass;
+
+	if (!kept)
+		return;
+	for (pass = 0; pass < 2; pass++) {
+		kept[0] = 0;
+		for (at = list; *at; at = end) {
+			size_t len, have = strlen(kept);
+			int is_apple;
+
+			while (*at == ' ')
+				at++;
+			for (end = at; *end && *end != ' '; end++)
+				;
+			len = end - at;
+			is_apple = len > 9 && !strncmp(at, "GL_APPLE_", 9);
+			if (pass == 0 && is_apple)
+				apple += len + 1;
+			if (pass == 1 && !is_apple && ext_listed(at, len, sims_ext) &&
+			    have + len + 1 + apple <= SIMS_EXT_MAX) {
+				if (have)
+					strcat(kept, " ");
+				strncat(kept, at, len);
+			}
+		}
+	}
+	/* the APPLE names after the others */
+	for (at = list; *at; at = end) {
+		while (*at == ' ')
+			at++;
+		for (end = at; *end && *end != ' '; end++)
+			;
+		if (end - at > 9 && !strncmp(at, "GL_APPLE_", 9)) {
+			if (*kept)
+				strcat(kept, " ");
+			strncat(kept, at, end - at);
+		}
+	}
+	strcpy(list, kept);
+	free(kept);
+	rdn_log("the extension list is cut to %u bytes for this program (RDN_EXT_FULL=1: whole)",
+		(unsigned)strlen(list));
+}
+
 static int ext_ours(void)
 {
 	static int ours = -1;
@@ -1748,7 +1861,7 @@ static int ext_ours(void)
 	if (ours < 0)
 		ours = leopard_gl_compat() || flushrange || var_on() || (apple_on() && ext_default[0]) ||
 		       getenv("RDN_EXT_ADD") != NULL || rdn_ws_no_core_image() ||
-		       rdn_ws_core_image();
+		       rdn_ws_core_image() || ext_capped();
 	return ours;
 }
 
@@ -1838,6 +1951,8 @@ static const GLubyte *ext_list(const GLubyte *mesa)
 		ext_drop(list, "GL_ARB_fragment_program");
 		rdn_log("the window server is not told of GL_ARB_fragment_program (no Core Image)");
 	}
+	if (ext_capped())
+		ext_cap(list);
 	rdn_log("extensions of ours named in the list:%s%s%s%s%s",
 		flushrange ? " GL_APPLE_flush_buffer_range" : "",
 		var_on() ? " GL_APPLE_vertex_array_range and what goes with it" : "",

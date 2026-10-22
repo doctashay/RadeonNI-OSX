@@ -167,6 +167,12 @@ been planned in detail.
   `RDN_GLD_NO_BACKBUFFER=1` keeps the old single buffer; the window server is
   never double-buffered). After a change to presentation grab the screen
   before measuring (`scripts/mac.sh g5 grab`): a frame rate proves nothing.
+- The Sims 2 (Aspyr 1.0, 2026-10-22, Tiger, G5): it copies GL_EXTENSIONS into a 4096-byte stack
+  buffer, so the 7.9 KB list smashed its stack (crash pc 0x6a656374, "ject" from
+  GL_ARB_uniform_buffer_object at byte 4124). The user's decision: for the program "The Sims 2" only,
+  `ext_cap()` in `gld/gen_dispatch.py` cuts the list to `sims_ext` (an OpenGL 2.0 card's names, Mesa's
+  order) plus Apple's names, 2184 bytes, cap 4000. `RDN_EXT_FULL=1` turns it off. Other programs keep the
+  full list. On Leopard the same game dies earlier, before any GL call (jump to 0 at startup): not ours.
 - Where the two games stand (2026-10-06, end of day, G5, 1920x1080):
   Doom 3 demo 48 and 51 fps on the saves `bench` and `bench2` (ARB2
   path, glthread; the GeForce 6600 LE 26 and 19), Quake 3 `four` 149.
