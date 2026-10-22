@@ -9,12 +9,12 @@ bool RadeonNIAccel::videoCharge(UInt32 bytes)
 {
  UInt32 old;
  do { old=fVideoCpuBytes; if(old>20u*1024*1024 || bytes>20u*1024*1024-old) return false; }
- while(!OSCompareAndSwap(old,old+bytes,&fVideoCpuBytes));
+ while(!OSCompareAndSwap(old,old+bytes,(UInt32 *)&fVideoCpuBytes)); /* Tiger's prototype takes a plain pointer */
  return true;
 }
 void RadeonNIAccel::videoUncharge(UInt32 bytes)
 {
- OSAddAtomic(-(SInt32)bytes,(volatile SInt32 *)&fVideoCpuBytes);
+ OSAddAtomic(-(SInt32)bytes,(SInt32 *)&fVideoCpuBytes);
 }
 RadeonNIVideoMemory *RadeonNIVideoMemory::withBytes(RadeonNIAccel *owner,UInt32 bytes,bool readOnly)
 {
