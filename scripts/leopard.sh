@@ -79,7 +79,7 @@ check() {
     "$root/scripts/check-kext-relocs.sh" "$out/RadeonNI.kext/Contents/MacOS/RadeonNI"
     fetch_exports
     python3 -I - "$exports" "$out/undefined.txt" <<'PY'
-import re, sys, collections
+import os, re, sys, collections
 d, und = sys.argv[1], sys.argv[2]
 # What the kext may use: the kernel's legacy set (System6.0, with the unsupported list) and the iokit, libkern and mach
 # libraries its Info.plist declares. The BSD interface (com.apple.kpi.bsd: proc_selfpid and the like) is not among them, and
@@ -113,6 +113,12 @@ for s in syms:
         unknown.append(s + '   (only in the BSD interface, which the kext cannot use)')
     else:
         unknown.append(s)
+# Symbols the lists cannot vouch for but the real check (kextload -t -n on a Leopard Mac, install.sh --check)
+# may accept: LEOPARD_ALLOW_UNKNOWN="sym1 sym2". Reported, not silent.
+allow = set(os.environ.get('LEOPARD_ALLOW_UNKNOWN', '').split())
+for s in [u for u in unknown if u.split()[0] in allow]:
+    print('  ALLOWED (verify with kextload -t -n on Leopard)', s)
+unknown = [u for u in unknown if u.split()[0] not in allow]
 print('undefined: %d; in the kernel lists: %d; from the IOPCIFamily and '
       'IOGraphicsFamily kexts (not checkable here): %d; unknown: %d'
       % (len(syms), len([s for s in syms if s in have]), sum(fam.values()), len(unknown)))
