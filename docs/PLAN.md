@@ -20,6 +20,17 @@ system sleep/wake. Tiger has a separate qualification track.
 | E: recovery | Bounded fault capture/reset; failed fences and reset generations; explicit context invalidation | Planned |
 | F: qualification | Game regressions, performance measurements, additional ASICs and modern GL features | Planned |
 
+### Open, noted, not started
+
+- **Leopard: Finder window corrupts while it is moved (2026-10-22, user).** Window title bar and toolbar
+  strip show stacked stale copies, the status text smears along the bottom edge; the window body, sidebar,
+  desktop, menu bar and Dock are right. No GPU errors in `system.log`. Installed Leopard kext was md5
+  `00500aa3…` (Oct 22 14:51), which predates `efc12f7` (`setIDMode` lets surface 1 through the SurfaceGate
+  only with BackingSurfaces); suspect the surface/shape path first, unproven. Evidence: the user's screenshot
+  `~/Desktop/Picture 1.png` on the G5's Leopard volume, copy in `images/leopard-finder-corruption-20261022.png`
+  on arch-server. `scripts/mac.sh g5 grab` does not work on Leopard (the Tiger-built `~/gl/rdnuc grab` returns
+  nothing), so look at a user's screenshot or fix the grab first. Start after the Sims 2 investigation.
+
 ### Implementation contracts
 
 - Preserve the failing baseline while investigating gate A; do not use a
