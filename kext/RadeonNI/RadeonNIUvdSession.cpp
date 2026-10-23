@@ -161,6 +161,9 @@ int RadeonNIAccel::videoCommand(UInt32 type,const rdn_uvd_h264_picture *picture,
 }
 int RadeonNIAccel::videoBindReadback(void)
 {
+#ifndef RDN_LEOPARD
+ return -ENODEV;	/* IODMACommand is Leopard's: Tiger's kernel lacks withSpecification and OutputHost64 */
+#else
  RadeonNIVideoSession *s=fVideoSession;
  if(s->readback->prepare()!=kIOReturnSuccess) return -EIO;
  s->readbackPrepared=true;
@@ -195,6 +198,7 @@ int RadeonNIAccel::videoBindReadback(void)
  if(error && done==s->readbackBytes) { s->gartUnsafe=true; videoPoison(error); }
  IOLockUnlock(fLock);
  return error;
+#endif
 }
 int RadeonNIAccel::videoUnbindReadback(void)
 {
@@ -339,6 +343,9 @@ IOReturn RadeonNIAccel::videoCreate(RadeonNIVideoUserClient *owner,bool administ
     (in->flags&~(RDN_VIDEO_CREATE_VALIDATION|RDN_VIDEO_CREATE_GPU_OUTPUT)) || !videoZero(in->reserved,7)) return kIOReturnBadArgument;
  // Smaller coded frames completed with unchanged output on Turks.
  if(in->config.coded_width<64 || in->config.coded_height<64) return kIOReturnUnsupported;
+#ifndef RDN_LEOPARD
+ return kIOReturnUnsupported;	/* RadeonNIVideoMemory is Leopard's (RadeonNIVideoMemory.h) */
+#endif
  rdn_uvd_h264_layout layout;
  if(!videoProfile(in->config.profile_idc) || rdn_uvd_h264_layout_init(&in->config,RDN_UVD_H264_TARGET_FIELDS,&layout)) return kIOReturnUnsupported;
  IOLockLock(fUvdLock);

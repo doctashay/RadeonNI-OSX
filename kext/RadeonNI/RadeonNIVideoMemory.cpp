@@ -2,9 +2,6 @@
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
 #include "RadeonNIVideoMemory.h"
-#define super IOGeneralMemoryDescriptor
-OSDefineMetaClassAndStructors(RadeonNIVideoMemory, IOGeneralMemoryDescriptor)
-
 bool RadeonNIAccel::videoCharge(UInt32 bytes)
 {
  UInt32 old;
@@ -16,6 +13,9 @@ void RadeonNIAccel::videoUncharge(UInt32 bytes)
 {
  OSAddAtomic(-(SInt32)bytes,(SInt32 *)&fVideoCpuBytes);
 }
+#ifdef RDN_LEOPARD
+#define super IOGeneralMemoryDescriptor
+OSDefineMetaClassAndStructors(RadeonNIVideoMemory, IOGeneralMemoryDescriptor)
 RadeonNIVideoMemory *RadeonNIVideoMemory::withBytes(RadeonNIAccel *owner,UInt32 bytes,bool readOnly)
 {
  if(!bytes || bytes>20u*1024*1024-4095) return 0;
@@ -45,3 +45,4 @@ void RadeonNIVideoMemory::free(void)
  if(buffer) IOFreeAligned(buffer,bytes);
  if(owner) { owner->videoUncharge(bytes); owner->release(); }
 }
+#endif
