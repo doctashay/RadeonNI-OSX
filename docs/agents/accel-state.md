@@ -173,6 +173,11 @@ been planned in detail.
   `ext_cap()` in `gld/gen_dispatch.py` cuts the list to `sims_ext` (an OpenGL 2.0 card's names, Mesa's
   order) plus Apple's names, 2184 bytes, cap 4000. `RDN_EXT_FULL=1` turns it off. Other programs keep the
   full list. On Leopard the same game dies earlier, before any GL call (jump to 0 at startup): not ours.
+  `scripts/gl-ext-scan.py <binary>` finds this pattern before a game runs (glGetString(GL_EXTENSIONS) into a
+  stack buffer, from the PowerPC code; it flags both Sims 2 sites). After the cap the Sims 2 gets past the
+  license and then crashes in Apple's QuickTime YUV422 conversion while playing its intro movie
+  (`TSData/Res/Movies`, Sorenson SVQ3; our QuickTime component is not installed on the Tiger volume, no
+  gld/kext frame in the stack): a second problem, not looked into further.
 - Where the two games stand (2026-10-06, end of day, G5, 1920x1080):
   Doom 3 demo 48 and 51 fps on the saves `bench` and `bench2` (ARB2
   path, glthread; the GeForce 6600 LE 26 and 19), Quake 3 `four` 149.
