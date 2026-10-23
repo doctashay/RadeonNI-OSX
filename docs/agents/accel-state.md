@@ -177,7 +177,12 @@ been planned in detail.
   stack buffer, from the PowerPC code; it flags both Sims 2 sites). After the cap the Sims 2 gets past the
   license and then crashes in Apple's QuickTime YUV422 conversion while playing its intro movie
   (`TSData/Res/Movies`, Sorenson SVQ3; our QuickTime component is not installed on the Tiger volume, no
-  gld/kext frame in the stack): a second problem, not looked into further.
+  gld/kext frame in the stack). Rev F (the patched build) crashes identically (same registers; the fault
+  page is `0x?38aa000`, the heap base moving 16 MB a run), with `RDN_NO_APPLE=1`, and with `RDN_SOFTWARE=1`
+  (Mesa not used at all; the game shows a blue screen): so not ours. Without the three intro movies in
+  `TSData/Res/Movies` the original build reaches its menu through our driver.
+  `RDN_SOFTWARE=1` in a program's environment, or its name in `/Library/Application Support/RadeonNI/software`
+  (the lines of `glversion21`), leaves that program to Apple's software renderer (`gld/rdn_mesa.c`).
 - Where the two games stand (2026-10-06, end of day, G5, 1920x1080):
   Doom 3 demo 48 and 51 fps on the saves `bench` and `bench2` (ARB2
   path, glthread; the GeForce 6600 LE 26 and 19), Quake 3 `four` 149.

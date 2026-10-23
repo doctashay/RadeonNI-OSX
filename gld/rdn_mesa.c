@@ -1322,9 +1322,10 @@ static void present_log(int rects, unsigned long sum, const uint8_t *rgb, int w,
  */
 #define RDN_GLVERSION_LIST "/Library/Application Support/RadeonNI/glversion21"
 
-static int want_version21(void)
+/* Is this program named in the file, or has the variable (1 or 0) been set? */
+static int program_listed(const char *var, const char *path)
 {
-	const char *env = getenv("RDN_GL_VERSION21");
+	const char *env = getenv(var);
 	const char *name = getprogname();
 	int named = -1, all = -1;
 	char line[256];
@@ -1332,7 +1333,7 @@ static int want_version21(void)
 
 	if (env)
 		return strcmp(env, "0") != 0;
-	f = fopen(RDN_GLVERSION_LIST, "r");
+	f = fopen(path, "r");
 	if (!f)
 		return 0;
 	while (fgets(line, sizeof(line), f)) {
@@ -1353,10 +1354,28 @@ static int want_version21(void)
 	return named >= 0 ? named : all > 0;
 }
 
+static int want_version21(void)
+{
+	return program_listed("RDN_GL_VERSION21", RDN_GLVERSION_LIST);
+}
+
+/*
+ * A program named in RDN_SOFTWARE_LIST (same lines as the list above), or
+ * started with RDN_SOFTWARE=1, is left to Apple's software renderer: Mesa
+ * and the card are not used for it. To tell a program's trouble from ours.
+ */
+#define RDN_SOFTWARE_LIST "/Library/Application Support/RadeonNI/software"
+
 static int mesa_ready(void)
 {
 	unsigned n;
 
+	if (usable < 0) {
+		if (program_listed("RDN_SOFTWARE", RDN_SOFTWARE_LIST)) {
+			usable = 0;
+			rdn_log("Mesa is not used for this program (RDN_SOFTWARE): Apple's software renderer");
+		}
+	}
 	if (usable < 0) {
 		/* Before Mesa makes its first context: it reads the override once. */
 		if (want_version21()) {
