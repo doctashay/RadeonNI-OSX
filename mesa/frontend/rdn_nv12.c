@@ -18,7 +18,7 @@ struct rdn_nv12 {
    struct pipe_resource *source[4], *destination[2];
    struct pipe_sampler_view *views[4];
    struct pipe_fence_handle *fence;
-   bool pending;
+   bool pending, quarantined;
 };
 
 static int quarantine_count;
@@ -252,13 +252,31 @@ rdn_nv12_run(struct rdn_nv12 *p, struct pipe_resource *source[4],
    if (pipe->memory_barrier)
       pipe->memory_barrier(pipe, PIPE_BARRIER_FRAMEBUFFER | PIPE_BARRIER_TEXTURE);
    pipe->flush(pipe, &p->fence, 0);
-   if (!p->fence || !pipe->screen->fence_finish(pipe->screen, pipe, p->fence, timeout_ns)) {
-      p->pending = true;
+   p->pending = true;
+   if (!timeout_ns)
+      return rdn_nv12_poll(p, false);
+   if (p->fence && pipe->screen->fence_finish(pipe->screen, pipe, p->fence, timeout_ns))
+      return rdn_nv12_poll(p, false);
+   return rdn_nv12_poll(p, true);
+}
+
+int
+rdn_nv12_poll(struct rdn_nv12 *p, bool abandon)
+{
+   if (!p || !p->pending || p->quarantined)
+      return OSMESA_NV12_PENDING;
+   struct pipe_context *pipe = p->pipe;
+   if (!p->fence || !pipe->screen->fence_finish(pipe->screen, pipe, p->fence, 0)) {
+      if (!abandon && p->fence)
+         return OSMESA_NV12_IN_PROGRESS;
+      p->quarantined = true;
       p_atomic_inc(&quarantine_count);
       return OSMESA_NV12_PENDING;
    }
-   bool healthy = !pipe->get_device_reset_status || pipe->get_device_reset_status(pipe) == PIPE_NO_RESET;
+   bool healthy = !pipe->get_device_reset_status ||
+                  pipe->get_device_reset_status(pipe) == PIPE_NO_RESET;
    release_resources(p);
+   p->pending = false;
    return healthy ? OSMESA_NV12_OK : OSMESA_NV12_RETIRED;
 }
 

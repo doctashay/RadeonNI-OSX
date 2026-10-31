@@ -1,4 +1,4 @@
-/* Cold Turks VRAM address layout. SPDX-License-Identifier: MIT */
+/* Cold Northern Islands VRAM address layout. SPDX-License-Identifier: MIT */
 #ifndef RDN_MC_LAYOUT_H
 #define RDN_MC_LAYOUT_H
 
@@ -26,7 +26,8 @@ struct rdn_mc_layout_result {
 	uint32_t modeset_required, failed_reg, expected, actual;
 };
 
-/* Diagnostic cold start only: 1002:675d, 1 GiB at 0xf00000000, DVI/TMDS.
+/* Cold start only: Turks 675d/6758 or Cayman 6704, 1/2 GiB.
+ * Firmware bases: 0xf00000000, plus Cayman 0xf800000000.
  * Caller stops every CPU aperture writer and owns scratch_offset permanently.
  * No clients, active VM/RLC/DMA, or running CP are allowed. DP and cursors are
  * rejected before writes. Success leaves CRTCs off and requires a full modeset.

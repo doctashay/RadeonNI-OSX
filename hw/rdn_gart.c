@@ -65,6 +65,15 @@ void rdn_gart_set_page(struct rdn_gart *gart, uint32_t page, uint64_t bus_addr)
 		write_entry(gart, page, bus_addr);
 }
 
+void rdn_gart_set_vram_page(struct rdn_gart *gart, uint32_t page, uint64_t gpu_addr)
+{
+   if (page >= RDN_GART_PAGES) return;
+   uint64_t entry = (gpu_addr & ~0xfffull) | R600_PTE_VALID |
+                    R600_PTE_READABLE | R600_PTE_WRITEABLE;
+   rdn_vram_write32(gart->accel, gart->table_offset + page * 8, (uint32_t)entry);
+   rdn_vram_write32(gart->accel, gart->table_offset + page * 8 + 4, (uint32_t)(entry >> 32));
+}
+
 void rdn_gart_clear_page(struct rdn_gart *gart, uint32_t page)
 {
 	if (page < RDN_GART_PAGES)
@@ -84,7 +93,18 @@ int rdn_gart_flush_checked(struct rdn_gart *gart)
         !gart->accel->card->os->log)
         return -EINVAL;
     card = gart->accel->card;
+    if (!rdn_family_has_acceleration(card->family))
+        return -EINVAL;
     rdn_wreg(card, HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
+    if (rdn_family_engine(card->family) == RDN_ENGINE_CAYMAN) {
+        rdn_wreg(card, 0x1478, 1);
+        for (i = 0; i < FLUSH_TIMEOUT_US; i++) {
+            if (rdn_rreg(card, 0x147c) & 1)
+                return 0;
+            card->os->delay_us(card->os->cookie, 1);
+        }
+        return -ETIMEDOUT;
+    }
     rdn_wreg(card, VM_CONTEXT0_REQUEST_RESPONSE, REQUEST_TYPE(1));
     for (i = 0; i < FLUSH_TIMEOUT_US; i++) {
         response = rdn_rreg(card, VM_CONTEXT0_REQUEST_RESPONSE);
@@ -132,13 +152,17 @@ static int enable_default(struct rdn_gart *gart, struct rdn_accel *accel,
 			  uint32_t table_offset, uint64_t dummy,
 			  uint32_t default_offset, uint32_t separate_default)
 {
+	if (!gart || !accel || !accel->card ||
+	    !rdn_family_has_acceleration(accel->card->family))
+		return -EINVAL;
 	uint64_t vram_end = accel->vram_base + accel->vram_size - 1;
 	uint32_t page;
 
-	if ((table_offset & 0xfff) || (dummy & 0xfff) ||
+	if (rdn_gart_gpu_start(accel) > 0xc0000000ull ||
+	    (table_offset & 0xfff) || (dummy & 0xfff) ||
 	    table_offset + RDN_GART_TABLE_BYTES > accel->aperture_size ||
-	    (accel->vram_base < RDN_GART_GPU_START + (uint64_t)RDN_GART_PAGES * RDN_GART_PAGE_SIZE &&
-	     vram_end >= RDN_GART_GPU_START))
+	    (accel->vram_base < rdn_gart_gpu_start(accel) + (uint64_t)RDN_GART_PAGES * RDN_GART_PAGE_SIZE &&
+	     vram_end >= rdn_gart_gpu_start(accel)))
 		return -EINVAL;
 
 	gart->accel = accel;
@@ -178,8 +202,10 @@ int rdn_gart_resume(struct rdn_gart *gart)
 	accel = gart->accel;
 	card = accel->card;
 	table_offset = gart->table_offset;
+	if (!rdn_family_has_acceleration(card->family))
+		return -EINVAL;
 	dummy = gart->dummy;
-	if (!accel->vram_size || (table_offset & 0xfff) || (dummy & 0xfff) ||
+	if (rdn_gart_gpu_start(accel) > 0xc0000000ull || !accel->vram_size || (table_offset & 0xfff) || (dummy & 0xfff) ||
 	    accel->aperture_size < RDN_GART_TABLE_BYTES ||
 	    table_offset > accel->aperture_size - RDN_GART_TABLE_BYTES)
 		return -EINVAL;
@@ -187,9 +213,9 @@ int rdn_gart_resume(struct rdn_gart *gart)
 	    !scratch_valid(accel, table_offset, dummy, gart->default_offset))
 		return -EINVAL;
 	vram_end = accel->vram_base + accel->vram_size - 1;
-	if (accel->vram_base < RDN_GART_GPU_START +
+	if (accel->vram_base < rdn_gart_gpu_start(accel) +
 	    (uint64_t)RDN_GART_PAGES * RDN_GART_PAGE_SIZE &&
-	    vram_end >= RDN_GART_GPU_START)
+	    vram_end >= rdn_gart_gpu_start(accel))
 		return -EINVAL;
 
 	/*
@@ -201,6 +227,12 @@ int rdn_gart_resume(struct rdn_gart *gart)
 	rdn_wreg(card, MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR,
 		 (uint32_t)(rdn_vram_addr(accel,
 			gart->separate_default ? gart->default_offset : table_offset) >> 12));
+
+	if (rdn_family_engine(card->family) == RDN_ENGINE_CAYMAN) {
+		int r = rdn_cayman_gart_setup(gart);
+		gart->ready = !r;
+		return r;
+	}
 
 	/* Setup L2 cache */
 	rdn_wreg(card, VM_L2_CNTL, ENABLE_L2_CACHE | ENABLE_L2_FRAGMENT_PROCESSING |
@@ -221,9 +253,9 @@ int rdn_gart_resume(struct rdn_gart *gart)
 	rdn_wreg(card, MC_VM_MB_L1_TLB2_CNTL, tmp);
 	rdn_wreg(card, MC_VM_MB_L1_TLB3_CNTL, tmp);
 	rdn_wreg(card, VM_CONTEXT0_PAGE_TABLE_START_ADDR,
-		 (uint32_t)(RDN_GART_GPU_START >> 12));
+		 (uint32_t)(rdn_gart_gpu_start(accel) >> 12));
 	rdn_wreg(card, VM_CONTEXT0_PAGE_TABLE_END_ADDR,
-		 (uint32_t)(RDN_GART_GPU_START >> 12) + RDN_GART_PAGES - 1);
+		 (uint32_t)(rdn_gart_gpu_start(accel) >> 12) + RDN_GART_PAGES - 1);
 	rdn_wreg(card, VM_CONTEXT0_PAGE_TABLE_BASE_ADDR,
 		 (uint32_t)(rdn_vram_addr(accel, table_offset) >> 12));
 	rdn_wreg(card, VM_CONTEXT0_CNTL, ENABLE_CONTEXT | PAGE_TABLE_DEPTH(0) |
@@ -235,7 +267,7 @@ int rdn_gart_resume(struct rdn_gart *gart)
 	rdn_gart_flush(gart);
 	rdn_log(card->os, RDN_LOG_INFO,
 		"GART of %u MB enabled at GPU address 0x%X, table at aperture offset 0x%X",
-		(unsigned)(RDN_GART_PAGES >> 8), (unsigned)RDN_GART_GPU_START,
+		(unsigned)(RDN_GART_PAGES >> 8), (unsigned)rdn_gart_gpu_start(accel),
 		(unsigned)table_offset);
 	gart->ready = true;
 	return 0;
@@ -250,6 +282,13 @@ void rdn_gart_disable(struct rdn_gart *gart)
 	if (!gart->ready)
 		return;
 	card = gart->accel->card;
+	if (!rdn_family_has_acceleration(card->family))
+		return;
+	if (rdn_family_engine(card->family) == RDN_ENGINE_CAYMAN) {
+		rdn_cayman_gart_disable(gart);
+		gart->ready = false;
+		return;
+	}
 	/* Disable all tables */
 	rdn_wreg(card, VM_CONTEXT0_CNTL, 0);
 	rdn_wreg(card, VM_CONTEXT1_CNTL, 0);

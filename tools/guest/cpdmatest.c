@@ -5,10 +5,11 @@
 #include <mach/mach.h>
 #include <IOKit/IOKitLib.h>
 #include "rdn_user.h"
+#include "rdn_probe_device.h"
 #define CHECK(x) do { unsigned e=(x); if(e){printf("line %u: 0x%x\n",__LINE__,e);return 1;} }while(0)
 int main(int argc,char **argv)
 {
-    io_service_t service=IOServiceGetMatchingService(kIOMasterPortDefault,IOServiceMatching(RDN_UC_SERVICE_CLASS));
+    io_service_t service=rdn_probe_device(argc>6?argv[6]:NULL);
     io_connect_t conn;vm_address_t aperture=0,src=0,dst=0;vm_size_t aperture_size=0;
     unsigned sb=0,db=0,ib=0,on=0,start=0,pages=0,fence=0,done=0;
     unsigned iterations=argc>1?strtoul(argv[1],0,0):1;
@@ -20,8 +21,9 @@ int main(int argc,char **argv)
     struct rdn_user_info info;IOByteCount infosize=sizeof(info);
     setbuf(stdout,NULL);
     if(!service||!iterations||iterations>10000||mode>3||
-       !first_size||first_size>capacity-8192||(dma_flags&~(1u<<21))||(chunk&&(chunk<16||chunk>4096||(chunk&(chunk-1)))))return 2;
-    CHECK(IOServiceOpen(service,mach_task_self(),RDN_UC_TYPE,&conn));
+       !first_size||first_size>capacity-8192||(dma_flags&~((1u<<21)|(2u<<24)))||(chunk&&(chunk<16||chunk>4096||(chunk&(chunk-1)))))return 2;
+    if((dma_flags&(2u<<24)) && (iterations!=1 || (first_size&3)))return 2;
+    CHECK(IOServiceOpen(service,mach_task_self(),RDN_UC_TYPE_V2,&conn));
     CHECK(IOConnectMapMemory(conn,RDN_UC_MEMORY_APERTURE,mach_task_self(),&aperture,&aperture_size,kIOMapAnywhere));
     CHECK(IOConnectMethodScalarIStructureO(conn,RDN_UC_GET_INFO,0,&infosize,&info));
     CHECK(IOConnectMethodScalarIScalarO(conn,RDN_UC_GART_INFO,0,3,&on,&start,&pages));
@@ -68,7 +70,7 @@ int main(int argc,char **argv)
         CHECK(IOConnectMethodScalarIScalarO(conn,RDN_UC_FENCE_WAIT,2,1,fence,3000,&done));
         if(!done){printf("STALL frame %u fence %u source +0x%x destination +0x%x bytes 0x%x\n",frame,fence,so,to,bytes);return 4;}
         CHECK(IOConnectMethodScalarIScalarO(conn,RDN_UC_SYNC_FOR_CPU,0,0));
-        for(i=0;i<capacity;++i){unsigned expected=i>=to&&i<to+bytes?source[so+i-to]:0xa5;if(destination[i]!=expected){printf("MISMATCH frame %u byte %u got %u expected %u\n",frame,i,destination[i],expected);return 5;}}
+        for(i=0;i<capacity;++i){unsigned expected=i>=to&&i<to+bytes?source[so+((i-to)^((dma_flags&(2u<<24))?3:0))]:0xa5;if(destination[i]!=expected){printf("MISMATCH frame %u byte %u got %u expected %u\n",frame,i,destination[i],expected);return 5;}}
         if(frame%100==0)printf("completed %u fence %u\n",frame+1,fence);
     }
     CHECK(IOServiceClose(conn));IOObjectRelease(service);

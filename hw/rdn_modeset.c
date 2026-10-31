@@ -6,9 +6,8 @@
  * radeon_display.c (radeon_compute_pll_avivo), radeon_atombios.c
  * (radeon_atom_get_clock_info) and radeon_clocks.c.
  *
- * Always CRTC 0. The two outputs of the HD 7570 this driver is written for
- * are listed below as its VBIOS object table describes them and as the
- * Linux driver uses them; they should be read from that table instead.
+ * The caller selects the CRTC and pixel PLL. Connector paths come from
+ * the VBIOS, with the original HD 7570 wiring retained as a fallback.
  * The DVI-I connector's digital output is checked against a register trace
  * of Linux. The DisplayPort connector is not: the trace has no DisplayPort
  * sink in it, so that path follows the Linux sources only.
@@ -51,7 +50,7 @@
 #define ENODEV 19
 #endif
 
-#define CRTC_ID			0
+#define CRTC_ID (card->display_crtc)
 
 /*
  * The outputs, in the order rdn_output_detect() tries them. Digital
@@ -310,7 +309,7 @@ bool rdn_output_is_duallink(struct rdn_card *card, const struct rdn_mode *mode)
  */
 static int output_pll(struct rdn_card *card)
 {
-	return output_is_dp(card) ? ATOM_DCPLL : ATOM_PPLL1;
+	return output_is_dp(card) ? ATOM_DCPLL : card->display_pll;
 }
 
 #define PS_WORDS		16
@@ -717,8 +716,15 @@ static int disable_spread_spectrum(struct rdn_card *card)
 	struct ps ps;
 
 	ps_init(&ps);
+	if (card->display_peers) for (unsigned i = 0; i < rdn_crtc_count(card); ++i) {
+		struct rdn_card *peer = card->display_peers[i];
+		if (peer && peer != card && peer->crtc_on && output_pll(peer) == output_pll(card))
+			return 0;
+	}
 	if (output_pll(card) == ATOM_DCPLL)
 		ps_u8(&ps, 2, ATOM_PPLL_SS_TYPE_V3_DCPLL);
+	else if (output_pll(card) == ATOM_PPLL2)
+		ps_u8(&ps, 2, ATOM_PPLL_SS_TYPE_V3_P2PLL);
 	return ps_exec(card, index, &ps);
 }
 
@@ -832,44 +838,45 @@ static void set_base(struct rdn_card *card, const struct rdn_mode *mode,
 	fb_location = ((uint64_t)(rdn_rreg(card, MC_VM_FB_LOCATION) & 0xffff) << 24) +
 		fb->aperture_offset;
 
-	rdn_wreg(card, AVIVO_D1VGA_CONTROL, 0);
+	if (card->display_crtc < 2)
+		rdn_wreg(card, AVIVO_D1VGA_CONTROL + card->display_crtc * 0x100, 0);
 
-	rdn_wreg(card, EVERGREEN_GRPH_FLIP_CONTROL, 0);
+	rdn_wreg(card, EVERGREEN_GRPH_FLIP_CONTROL + rdn_crtc_offset(card->display_crtc), 0);
 
-	rdn_wreg(card, EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH,
+	rdn_wreg(card, EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH + rdn_crtc_offset(card->display_crtc),
 		 (uint32_t)(fb_location >> 32));
-	rdn_wreg(card, EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH,
+	rdn_wreg(card, EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH + rdn_crtc_offset(card->display_crtc),
 		 (uint32_t)(fb_location >> 32));
-	rdn_wreg(card, EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS,
+	rdn_wreg(card, EVERGREEN_GRPH_PRIMARY_SURFACE_ADDRESS + rdn_crtc_offset(card->display_crtc),
 		 (uint32_t)fb_location & EVERGREEN_GRPH_SURFACE_ADDRESS_MASK);
-	rdn_wreg(card, EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS,
+	rdn_wreg(card, EVERGREEN_GRPH_SECONDARY_SURFACE_ADDRESS + rdn_crtc_offset(card->display_crtc),
 		 (uint32_t)fb_location & EVERGREEN_GRPH_SURFACE_ADDRESS_MASK);
-	rdn_wreg(card, EVERGREEN_GRPH_CONTROL, fb_format);
-	rdn_wreg(card, EVERGREEN_GRPH_SWAP_CONTROL, fb_swap);
+	rdn_wreg(card, EVERGREEN_GRPH_CONTROL + rdn_crtc_offset(card->display_crtc), fb_format);
+	rdn_wreg(card, EVERGREEN_GRPH_SWAP_CONTROL + rdn_crtc_offset(card->display_crtc), fb_swap);
 
 	/* 8 bpc scanout goes through the LUT */
-	tmp = rdn_rreg(card, EVERGREEN_GRPH_LUT_10BIT_BYPASS_CONTROL);
+	tmp = rdn_rreg(card, EVERGREEN_GRPH_LUT_10BIT_BYPASS_CONTROL + rdn_crtc_offset(card->display_crtc));
 	tmp &= ~EVERGREEN_LUT_10BIT_BYPASS_EN;
-	rdn_wreg(card, EVERGREEN_GRPH_LUT_10BIT_BYPASS_CONTROL, tmp);
+	rdn_wreg(card, EVERGREEN_GRPH_LUT_10BIT_BYPASS_CONTROL + rdn_crtc_offset(card->display_crtc), tmp);
 
-	rdn_wreg(card, EVERGREEN_GRPH_SURFACE_OFFSET_X, 0);
-	rdn_wreg(card, EVERGREEN_GRPH_SURFACE_OFFSET_Y, 0);
-	rdn_wreg(card, EVERGREEN_GRPH_X_START, 0);
-	rdn_wreg(card, EVERGREEN_GRPH_Y_START, 0);
-	rdn_wreg(card, EVERGREEN_GRPH_X_END, fb->width);
-	rdn_wreg(card, EVERGREEN_GRPH_Y_END, fb->height);
+	rdn_wreg(card, EVERGREEN_GRPH_SURFACE_OFFSET_X + rdn_crtc_offset(card->display_crtc), 0);
+	rdn_wreg(card, EVERGREEN_GRPH_SURFACE_OFFSET_Y + rdn_crtc_offset(card->display_crtc), 0);
+	rdn_wreg(card, EVERGREEN_GRPH_X_START + rdn_crtc_offset(card->display_crtc), 0);
+	rdn_wreg(card, EVERGREEN_GRPH_Y_START + rdn_crtc_offset(card->display_crtc), 0);
+	rdn_wreg(card, EVERGREEN_GRPH_X_END + rdn_crtc_offset(card->display_crtc), fb->width);
+	rdn_wreg(card, EVERGREEN_GRPH_Y_END + rdn_crtc_offset(card->display_crtc), fb->height);
 
-	rdn_wreg(card, EVERGREEN_GRPH_PITCH, fb->pitch_pixels);
-	rdn_wreg(card, EVERGREEN_GRPH_ENABLE, 1);
+	rdn_wreg(card, EVERGREEN_GRPH_PITCH + rdn_crtc_offset(card->display_crtc), fb->pitch_pixels);
+	rdn_wreg(card, EVERGREEN_GRPH_ENABLE + rdn_crtc_offset(card->display_crtc), 1);
 
-	rdn_wreg(card, EVERGREEN_DESKTOP_HEIGHT, fb->height);
-	rdn_wreg(card, EVERGREEN_VIEWPORT_START, 0);
-	rdn_wreg(card, EVERGREEN_VIEWPORT_SIZE,
+	rdn_wreg(card, EVERGREEN_DESKTOP_HEIGHT + rdn_crtc_offset(card->display_crtc), fb->height);
+	rdn_wreg(card, EVERGREEN_VIEWPORT_START + rdn_crtc_offset(card->display_crtc), 0);
+	rdn_wreg(card, EVERGREEN_VIEWPORT_SIZE + rdn_crtc_offset(card->display_crtc),
 		 ((uint32_t)mode->hdisplay << 16) |
 		 ((mode->vdisplay + 1u) & ~1u));
 
 	/* set pageflip to happen anywhere in vblank interval */
-	rdn_wreg(card, EVERGREEN_MASTER_UPDATE_MODE, 0);
+	rdn_wreg(card, EVERGREEN_MASTER_UPDATE_MODE + rdn_crtc_offset(card->display_crtc), 0);
 }
 
 void rdn_lut_set(struct rdn_card *card, uint32_t start, uint32_t count,
@@ -877,17 +884,17 @@ void rdn_lut_set(struct rdn_card *card, uint32_t start, uint32_t count,
 {
 	uint32_t i;
 
-	if (start >= 256)
+	if (!card || card->display_crtc >= rdn_crtc_count(card) || !entries || start >= 256)
 		return;
 	if (count > 256 - start)
 		count = 256 - start;
 
-	rdn_wreg(card, EVERGREEN_DC_LUT_RW_MODE, 0);
-	rdn_wreg(card, EVERGREEN_DC_LUT_WRITE_EN_MASK, 0x00000007);
+	rdn_wreg(card, EVERGREEN_DC_LUT_RW_MODE + rdn_crtc_offset(card->display_crtc), 0);
+	rdn_wreg(card, EVERGREEN_DC_LUT_WRITE_EN_MASK + rdn_crtc_offset(card->display_crtc), 0x00000007);
 	/* The index advances by itself after each colour written. */
-	rdn_wreg(card, EVERGREEN_DC_LUT_RW_INDEX, start);
+	rdn_wreg(card, EVERGREEN_DC_LUT_RW_INDEX + rdn_crtc_offset(card->display_crtc), start);
 	for (i = 0; i < count; i++)
-		rdn_wreg(card, EVERGREEN_DC_LUT_30_COLOR,
+		rdn_wreg(card, EVERGREEN_DC_LUT_30_COLOR + rdn_crtc_offset(card->display_crtc),
 			 ((uint32_t)(entries[i].red & 0x3ff) << 20) |
 			 ((uint32_t)(entries[i].green & 0x3ff) << 10) |
 			 (uint32_t)(entries[i].blue & 0x3ff));
@@ -900,53 +907,53 @@ static void load_lut(struct rdn_card *card)
 
 	card->os->delay_us(card->os->cookie, 10000);
 
-	rdn_wreg(card, NI_INPUT_CSC_CONTROL,
+	rdn_wreg(card, NI_INPUT_CSC_CONTROL + rdn_crtc_offset(card->display_crtc),
 		 (NI_INPUT_CSC_GRPH_MODE(NI_INPUT_CSC_BYPASS) |
 		  NI_INPUT_CSC_OVL_MODE(NI_INPUT_CSC_BYPASS)));
-	rdn_wreg(card, NI_PRESCALE_GRPH_CONTROL, NI_GRPH_PRESCALE_BYPASS);
-	rdn_wreg(card, NI_PRESCALE_OVL_CONTROL, NI_OVL_PRESCALE_BYPASS);
-	rdn_wreg(card, NI_INPUT_GAMMA_CONTROL,
+	rdn_wreg(card, NI_PRESCALE_GRPH_CONTROL + rdn_crtc_offset(card->display_crtc), NI_GRPH_PRESCALE_BYPASS);
+	rdn_wreg(card, NI_PRESCALE_OVL_CONTROL + rdn_crtc_offset(card->display_crtc), NI_OVL_PRESCALE_BYPASS);
+	rdn_wreg(card, NI_INPUT_GAMMA_CONTROL + rdn_crtc_offset(card->display_crtc),
 		 (NI_GRPH_INPUT_GAMMA_MODE(NI_INPUT_GAMMA_USE_LUT) |
 		  NI_OVL_INPUT_GAMMA_MODE(NI_INPUT_GAMMA_USE_LUT)));
 
-	rdn_wreg(card, EVERGREEN_DC_LUT_CONTROL, 0);
+	rdn_wreg(card, EVERGREEN_DC_LUT_CONTROL + rdn_crtc_offset(card->display_crtc), 0);
 
-	rdn_wreg(card, EVERGREEN_DC_LUT_BLACK_OFFSET_BLUE, 0);
-	rdn_wreg(card, EVERGREEN_DC_LUT_BLACK_OFFSET_GREEN, 0);
-	rdn_wreg(card, EVERGREEN_DC_LUT_BLACK_OFFSET_RED, 0);
+	rdn_wreg(card, EVERGREEN_DC_LUT_BLACK_OFFSET_BLUE + rdn_crtc_offset(card->display_crtc), 0);
+	rdn_wreg(card, EVERGREEN_DC_LUT_BLACK_OFFSET_GREEN + rdn_crtc_offset(card->display_crtc), 0);
+	rdn_wreg(card, EVERGREEN_DC_LUT_BLACK_OFFSET_RED + rdn_crtc_offset(card->display_crtc), 0);
 
-	rdn_wreg(card, EVERGREEN_DC_LUT_WHITE_OFFSET_BLUE, 0xffff);
-	rdn_wreg(card, EVERGREEN_DC_LUT_WHITE_OFFSET_GREEN, 0xffff);
-	rdn_wreg(card, EVERGREEN_DC_LUT_WHITE_OFFSET_RED, 0xffff);
+	rdn_wreg(card, EVERGREEN_DC_LUT_WHITE_OFFSET_BLUE + rdn_crtc_offset(card->display_crtc), 0xffff);
+	rdn_wreg(card, EVERGREEN_DC_LUT_WHITE_OFFSET_GREEN + rdn_crtc_offset(card->display_crtc), 0xffff);
+	rdn_wreg(card, EVERGREEN_DC_LUT_WHITE_OFFSET_RED + rdn_crtc_offset(card->display_crtc), 0xffff);
 
-	rdn_wreg(card, EVERGREEN_DC_LUT_RW_MODE, 0);
-	rdn_wreg(card, EVERGREEN_DC_LUT_WRITE_EN_MASK, 0x00000007);
+	rdn_wreg(card, EVERGREEN_DC_LUT_RW_MODE + rdn_crtc_offset(card->display_crtc), 0);
+	rdn_wreg(card, EVERGREEN_DC_LUT_WRITE_EN_MASK + rdn_crtc_offset(card->display_crtc), 0x00000007);
 
-	rdn_wreg(card, EVERGREEN_DC_LUT_RW_INDEX, 0);
+	rdn_wreg(card, EVERGREEN_DC_LUT_RW_INDEX + rdn_crtc_offset(card->display_crtc), 0);
 	for (i = 0; i < 256; i++) {
 		/* 10 bits per channel: red, green, blue */
 		uint32_t v = i << 2;
 
-		rdn_wreg(card, EVERGREEN_DC_LUT_30_COLOR,
+		rdn_wreg(card, EVERGREEN_DC_LUT_30_COLOR + rdn_crtc_offset(card->display_crtc),
 			 (v << 20) | (v << 10) | v);
 	}
 
-	rdn_wreg(card, NI_DEGAMMA_CONTROL,
+	rdn_wreg(card, NI_DEGAMMA_CONTROL + rdn_crtc_offset(card->display_crtc),
 		 (NI_GRPH_DEGAMMA_MODE(NI_DEGAMMA_BYPASS) |
 		  NI_OVL_DEGAMMA_MODE(NI_DEGAMMA_BYPASS) |
 		  NI_ICON_DEGAMMA_MODE(NI_DEGAMMA_BYPASS) |
 		  NI_CURSOR_DEGAMMA_MODE(NI_DEGAMMA_BYPASS)));
-	rdn_wreg(card, NI_GAMUT_REMAP_CONTROL,
+	rdn_wreg(card, NI_GAMUT_REMAP_CONTROL + rdn_crtc_offset(card->display_crtc),
 		 (NI_GRPH_GAMUT_REMAP_MODE(NI_GAMUT_REMAP_BYPASS) |
 		  NI_OVL_GAMUT_REMAP_MODE(NI_GAMUT_REMAP_BYPASS)));
-	rdn_wreg(card, NI_REGAMMA_CONTROL,
+	rdn_wreg(card, NI_REGAMMA_CONTROL + rdn_crtc_offset(card->display_crtc),
 		 (NI_GRPH_REGAMMA_MODE(NI_REGAMMA_BYPASS) |
 		  NI_OVL_REGAMMA_MODE(NI_REGAMMA_BYPASS)));
-	rdn_wreg(card, NI_OUTPUT_CSC_CONTROL,
+	rdn_wreg(card, NI_OUTPUT_CSC_CONTROL + rdn_crtc_offset(card->display_crtc),
 		 (NI_OUTPUT_CSC_GRPH_MODE(NI_OUTPUT_CSC_BYPASS) |
 		  NI_OUTPUT_CSC_OVL_MODE(NI_OUTPUT_CSC_BYPASS)));
 	/* XXX match this to the depth of the crtc fmt block, move to modeset? */
-	rdn_wreg(card, 0x6940, 0);
+	rdn_wreg(card, 0x6940 + rdn_crtc_offset(card->display_crtc), 0);
 }
 
 /*
@@ -1025,31 +1032,31 @@ static void hdmi_mode_set(struct rdn_card *card, const struct rdn_mode *mode)
 	frame[0] = (uint8_t)(0x100 - sum);
 
 	/* dce4_set_mute() */
-	rdn_wreg(card, HDMI_GC, rdn_rreg(card, HDMI_GC) | HDMI_GC_AVMUTE);
+	rdn_wreg(card, HDMI_GC + rdn_crtc_offset(card_output(card)->dig_encoder), rdn_rreg(card, HDMI_GC + rdn_crtc_offset(card_output(card)->dig_encoder)) | HDMI_GC_AVMUTE);
 
 	/* dce4_set_vbi_packet() */
-	rdn_wreg(card, HDMI_VBI_PACKET_CONTROL,
+	rdn_wreg(card, HDMI_VBI_PACKET_CONTROL + rdn_crtc_offset(card_output(card)->dig_encoder),
 		 HDMI_NULL_SEND | HDMI_GC_SEND | HDMI_GC_CONT);
 
 	/* dce4_hdmi_set_color_depth(), 8 bits per colour */
-	tmp = rdn_rreg(card, HDMI_CONTROL);
+	tmp = rdn_rreg(card, HDMI_CONTROL + rdn_crtc_offset(card_output(card)->dig_encoder));
 	tmp &= ~(HDMI_DEEP_COLOR_ENABLE | HDMI_DEEP_COLOR_DEPTH_MASK);
-	rdn_wreg(card, HDMI_CONTROL, tmp);
+	rdn_wreg(card, HDMI_CONTROL + rdn_crtc_offset(card_output(card)->dig_encoder), tmp);
 
 	/* evergreen_set_avi_packet(); the top byte is the version */
-	rdn_wreg(card, AFMT_AVI_INFO0, frame[0] | (frame[1] << 8) |
+	rdn_wreg(card, AFMT_AVI_INFO0 + rdn_crtc_offset(card_output(card)->dig_encoder), frame[0] | (frame[1] << 8) |
 		 (frame[2] << 16) | ((uint32_t)frame[3] << 24));
-	rdn_wreg(card, AFMT_AVI_INFO1, frame[4] | (frame[5] << 8) |
+	rdn_wreg(card, AFMT_AVI_INFO1 + rdn_crtc_offset(card_output(card)->dig_encoder), frame[4] | (frame[5] << 8) |
 		 (frame[6] << 16) | ((uint32_t)frame[7] << 24));
-	rdn_wreg(card, AFMT_AVI_INFO2, frame[8] | (frame[9] << 8) |
+	rdn_wreg(card, AFMT_AVI_INFO2 + rdn_crtc_offset(card_output(card)->dig_encoder), frame[8] | (frame[9] << 8) |
 		 (frame[10] << 16) | ((uint32_t)frame[11] << 24));
-	rdn_wreg(card, AFMT_AVI_INFO3, frame[12] | (frame[13] << 8) |
+	rdn_wreg(card, AFMT_AVI_INFO3 + rdn_crtc_offset(card_output(card)->dig_encoder), frame[12] | (frame[13] << 8) |
 		 ((uint32_t)2 << 24));
-	tmp = rdn_rreg(card, HDMI_INFOFRAME_CONTROL1);
+	tmp = rdn_rreg(card, HDMI_INFOFRAME_CONTROL1 + rdn_crtc_offset(card_output(card)->dig_encoder));
 	tmp &= ~HDMI_AVI_INFO_LINE_MASK;
-	rdn_wreg(card, HDMI_INFOFRAME_CONTROL1, tmp | HDMI_AVI_INFO_LINE(2));
+	rdn_wreg(card, HDMI_INFOFRAME_CONTROL1 + rdn_crtc_offset(card_output(card)->dig_encoder), tmp | HDMI_AVI_INFO_LINE(2));
 
-	rdn_wreg(card, HDMI_GC, rdn_rreg(card, HDMI_GC) & ~HDMI_GC_AVMUTE);
+	rdn_wreg(card, HDMI_GC + rdn_crtc_offset(card_output(card)->dig_encoder), rdn_rreg(card, HDMI_GC + rdn_crtc_offset(card_output(card)->dig_encoder)) & ~HDMI_GC_AVMUTE);
 
 	rdn_log(card->os, RDN_LOG_INFO, "HDMI AVI infoframe, format %u",
 		(unsigned)vic);
@@ -1061,7 +1068,7 @@ static void hdmi_mode_set(struct rdn_card *card, const struct rdn_mode *mode)
  */
 static void hdmi_enable(struct rdn_card *card, bool enable)
 {
-	rdn_wreg(card, HDMI_INFOFRAME_CONTROL0,
+	rdn_wreg(card, HDMI_INFOFRAME_CONTROL0 + rdn_crtc_offset(card_output(card)->dig_encoder),
 		 enable ? HDMI_AVI_INFO_SEND | HDMI_AVI_INFO_CONT : 0);
 }
 
@@ -1177,6 +1184,25 @@ static int train_drive(void *ctx, uint8_t lane_set)
 				     lane_set);
 }
 
+static bool transmitter_valid(const struct rdn_output *out)
+{
+	if (!out || out->transmitter_sel > 2 || out->dig_encoder >= RDN_NUM_CRTC)
+		return false;
+	switch (out->connector_id) {
+	case CONNECTOR_OBJECT_ID_SINGLE_LINK_DVI_I:
+	case CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_I:
+	case CONNECTOR_OBJECT_ID_SINGLE_LINK_DVI_D:
+	case CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_D:
+	case CONNECTOR_OBJECT_ID_HDMI_TYPE_A:
+	case CONNECTOR_OBJECT_ID_HDMI_TYPE_B:
+		return !out->displayport;
+	case CONNECTOR_OBJECT_ID_DISPLAYPORT:
+		return out->displayport;
+	default:
+		return false;
+	}
+}
+
 /* atombios_dig_transmitter_setup(ATOM_TRANSMITTER_ACTION_INIT) */
 static int dig_transmitter_init(struct rdn_card *card,
 				const struct rdn_output *out)
@@ -1184,6 +1210,8 @@ static int dig_transmitter_init(struct rdn_card *card,
 	int index = GetIndexIntoMasterTable(COMMAND, UNIPHYTransmitterControl);
 	struct ps ps;
 
+	if (!transmitter_valid(out))
+		return -EINVAL;
 	if (cmd_table_check(card, index, "UNIPHYTransmitterControl", 1, 4))
 		return -EINVAL;
 	ps_init(&ps);
@@ -1225,7 +1253,7 @@ void rdn_output_select(struct rdn_card *card, const struct rdn_output *out)
  * DisplayPort sink is looked for: a passive adapter to DVI or HDMI, which
  * would answer as plain I2C on the same pins, is not supported.
  */
-static int output_edid(struct rdn_card *card, const struct rdn_output *out,
+int rdn_output_probe(struct rdn_card *card, const struct rdn_output *out,
 		       uint8_t *edid)
 {
 	struct rdn_i2c_bus bus;
@@ -1307,7 +1335,7 @@ int rdn_output_detect(struct rdn_card *card, uint8_t *edid)
 		cand[n++] = &card->twin;
 
 	for (i = 0; i < n; i++) {
-		r = output_edid(card, cand[i], edid);
+		r = rdn_output_probe(card, cand[i], edid);
 		if (r > 0) {
 			rdn_log(card->os, RDN_LOG_INFO,
 				"%s: EDID found (UNIPHY%d%s, DDC line 0x%02x, "
@@ -1331,6 +1359,72 @@ int rdn_output_detect(struct rdn_card *card, uint8_t *edid)
  * engine clock. Without that clock the CRTC timing is wrong even though
  * every modeset register holds the right value.
  */
+int rdn_output_init(struct rdn_card *card)
+{
+	return dig_transmitter_init(card, card_output(card));
+}
+
+static bool transmitter_same(const struct rdn_output *a,
+			     const struct rdn_output *b)
+{
+	return a->connector_id == b->connector_id &&
+	       a->transmitter_sel == b->transmitter_sel && a->linkb == b->linkb;
+}
+
+static int transmitters_init(struct rdn_card *card)
+{
+	const struct rdn_output *plan[RDN_MAX_BOARD_OUTPUTS + 3];
+	int count = 0, pass, i, j, r;
+
+	if (card->num_board < 0 || card->num_board > RDN_MAX_BOARD_OUTPUTS)
+		return -EINVAL;
+	if (!card->num_board && card->atom.ctx)
+		board_outputs_read(card);
+	if (card->num_board) {
+		/* Retain DP-before-TMDS ordering, using only this board's wiring. */
+		for (pass = 0; pass < 2; pass++) {
+			for (i = 0; i < card->num_board; i++) {
+				const struct rdn_output *out = &card->board[i];
+				if (!transmitter_valid(out))
+					return -EINVAL;
+				if (out->displayport != (pass == 0))
+					continue;
+				for (j = 0; j < count; j++)
+					if (transmitter_same(plan[j], out))
+						break;
+				if (j == count)
+					plan[count++] = out;
+			}
+		}
+	} else {
+		/* The fixed wiring belongs to the tested Dell 1028:2b20 board. */
+		if (card->family != RDN_FAMILY_TURKS || !card->os->cfg_read32 ||
+		    card->os->cfg_read32(card->os->cookie, 0) != 0x675d1002u ||
+		    card->os->cfg_read32(card->os->cookie, 0x2c) != 0x2b201028u) {
+			rdn_log(card->os, RDN_LOG_ERROR,
+				"no usable board transmitter map; fixed 7570 wiring not applicable");
+			return -ENODEV;
+		}
+		plan[count++] = &outputs[RDN_OUTPUT_DP];
+		plan[count++] = &outputs[RDN_OUTPUT_DVI];
+		if (card->output) {
+			if (!transmitter_valid(card->output))
+				return -EINVAL;
+			for (j = 0; j < count; j++)
+				if (transmitter_same(plan[j], card->output))
+					break;
+			if (j == count)
+				plan[count++] = card->output;
+		}
+	}
+	for (i = 0; i < count; i++) {
+		r = dig_transmitter_init(card, plan[i]);
+		if (r)
+			return r;
+	}
+	return 0;
+}
+
 int rdn_display_init(struct rdn_card *card)
 {
 	struct atom_context *ctx = card->atom.ctx;
@@ -1340,18 +1434,9 @@ int rdn_display_init(struct rdn_card *card)
 	struct ps ps;
 	int index, r;
 
-	/* Every transmitter, in Linux's order: DisplayPort's, then DVI's. */
-	r = dig_transmitter_init(card, &outputs[RDN_OUTPUT_DP]);
+	r = transmitters_init(card);
 	if (r)
 		return r;
-	r = dig_transmitter_init(card, &outputs[RDN_OUTPUT_DVI]);
-	if (r)
-		return r;
-	if (card->output && !output_is_builtin(card->output)) {
-		r = dig_transmitter_init(card, card->output);
-		if (r)
-			return r;
-	}
 
 	/* atombios_crtc_set_disp_eng_pll(), PIXEL_CLOCK_PARAMETERS_V6 */
 	if (!atom_parse_data_header(ctx, GetIndexIntoMasterTable(DATA, FirmwareInfo),
@@ -1382,6 +1467,9 @@ int rdn_modeset(struct rdn_card *card, const struct rdn_mode *mode,
 	bool dp = output_is_dp(card);
 	struct rdn_pll pll;
 	int r;
+
+	if (card->display_crtc >= rdn_crtc_count(card) || out->dig_encoder >= RDN_NUM_CRTC ||
+	    (!dp && card->display_pll > ATOM_PPLL2)) return -EINVAL;
 
 	if (!dp && mode->clock > 165000 &&
 	    (hdmi || !rdn_output_is_duallink(card, mode) || mode->clock > 330000))
@@ -1448,6 +1536,7 @@ int rdn_modeset(struct rdn_card *card, const struct rdn_mode *mode,
 	card->wm_clock = mode->clock;
 	card->wm_hdisplay = mode->hdisplay;
 	card->wm_htotal = mode->htotal;
+	card->wm_vdisplay = mode->vdisplay;card->wm_vtotal = mode->vtotal;
 	rdn_bandwidth_update(card);
 	overscan_setup(card);
 	scaler_setup(card);
@@ -1535,6 +1624,8 @@ bool rdn_output_connected(struct rdn_card *card)
 int rdn_output_disable(struct rdn_card *card, const struct rdn_mode *mode,
 		       bool hdmi)
 {
+	if (!card || card->display_crtc >= rdn_crtc_count(card))
+		return -EINVAL;
 	const struct rdn_output *out = card_output(card);
 	bool dp = output_is_dp(card);
 	int encoder_mode = dp ? ATOM_ENCODER_MODE_DP :

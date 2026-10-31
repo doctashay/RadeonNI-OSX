@@ -1,3 +1,7 @@
+#include "RadeonNITelemetry.h"
+extern "C" {
+#include "rdn_pm.h"
+}
 /*
  * Radeon HD 7570 ("Turks", Northern Islands) driver for Mac OS X 10.4 PPC.
  *
@@ -7,6 +11,7 @@
 
 #include <IOKit/IOLib.h>
 #include <libkern/OSByteOrder.h>
+#include <libkern/OSAtomic.h>
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
@@ -34,6 +39,8 @@ OSDefineMetaClassAndStructors(RadeonNI, IOFramebuffer)
 #define RDN_FIRST_START_PROPERTY "RadeonNIFirstStartClaimed"
 #define RDN_MC_BLOCKED_PROPERTY "RadeonNIMCLayoutBlocked"
 
+static volatile UInt32 gAcceleratorClaimed;
+
 enum { kRdnPowerSleep, kRdnPowerIdle, kRdnPowerOn, kRdnPowerCount };
 
 static const char *cardModel(UInt16 device)
@@ -41,7 +48,16 @@ static const char *cardModel(UInt16 device)
 	switch (device) {
 	case 0x675d: return "ATI Radeon HD 7570";
 	case 0x6758: return "ATI Radeon HD 6670";
-	default: return "ATI Radeon Turks";
+	case 0x6704: return "ATI FirePro V7900";
+	default:
+		if (rdn_family_from_device(device) == RDN_FAMILY_BARTS)
+			return "ATI Radeon Barts";
+		if (rdn_family_from_device(device) == RDN_FAMILY_CAICOS)
+			return "ATI Radeon Caicos";
+		if (rdn_family_from_device(device) == RDN_FAMILY_CAYMAN)
+			return "ATI Radeon Cayman";
+		return rdn_family_from_device(device) == RDN_FAMILY_TURKS ?
+			"ATI Radeon Turks" : "ATI Radeon";
 	}
 }
 
@@ -303,9 +319,19 @@ bool RadeonNI::loadBios()
 		if (!(source ? biosFromPersonality() : biosFromRom()))
 			continue;
 		if (!rdn_card_init(&fCard, &fOS, fBios)) {
-			if (!source)
-				compareWithPersonality();
-			return true;
+			OSString *profile = OSDynamicCast(OSString, getProperty("FirmwareFamily"));
+			if (profile && !profile->isEqualTo(rdn_family_name(fCard.family))) {
+				IOLog("RadeonNI: firmware profile does not match PCI family\n");
+				rdn_card_fini(&fCard);
+			} else {
+				setProperty("ASICFamily", rdn_family_name(fCard.family));
+				setProperty("FramebufferOnly", !rdn_family_has_acceleration(fCard.family));
+				setProperty("DisplayControllerCount", (UInt64)rdn_crtc_count(&fCard), 32);
+				setProperty("RadeonNIVBIOS",fBios,fBiosSize);
+				if (!source)
+					compareWithPersonality();
+				return true;
+			}
 		}
 		IOLog("RadeonNI: the image from %s is not a usable VBIOS\n",
 		      source ? "the personality" : "the card's ROM");
@@ -327,6 +353,7 @@ void RadeonNI::describeFb(const struct rdn_mode *mode, IOIndex depth,
 			  struct rdn_fb *fb)
 {
 	bzero(fb, sizeof(*fb));
+	fb->aperture_offset = fScanoutOffset;
 	fb->width = mode->hdisplay;
 	fb->height = mode->vdisplay;
 	/* Linux pads the pitch to 64 pixels; do the same. */
@@ -337,6 +364,12 @@ void RadeonNI::describeFb(const struct rdn_mode *mode, IOIndex depth,
 
 bool RadeonNI::claimColdLayout()
 {
+	if (!rdn_family_has_acceleration(rdn_family_from_device(
+		fDevice->configRead16(kIOPCIConfigDeviceID)))) {
+		fMCRebaseRequested = false;
+		return !fDevice->getProperty(RDN_MC_BLOCKED_PROPERTY) &&
+		       !fDevice->getProperty(RDN_UVD_REBOOT_PROPERTY);
+	}
 	if (!fDevice->lockForArbitration(false)) {
 		IOLog("RadeonNI: cold MC layout cannot lock PCI provider\n");
 		return false;
@@ -392,28 +425,7 @@ bool RadeonNI::claimColdLayout()
 		if (other)
 			goto fail;
 	}
-	{
-		IORegistryIterator *services = IORegistryIterator::iterateOver(
-			IORegistryEntry::getRegistryRoot(), gIOServicePlane,
-			kIORegistryIterateRecursively);
-		reason = "graphics registry iterator unavailable";
-		if (!services)
-			goto fail;
-		IORegistryEntry *entry;
-		bool present = false;
-		while ((entry = services->getNextObject()))
-			if (entry != this && (OSDynamicCast(IOFramebuffer, entry) ||
-			    OSDynamicCast(IOAccelerator, entry))) {
-				IOLog("RadeonNI: cold MC layout existing graphics service %s (%s)\n",
-				      entry->getName(), entry->getMetaClass()->getClassName());
-				present = true;
-			}
-		present = present || !services->isValid();
-		services->release();
-		reason = "graphics service exists or registry changed";
-		if (present)
-			goto fail;
-	}
+
 	return true;
 fail:
 	IOLog("RadeonNI: cold MC layout startup rejected: %s\n", reason);
@@ -430,6 +442,10 @@ bool RadeonNI::resumeColdConsole(bool newLayout)
 {
 	PE_Video video;
 	IOPlatformExpert *platform = getPlatform();
+	if (!fMCConsoleOwned) {
+		if (!newLayout) fDevice->removeProperty(RDN_MC_BLOCKED_PROPERTY);
+		return true;
+	}
 	if (!fMCConsoleSuspended || !platform)
 		return false;
 	if (newLayout) {
@@ -461,7 +477,7 @@ bool RadeonNI::failedColdStart(IOService *provider)
 		cleanUp();
 		return false;
 	}
-	if (!fMCConsoleSuspended) {
+	if (fMCConsoleOwned && !fMCConsoleSuspended) {
 		getPlatform()->setConsoleInfo(0, kPEDisableScreen);
 		fMCConsoleSuspended = true;
 	}
@@ -473,7 +489,7 @@ bool RadeonNI::failedColdStart(IOService *provider)
 		fDevice->unlockForArbitration();
 		fMCProviderLocked = false;
 	}
-	IOLog("RadeonNI: cold MC layout quarantined; console disabled, reboot required\n");
+	IOLog("RadeonNI: cold MC layout quarantined; reboot required\n");
 	IOService::start(provider);
 	return true;
 }
@@ -485,6 +501,26 @@ bool RadeonNI::rebaseColdLayout(int handover, bool unpostedEntry)
 	PE_Video video;
 	if (!fMCRebaseRequested)
 		return true;
+	if (!unpostedEntry) {
+		IORegistryIterator *services = IORegistryIterator::iterateOver(
+			IORegistryEntry::getRegistryRoot(), gIOServicePlane,
+			kIORegistryIterateRecursively);
+		if (!services)
+			return false;
+		IORegistryEntry *entry;
+		bool present = false;
+		while ((entry = services->getNextObject()))
+			if (entry != this && (OSDynamicCast(IOFramebuffer, entry) ||
+			    OSDynamicCast(IOAccelerator, entry))) {
+				IOLog("RadeonNI: cold MC layout existing graphics service %s (%s)\n",
+				      entry->getName(), entry->getMetaClass()->getClassName());
+				present = true;
+			}
+		present = present || !services->isValid();
+		services->release();
+		if (present)
+			return false;
+	}
 	bzero(&video, sizeof(video));
 	if ((!unpostedEntry && handover <= 0) || !fMCProviderLocked || !fMCProviderOpen ||
 	    !platform || platform->getConsoleInfo(&video) != kIOReturnSuccess ||
@@ -502,10 +538,13 @@ bool RadeonNI::rebaseColdLayout(int handover, bool unpostedEntry)
 	if (!fDevice->setProperty(RDN_MC_BLOCKED_PROPERTY, true) ||
 	    fDevice->getProperty(RDN_MC_BLOCKED_PROPERTY) != kOSBooleanTrue)
 		return false;
-	/* Leopard drains both text output and the progress blitter before returning. */
-	if (platform->setConsoleInfo(0, kPEDisableScreen) != kIOReturnSuccess)
-		return false;
-	fMCConsoleSuspended = true;
+	/* An unposted card cannot own the firmware console on another GPU. */
+	fMCConsoleOwned = !unpostedEntry;
+	if (fMCConsoleOwned) {
+		if (platform->setConsoleInfo(0, kPEDisableScreen) != kIOReturnSuccess)
+			return false;
+		fMCConsoleSuspended = true;
+	}
 	bzero(&result, sizeof(result));
 	int r = rdn_mc_layout_rebase_zero(&fCard, RDN_MC_LAYOUT_CONDITIONS,
 					 RDN_MC_LAYOUT_SCRATCH_OFFSET, &result);
@@ -523,6 +562,8 @@ bool RadeonNI::rebaseColdLayout(int handover, bool unpostedEntry)
 		IOLog("RadeonNI: cold MC layout register 0x%08lx expected 0x%08lx actual 0x%08lx\n",
 		      (unsigned long)result.failed_reg, (unsigned long)result.expected,
 		      (unsigned long)result.actual);
+	if (!result.access_restored || (result.modeset_required && !result.rollback_ok))
+		fMCRebased = true;
 	if (r) {
 		if (result.access_restored &&
 		    (result.rollback_ok || !result.modeset_required))
@@ -570,6 +611,13 @@ bool RadeonNI::bringUp()
 		r = rdn_card_repost(&fCard);
 		IOLog("RadeonNI: ASIC_Init again on the posted card (rdn_repost): %d\n", r);
 	}
+	/* The forced fan PWM wiring has only been validated on the V7900. */
+	if (fDevice->configRead16(kIOPCIConfigDeviceID) == 0x6704) {
+		int fan = rdn_pm_fan_full(&fCard);
+		setProperty("FanControlReady", fan == 0);
+		setProperty("FanRequestedPercent", (UInt64)(fan ? 0 : 100), 32);
+		IOLog("RadeonNI: Cayman maximum fan PWM result %d\n", fan);
+	}
 	if (!rebaseColdLayout(handover, unpostedEntry))
 		return false;
 	IOLog("RadeonNI: CONFIG_MEMSIZE %lu MB\n",
@@ -580,7 +628,8 @@ bool RadeonNI::bringUp()
 	 * UVD block's firmware window only works below 4 GB. Before the mode set; the display stays off until then. Before the memory
 	 * controller's microcode, as in radeon's evergreen_startup() (mc_program, then ni_mc_load_microcode).
 	 */
-	if (getProperty("RelocateVRAM") == kOSBooleanTrue && !fMCRebaseRequested) {
+	if (rdn_family_has_acceleration(fCard.family) &&
+	    getProperty("RelocateVRAM") == kOSBooleanTrue && !fMCRebaseRequested) {
 		int mr = rdn_mc_relocate(&fCard, 0);
 
 		IOLog("RadeonNI: video memory moved to 0: %d (0 moved, 1 there already)\n", mr);
@@ -594,7 +643,7 @@ bool RadeonNI::bringUp()
 	 */
 	if (!PE_parse_boot_arg("rdn_mc", &i))
 		i = 1;
-	if (i) {
+	if (i && rdn_family_has_acceleration(fCard.family)) {
 		OSData *mc = OSDynamicCast(OSData, getProperty("FW_MC"));
 
 		if (!mc) {
@@ -623,11 +672,17 @@ bool RadeonNI::bringUp()
 		}
 	}
 	if (fEdidLen < 0) {
-		IOLog("RadeonNI: no EDID on any connector (%d)\n", fEdidLen);
-		return false;
+		if (!fMultiHead || !fCard.num_board) {
+			IOLog("RadeonNI: no EDID on any connector (%d)\n", fEdidLen);
+			return false;
+		}
+		rdn_output_select(&fCard, &fCard.board[0]);
+		bzero(&fCard.dp, sizeof(fCard.dp));
+		fEdidLen = 0;
 	}
+	fConnected = fEdidLen > 0;
 	/* For ioreg: what the monitor said, when a mode is refused. */
-	setProperty("EDID", fEdid, fEdidLen);
+	if (fEdidLen) setProperty("EDID", fEdid, fEdidLen);
 	setProperty("Output", fCard.output->name);
 	fForceDVI = PE_parse_boot_arg("rdn_dvi", &i) && i;
 	IOLog("RadeonNI: %s: EDID %d bytes, %s input, %s signalling%s\n",
@@ -639,7 +694,12 @@ bool RadeonNI::bringUp()
 	{
 		int pref = 0;
 
-		fModeCount = (UInt32)rdn_edid_modes(fEdid, fEdidLen, fModes, kMaxModes, &pref);
+		if (fConnected)
+			fModeCount = (UInt32)rdn_edid_modes(fEdid, fEdidLen, fModes, kMaxModes, &pref);
+		else {
+			struct rdn_mode fallback = {25175,640,656,752,800,480,490,492,525,3};
+			fModes[0] = fallback; fModeCount = 1;
+		}
 		fPreferred = (UInt32)pref + 1;
 	}
 	for (i = 0; i < fModeCount; i++)
@@ -662,6 +722,10 @@ bool RadeonNI::bringUp()
 			fSurfaceBytes = bytes;
 	}
 	fSurfaceBytes = (fSurfaceBytes + 0xfffff) & ~0xfffff;
+	if (fMultiHead) {
+		if (fSurfaceBytes > CURSOR_OFFSET) return false;
+		fSurfaceBytes = CURSOR_OFFSET;
+	}
 	IOLog("RadeonNI: surface memory %lu MB\n",
 	      (unsigned long)fSurfaceBytes >> 20);
 
@@ -726,7 +790,7 @@ bool RadeonNI::bringUp()
 	 * progress spinner for that layout until IOFramebuffer sets up our framebuffer
 	 * a little later: tell it the new layout now, as IOFramebuffer::doSetup() will.
 	 */
-	if (warm && !fMCRebased) {
+	if (warm && !fMCRebased && fConnected) {
 		PE_Video v;
 
 		IOReturn cr;
@@ -791,6 +855,16 @@ IOReturn RadeonNI::programMode(IODisplayModeID id, IOIndex depth)
 
 IOReturn RadeonNI::programModeLocked(IODisplayModeID id, IOIndex depth)
 {
+ RadeonNI *root=fParent?fParent:this;
+ RadeonNIAccel *accel=root->fAccel;
+ IOReturn result=accel?accel->beginDisplayPowerChange():kIOReturnSuccess;
+ if(result!=kIOReturnSuccess)return result;
+ result=programModeHardware(id,depth);
+ if(accel)accel->endDisplayPowerChange();
+ return result;
+}
+IOReturn RadeonNI::programModeHardware(IODisplayModeID id, IOIndex depth)
+{
 	const struct rdn_mode *mode = modeForID(id);
 	struct rdn_fb next;
 	int r;
@@ -798,9 +872,19 @@ IOReturn RadeonNI::programModeLocked(IODisplayModeID id, IOIndex depth)
 	if (!mode || depth < 0 || depth >= kDepthCount)
 		return kIOReturnUnsupportedMode;
 
+	RadeonNI *root = fParent ? fParent : this;
+	if (fMultiHead) for (unsigned i = 0; i < rdn_crtc_count(&fCard); ++i) {
+		RadeonNI *peer = root->fHeads[i];
+		if (!peer || peer == this || !peer->fCard.crtc_on ||
+		    peer->fCard.output->transmitter_sel != fCard.output->transmitter_sel) continue;
+		const struct rdn_mode *peerMode = peer->modeForID(peer->fCurrentMode);
+		if (rdn_output_is_duallink(&fCard, mode) ||
+		    (peerMode && rdn_output_is_duallink(&peer->fCard, peerMode)))
+			return kIOReturnUnsupportedMode;
+	}
 	describeFb(mode, depth, &next);
 	/* Keep requested geometry while asleep; program it when the output wakes. */
-	r = fOutputRequested ? rdn_modeset(&fCard, mode, &next, useHDMI()) : 0;
+	r = (fOutputRequested && (!fMultiHead || fEdidLen > 0)) ? rdn_modeset(&fCard, mode, &next, useHDMI()) : 0;
 	IOLog("RadeonNI: mode %ld depth %ld (%ux%u, %lu bpp): %d\n", (long)id,
 	      (long)depth, mode->hdisplay, mode->vdisplay,
 	      (unsigned long)next.bpp, r);
@@ -810,12 +894,12 @@ IOReturn RadeonNI::programModeLocked(IODisplayModeID id, IOIndex depth)
 	fCurrentMode = id;
 	fCurrentDepth = depth;
 	fModeSet = true;
-	fOutputOn = fOutputRequested;
+	fOutputOn = fOutputRequested && (!fMultiHead || fEdidLen > 0);
 	if (!fOutputOn)
 		return kIOReturnSuccess;
 	/* The mode set leaves the cursor's registers to us. */
 	if (fHWCursor && fCursorLoaded)
-		rdn_cursor_set(&fCard, CURSOR_OFFSET, fCursorX, fCursorY,
+		rdn_cursor_set(&fCard, fCursorOffset, fCursorX, fCursorY,
 			       fCursorVisible);
 	loadColors();
 	return kIOReturnSuccess;
@@ -831,6 +915,10 @@ bool RadeonNI::start(IOService *provider)
 {
 	const char *model;
 	UInt32 memoryMB, memoryBytes;
+	if (fParent) return startHead(provider);
+	fCursorOffset = CURSOR_OFFSET;
+	fHeads[0] = this;
+	fMultiHead = getProperty("MultiHead") == kOSBooleanTrue;
 
 	fDevice = OSDynamicCast(IOPCIDevice, provider);
 	if (!fDevice)
@@ -920,10 +1008,162 @@ bool RadeonNI::start(IOService *provider)
 	 * The accelerator is announced only when the personality asks for
 	 * it: the window server and OpenGL act on it as soon as it is there.
 	 */
-	if (getProperty("Accelerator") == kOSBooleanTrue)
-		fAccel = RadeonNIAccel::withFramebuffer(this, provider);
+	if (rdn_family_has_acceleration(fCard.family) &&
+	    getProperty("Accelerator") == kOSBooleanTrue && fConnected) {
+		UInt32 limit = getProperty("MultiGPUAcceleration") == kOSBooleanTrue ? 4 : 1;
+		for (UInt32 i = 0; i < limit && !fAcceleratorClaimed; ++i) {
+			UInt32 old;
+			do {
+				old = gAcceleratorClaimed;
+				if (old & (1u << i)) break;
+				if (OSCompareAndSwap(old, old | (1u << i), &gAcceleratorClaimed)) {
+					fAcceleratorIndex = i;
+					fAcceleratorClaimed = true;
+					break;
+				}
+			} while (true);
+		}
+		if (fAcceleratorClaimed) {
+			setProperty("GLDDeviceIndex", (UInt64)fAcceleratorIndex, 32);
+			fAccel = RadeonNIAccel::withFramebuffer(this, provider);
+		}
+		if (!fAccel) {
+			if (fAcceleratorClaimed) {
+				UInt32 old;
+				do { old = gAcceleratorClaimed; }
+				while (!OSCompareAndSwap(old, old & ~(1u << fAcceleratorIndex), &gAcceleratorClaimed));
+			}
+			fAcceleratorClaimed = false;
+		}
+	}
+	setProperty("HardwareGLActive", fAccel != 0);
+	if (!fAccel)
+		IOLog("RadeonNI: %s exposes framebuffer outputs without a shared GL renderer\n", model);
+	if (fMultiHead) startHeads();
 	checkFirmwareHook();
 	return true;
+}
+
+bool RadeonNI::screenAt(UInt32 index, struct rdn_fb *fb)
+{
+	RadeonNI *root = fParent ? fParent : this;
+	return index < rdn_crtc_count(&root->fCard) && root->fHeads[index] && root->fHeads[index]->screen(fb);
+}
+
+void RadeonNI::linkHeadAccelerator()
+{
+	if (!fParent->fAccel) return;
+	const char *keys[] = { "IOAccelTypes", "IOAccelRevision" };
+	for (unsigned i = 0; i < sizeof(keys)/sizeof(keys[0]); ++i) {
+		OSObject *value = fParent->getProperty(keys[i]);
+		if (value) setProperty(keys[i], value);
+	}
+	setProperty("IOAccelIndex", (UInt64)fHeadIndex, 32);
+}
+
+bool RadeonNI::startHead(IOService *provider)
+{
+	fDevice = fParent->fDevice;
+	fRegMap = fParent->fRegMap; fRegMap->retain();
+	fFbMap = fParent->fFbMap; fFbMap->retain();
+	fRegs = fParent->fRegs; fLock = fParent->fLock;
+	fOS = fParent->fOS; fCard = fParent->fCard;
+	fCard.output = &fHeadOutput; bzero(&fCard.dp, sizeof(fCard.dp));
+	fCard.display_crtc = fHeadIndex; fCard.display_pll = fHeadPll;
+	fCard.crtc_on = false; fCard.wm_clock = 0;
+	fForceDVI = fParent->fForceDVI;
+	fMultiHead = true; fHotplug = fParent->fHotplug; fDpms = fParent->fDpms;
+	fOutputRequested = fDisplayRequested = fFramebufferRequested = true;
+	fPowerState = kRdnPowerOn;
+	fSurfaceBytes = 32u << 20;
+	if (fParent->fAccel) {
+		if (fParent->fAccel->allocVram(fSurfaceBytes + 16384, 4096, &fScanoutOffset, false)) {
+			cleanUp(); return false;
+		}
+		fHeadAllocation = true;
+	} else {
+		fScanoutOffset = (32u << 20) + (fHeadIndex - 1) * (fSurfaceBytes + 16384);
+		if ((UInt64)fScanoutOffset + fSurfaceBytes + 16384 > fFbMap->getLength()) {
+			cleanUp(); return false;
+		}
+	}
+	fCursorOffset = fScanoutOffset + fSurfaceBytes;
+	fHWCursor = fParent->fHWCursor;
+	IOLockLock(fLock);
+	fEdidLen = rdn_output_probe(&fCard, &fHeadOutput, fEdid);
+	fConnected = fEdidLen > 0;
+	int preferred = 0;
+	if (fConnected) fModeCount = rdn_edid_modes(fEdid, fEdidLen, fModes, kMaxModes, &preferred);
+	else {
+		fEdidLen = 0; fModeCount = 1;
+		struct rdn_mode fallback = {25175, 640,656,752,800,480,490,492,525,3};
+		fModes[0] = fallback;
+	}
+	UInt32 keep = 0, preferredMode = 1;
+	for (UInt32 i = 0; i < fModeCount; ++i) {
+		struct rdn_fb fb;
+		describeFb(&fModes[i], kDepth32, &fb);
+		if ((UInt64)fb.pitch_pixels * 4 * fb.height > fSurfaceBytes) continue;
+		if (i == (UInt32)preferred) preferredMode = keep + 1;
+		fModes[keep++] = fModes[i];
+	}
+	fModeCount = keep;
+	fPreferred = preferredMode; fCurrentDepth = kDepth32;
+	for (unsigned i = 0; i < 256; ++i) {
+		fGamma[i].red = fGamma[i].green = fGamma[i].blue = i << 2;
+		fClut[i] = fGamma[i];
+	}
+	int error = fCard.family == RDN_FAMILY_CAYMAN ? 0 : rdn_output_init(&fCard);
+	rdn_output_hpd_enable(&fCard);
+	IOLockUnlock(fLock);
+	if (error || !fModeCount) { cleanUp(); return false; }
+	setProperty("Accelerator", fParent->fAccel != 0);
+	setProperty("Output", fHeadOutput.name);
+	if (fEdidLen) setProperty("EDID", fEdid, fEdidLen);
+	setProperty("IOFBDependentID", (UInt64)(uintptr_t)fParent, 64);
+	setProperty("IOFBDependentIndex", (UInt64)fHeadIndex, 32);
+	linkHeadAccelerator();
+	if (!super::start(provider)) { cleanUp(); return false; }
+	setName("RadeonNI display");
+	startHotplug();
+	registerService();
+	IOLog("RadeonNI: head %lu registered on %s, connected %u, scanout 0x%lx\n",
+	      (unsigned long)fHeadIndex, fHeadOutput.name, fConnected, (unsigned long)fScanoutOffset);
+	return true;
+}
+
+void RadeonNI::startHeads()
+{
+	fDisplayCards[0] = &fCard;
+	fCard.display_peers = fDisplayCards;
+	setProperty("IOFBDependentID", (UInt64)(uintptr_t)this, 64);
+	setProperty("IOFBDependentIndex", (UInt64)0, 32);
+	unsigned next = 1, tmds = fCard.output->displayport ? 0 : 1;
+	unsigned encoders = 1u << fCard.output->dig_encoder;
+	for (int i = 0; i < fCard.num_board && next < rdn_crtc_count(&fCard); ++i) {
+		const struct rdn_output *out = &fCard.board[i];
+		if (out->dig_encoder >= RDN_NUM_CRTC || (encoders & (1u << out->dig_encoder)) ||
+		    (!out->displayport && tmds >= 2)) continue;
+		RadeonNI *head = new RadeonNI;
+		if (!head || !head->init()) { if (head) head->release(); continue; }
+		head->fParent = this; retain(); head->fHeadOutput = *out; head->fHeadIndex = next;
+		head->fHeadPll = out->displayport ? 0 : tmds;
+		fHeads[next] = head;
+		if (!head->attach(this)) { head->cleanUp(); head->release(); continue; }
+		if (!head->start(this)) { head->detach(this); head->release(); continue; }
+		fDisplayCards[next] = &head->fCard;
+		encoders |= 1u << out->dig_encoder;
+		if (!out->displayport) tmds++;
+		next++;
+		head->release();
+	}
+	IOLockLock(fLock);
+	for (unsigned i = 0; i < next; ++i) if (fHeads[i]) {
+		fHeads[i]->fCard.display_heads = next;
+		rdn_bandwidth_update_clocks(&fHeads[i]->fCard);
+	}
+	IOLockUnlock(fLock);
+	setProperty("DisplayHeadCount", (UInt64)next, 32);
 }
 
 unsigned long RadeonNI::maxCapabilityForDomainState(IOPMPowerFlags state)
@@ -966,6 +1206,8 @@ void RadeonNI::noticeTimerFired(OSObject *owner, IOTimerEventSource *sender)
  */
 void RadeonNI::checkFirmwareHook()
 {
+	if (fCard.family != RDN_FAMILY_TURKS)
+		return;
 	static const char marker[] = "RadeonNI-OF begin";
 	const int mlen = sizeof(marker) - 1;
 	IORegistryEntry *options, *root;
@@ -1016,9 +1258,31 @@ void RadeonNI::checkFirmwareHook()
 
 void RadeonNI::cleanUp()
 {
+	if (fAcceleratorClaimed) {
+		fAcceleratorClaimed = false;
+		UInt32 old;
+		do { old = gAcceleratorClaimed; }
+		while (!OSCompareAndSwap(old, old & ~(1u << fAcceleratorIndex), &gAcceleratorClaimed));
+	}
+	if (fParent) {
+		if (fCard.crtc_on && fLock) {
+			IOLockLock(fLock);
+			rdn_output_disable(&fCard, modeForID(fCurrentMode ? fCurrentMode : fPreferred), useHDMI());
+			IOLockUnlock(fLock);
+		}
+		if (fHeadAllocation && !fCard.crtc_on && fParent->fAccel)
+			fParent->fAccel->freeVram(fScanoutOffset);
+		fHeadAllocation = false;
+		fLock = 0;
+		fCardReady = false;
+		fParent->fHeads[fHeadIndex] = 0;
+		fParent->fDisplayCards[fHeadIndex] = 0;
+		fParent->release(); fParent = 0;
+	}
+
 	if (fMCFatal)
 		return;
-	if (fMCRebased && fFbMap && !fMCConsoleSuspended) {
+	if (fMCRebased && fMCConsoleOwned && fFbMap && !fMCConsoleSuspended) {
 		/* Stop console writes before releasing framebuffer resources. */
 		getPlatform()->setConsoleInfo(0, kPEDisableScreen);
 		fMCConsoleSuspended = true;
@@ -1056,6 +1320,9 @@ void RadeonNI::cleanUp()
 
 void RadeonNI::stop(IOService *provider)
 {
+	if (!fParent) for (unsigned i = 1; i < rdn_crtc_count(&fCard); ++i)
+		if (fHeads[i]) fHeads[i]->terminate(kIOServiceSynchronous);
+
 	if (fMCFatal)
 		return;
 	if (fAccel)
@@ -1081,9 +1348,43 @@ bool RadeonNI::requestTerminate(IOService *provider, IOOptionBits options)
 	return !fMCFatal && super::requestTerminate(provider, options);
 }
 
+IOReturn RadeonNI::readBoardSensors(struct rdn_user_board_sensors *out)
+{
+ if (isInactive() || fParent || !fCardReady || !fRegMap || fMCFatal) return kIOReturnNotReady;
+ if (!tryPowerLock()) return kIOReturnBusy;
+ rdn_pm_board_sensors(&fCard, out);
+ unlockPower();
+ return kIOReturnSuccess;
+}
+
+IOReturn RadeonNI::readTelemetry(bool clocks,UInt32 *temperature,UInt32 *core,UInt32 *memory)
+{
+ if(isInactive() || fParent || !fCardReady || !fRegMap || fMCFatal)return kIOReturnNotReady;
+ if(!tryPowerLock())return kIOReturnBusy;
+ IOReturn result=kIOReturnSuccess;
+ if(clocks) {
+  uint32_t sc=0,mc=0;
+  if(rdn_pm_get_clocks(&fCard,&sc,&mc))result=kIOReturnIOError;
+  *core=sc;*memory=mc;
+ } else {
+  *temperature=readReg(0x740);*core=readReg(0x8010);*memory=readReg(0xe50);
+ }
+ unlockPower();return result;
+}
+
 IOReturn RadeonNI::newUserClient(task_t task, void *security, UInt32 type,
 				IOUserClient **handler)
 {
+ if(type==RDN_UC_TELEMETRY) {
+  *handler=0;
+  if(fParent || !fCardReady || fMCFatal || isInactive())return kIOReturnNotReady;
+  RadeonNITelemetry *client=new RadeonNITelemetry;
+  if(!client)return kIOReturnNoMemory;
+  if(!client->initWithTask(task,security,type)) {client->release();return kIOReturnNoMemory;}
+  if(!client->attach(this)) {client->release();return kIOReturnNotAttached;}
+  if(!client->start(this)) {client->detach(this);client->release();return kIOReturnNotReady;}
+  *handler=client;return kIOReturnSuccess;
+ }
 	if (fMCFatal) {
 		if (handler)
 			*handler = 0;
@@ -1095,6 +1396,16 @@ IOReturn RadeonNI::newUserClient(task_t task, void *security, UInt32 type,
 IOReturn RadeonNI::newUserClient(task_t task, void *security, UInt32 type,
 				OSDictionary *properties, IOUserClient **handler)
 {
+ if(type==RDN_UC_TELEMETRY) {
+  *handler=0;
+  if(fParent || !fCardReady || fMCFatal || isInactive())return kIOReturnNotReady;
+  RadeonNITelemetry *client=new RadeonNITelemetry;
+  if(!client)return kIOReturnNoMemory;
+  if(!client->initWithTask(task,security,type)) {client->release();return kIOReturnNoMemory;}
+  if(!client->attach(this)) {client->release();return kIOReturnNotAttached;}
+  if(!client->start(this)) {client->detach(this);client->release();return kIOReturnNotReady;}
+  *handler=client;return kIOReturnSuccess;
+ }
 	if (fMCFatal) {
 		if (handler)
 			*handler = 0;
@@ -1145,7 +1456,7 @@ IOReturn RadeonNI::setCursorImage(void *cursorImage)
 	info.hardwareCursorData = (UInt8 *)fCursorData;
 	if (!convertCursorImage(cursorImage, &desc, &info)) {
 		fCursorLoaded = false;
-		rdn_cursor_set(&fCard, CURSOR_OFFSET, 0, 0, false);
+		rdn_cursor_set(&fCard, fCursorOffset, 0, 0, false);
 		return kIOReturnUnsupported;
 	}
 	w = info.cursorWidth;
@@ -1161,13 +1472,13 @@ IOReturn RadeonNI::setCursorImage(void *cursorImage)
 	}
 
 	/* The card reads little-endian words; the rest is transparent. */
-	dst = (volatile UInt32 *)((volatile UInt8 *)aperture() + CURSOR_OFFSET);
+	dst = (volatile UInt32 *)((volatile UInt8 *)aperture() + fCursorOffset);
 	for (y = 0; y < RDN_CURSOR_SIZE; y++)
 		for (x = 0; x < RDN_CURSOR_SIZE; x++)
 			dst[y * RDN_CURSOR_SIZE + x] = (x < w && y < h) ?
 				OSSwapHostToLittleInt32(fCursorData[y * w + x]) : 0;
 	fCursorLoaded = true;
-	rdn_cursor_set(&fCard, CURSOR_OFFSET, fCursorX, fCursorY, fCursorVisible);
+	rdn_cursor_set(&fCard, fCursorOffset, fCursorX, fCursorY, fCursorVisible);
 	return kIOReturnSuccess;
 }
 
@@ -1180,7 +1491,7 @@ IOReturn RadeonNI::setCursorState(SInt32 x, SInt32 y, bool visible)
 	fCursorY = y;
 	fCursorVisible = visible;
 	if (fCursorLoaded)
-		rdn_cursor_set(&fCard, CURSOR_OFFSET, x, y, visible);
+		rdn_cursor_set(&fCard, fCursorOffset, x, y, visible);
 	return kIOReturnSuccess;
 }
 
@@ -1266,7 +1577,7 @@ IODeviceMemory *RadeonNI::getApertureRange(IOPixelAperture aperture)
 	bar = fDevice->getDeviceMemoryWithRegister(FB_BAR);
 	if (!bar)
 		return 0;
-	return IODeviceMemory::withSubRange(bar, 0, fSurfaceBytes);
+	return IODeviceMemory::withSubRange(bar, fScanoutOffset, fSurfaceBytes);
 }
 
 IODeviceMemory *RadeonNI::getVRAMRange(void)
@@ -1776,7 +2087,7 @@ void RadeonNI::pollHotplug()
 	if (!fLock || !fModeSet)
 		return;
 	IOLockLock(fLock);
-	if (!fOutputRequested) {
+	if (!fOutputRequested && !fMultiHead) {
 		fSenseSteady = 0;
 		IOLockUnlock(fLock);
 		return;
@@ -1841,7 +2152,7 @@ void RadeonNI::monitorReturned()
 	bool changed;
 
 	IOLog("RadeonNI: the monitor is back\n");
-	len = rdn_output_detect(&fCard, edid);
+	len = fMultiHead ? rdn_output_probe(&fCard, fCard.output, edid) : rdn_output_detect(&fCard, edid);
 	if (len < 0) {
 		IOLog("RadeonNI: no EDID yet (%d); will try again\n", len);
 		return;
@@ -1879,7 +2190,14 @@ void RadeonNI::monitorReturned()
 	} else {
 		id = fCurrentMode;
 	}
+	int oldEdidLen = fEdidLen;
+	UInt8 oldEdid[RDN_EDID_MAX_SIZE];
+	bcopy(fEdid, oldEdid, sizeof(oldEdid));
+	bcopy(edid, fEdid, len);
+	fEdidLen = len;
 	if (programModeLocked(id, fCurrentDepth) != kIOReturnSuccess) {
+		fEdidLen = oldEdidLen;
+		bcopy(oldEdid, fEdid, sizeof(oldEdid));
 		if (changed) {
 			bcopy(oldModes, fModes, sizeof(oldModes));
 			fModeCount = oldCount;

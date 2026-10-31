@@ -25,12 +25,19 @@
 #include <GL/osmesa.h>
 
 #include <pthread.h>
+#include <mach/mach_time.h>
 #include <stdio.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include "rdn_engine.h"
 #include "rdn_glue.h"
 #include "rdn_target.h"
+
+#ifndef RDN_GPU_INDEX
+#define RDN_GPU_INDEX 0
+#endif
+static int selected_renderer(void *cgl_ctx);
 
 /* gldAttachDrawable's type for CGLSetOffScreen: kCGLPFAOffScreen. */
 #define DRAWABLE_OFFSCREEN	0x35
@@ -99,8 +106,10 @@ struct context {
 	int unpack_row_bytes;
 	/* The context it shares objects with (gldCreateContext's fourth argument). */
 	void *share;
+	void *texture_group_key;
 	void *rend;
 	OSMesaContext mesa;
+	int modern_version;
 	long type;
 	const uint32_t *record;
 	/* What Mesa is bound to now; compared with the record. */
@@ -119,7 +128,8 @@ struct context {
 	 * much, to the bottom left corner of that part (rdn_origin_x).
 	 */
 	int direct;
-	uint32_t screen_width, screen_height, screen_pitch;
+	uint32_t screen_width, screen_height, screen_pitch, screen_offset;
+	uint64_t screen_check_us;
 	int origin_x, origin_y;
 	/*
 	 * For DRAWABLE_SURFACE: the window server's names for it; origin_*
@@ -144,12 +154,17 @@ struct context {
 	/* Bound to nothing that is shown (no drawable yet). */
 	int nowhere;
 	unsigned swaps;
+	uint64_t profile_previous;
+	unsigned profile_count;
+	double profile_samples[512][6];
+	uint64_t profile_stage[3];
 	/* The pixel format asked for a double-buffered context (OSMesaDoubleBuffer). */
 	int dbl;
 };
 
 #define MAX_CONTEXTS 64
 static struct context contexts[MAX_CONTEXTS];
+static void texture_group_destroyed(void *group);
 static int resolved, usable = -1;
 
 /* Core Animation can bind one context to several independently live surfaces. */
@@ -245,6 +260,17 @@ static struct context *find(void *gld_ctx)
 	return NULL;
 }
 
+const char *rdn_mesa_device_model(void)
+{
+	return rdn_target_device_model();
+}
+
+__attribute__((visibility("default")))
+uint32_t RDNGLGetDeviceID(void)
+{
+	return rdn_target_device_id();
+}
+
 /*
  * Mesa's context for ours, made now if it is not yet. A context that
  * shares (CGLCreateContext's second argument) is made with the other's
@@ -262,17 +288,17 @@ static OSMesaContext modern_context(OSMesaContext share)
 	const int attribs[] = { OSMESA_FORMAT, OSMESA_BGRA,
 		OSMESA_DEPTH_BITS, 24, OSMESA_STENCIL_BITS, 8,
 		OSMESA_PROFILE, OSMESA_COMPAT_PROFILE,
-		OSMESA_CONTEXT_MAJOR_VERSION, 4, OSMESA_CONTEXT_MINOR_VERSION, 6, 0 };
+		OSMESA_CONTEXT_MAJOR_VERSION, 4, OSMESA_CONTEXT_MINOR_VERSION, 6,
+		OSMESA_LOSE_CONTEXT_ON_RESET, 1, 0 };
 	return OSMesaCreateContextAttribs(attribs, share);
 }
 
 /* Opt in before creating any CGL contexts. The desktop keeps its legacy path. */
-__attribute__((visibility("default")))
-int RDNGLRequestCompatibilityContext(int major, int minor)
+static int modern_ready(void)
 {
 	OSMesaContext probe;
 	int i;
-	if (major != 4 || minor != 6 || rdn_window_server)
+	if (rdn_window_server)
 		return 0;
 	for (i = 0; i < MAX_CONTEXTS; ++i)
 		if (contexts[i].gld_ctx)
@@ -281,37 +307,85 @@ int RDNGLRequestCompatibilityContext(int major, int minor)
 	if (!probe)
 		return 0;
 	OSMesaDestroyContext(probe);
-	rdn_modern_contexts = 1;
 	return 1;
 }
 
-__attribute__((visibility("default")))
-int RDNGLMakeCurrent(void *cgl_context)
+static int modern_make_current(void *cgl_context)
 {
+	OSMesaContext current;
+	struct context *c = NULL;
 	GLint major = 0, minor = 0;
 	void (*get)(GLenum, GLint *);
-	if (!rdn_modern_contexts)
+	int i;
+	if (!rdn_hook_modern_enabled() || (cgl_context && !rdn_mesa_owns_current()))
 		return 0;
+
 	rdn_mesa_early_all(cgl_context);
+	current = OSMesaGetCurrentContext();
 	if (!cgl_context)
-		return OSMesaGetCurrentContext() == NULL;
-	if (!OSMesaGetCurrentContext())
+		return current == NULL;
+	if (!current)
 		return 0;
+	for (i = 0; i < MAX_CONTEXTS; ++i)
+		if (contexts[i].gld_ctx && contexts[i].mesa == current &&
+		    (contexts[i].rend == *(void **)cgl_context ||
+		     contexts[i].early_rend == *(void **)cgl_context)) {
+			c = &contexts[i];
+			break;
+		}
+	if (!c)
+		return 0;
+	/* Version queries drain glthread; the version lasts for this context. */
+	if (c->modern_version)
+		return c->modern_version > 0;
 	get = (void (*)(GLenum, GLint *))OSMesaGetProcAddress("glGetIntegerv");
 	if (!get)
 		return 0;
 	get(GL_MAJOR_VERSION, &major);
 	get(GL_MINOR_VERSION, &minor);
-	return major > 4 || (major == 4 && minor >= 6);
+	c->modern_version = major > 4 || (major == 4 && minor >= 6) ? 1 : -1;
+	return c->modern_version > 0;
+}
+
+static void *modern_lookup(const char *name)
+{
+	if (!rdn_hook_modern_enabled() || !rdn_mesa_owns_current() || !name || name[0] != 'g' || name[1] != 'l' ||
+					!OSMesaGetCurrentContext())
+		return NULL;
+	return (void *)OSMesaGetProcAddress(name);
+}
+
+static void register_modern_once(void)
+{
+    rdn_hook_modern_register(modern_ready, modern_make_current, modern_lookup);
+}
+
+static void register_modern(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, register_modern_once);
+}
+
+__attribute__((visibility("default")))
+int RDNGLRequestCompatibilityContext(int major, int minor)
+{
+    if (major != 4 || minor != 6 || rdn_window_server) return 0;
+    register_modern();
+    return rdn_hook_modern_request();
+}
+
+__attribute__((visibility("default")))
+int RDNGLMakeCurrent(void *ctx)
+{
+    register_modern();
+    return rdn_hook_modern_current(ctx);
 }
 
 __attribute__((visibility("default")))
 void *RDNGLGetProcAddress(const char *name)
 {
-	if (!rdn_modern_contexts || !name || name[0] != 'g' || name[1] != 'l' ||
-					!OSMesaGetCurrentContext())
-		return NULL;
-	return (void *)OSMesaGetProcAddress(name);
+    register_modern();
+    return rdn_hook_modern_lookup(name);
 }
 
 static OSMesaContext mesa_for(struct context *c)
@@ -328,6 +402,7 @@ static OSMesaContext mesa_for(struct context *c)
 	}
 	OSMesaDoubleBuffer(c->dbl ? GL_TRUE : GL_FALSE);
 
+ rdn_modern_contexts = rdn_hook_modern_enabled();
  if (rdn_modern_contexts) {
   c->mesa = modern_context(list);
  } else {
@@ -342,6 +417,7 @@ static OSMesaContext mesa_for(struct context *c)
 void rdn_mesa_context_created(void *gld_ctx, void *share)
 {
 	int i;
+	register_modern();
 
 	if (!gld_ctx || find(gld_ctx))
 		return;
@@ -368,8 +444,10 @@ void rdn_mesa_context_destroyed(void *gld_ctx)
 	}
 	if (c->mesa)
 		OSMesaDestroyContext(c->mesa);
+	void *group = c->texture_group_key;
 	/* WindowServer owns the surface lifetime, independently of this context. */
 	memset(c, 0, sizeof(*c));
+	texture_group_destroyed(group);
 }
 
 
@@ -566,6 +644,15 @@ static struct pbuffer *pbuffer_for(const uint32_t *r)
  * gldAttachDrawable got. Returns 1 if the call is ours, with the CGL
  * error (0 if it worked) in *result.
  */
+/* WindowServer reuses one engine context across its GPU renderers. */
+static int owns_engine_dispatch(void *rend)
+{
+    const struct rdn_engine_layout *layout = rdn_engine_layout();
+    if (!rend || !layout) return 0;
+    void *table = *(void **)((char *)rend + layout->table_off - layout->disp_back);
+    return rdn_dispatch_owns(table);
+}
+
 int rdn_mesa_tex_image_pbuffer(void *cgl_ctx, void *pbuffer, int source, int *result)
 {
 	const uint32_t *r = pbuffer;
@@ -578,7 +665,8 @@ int rdn_mesa_tex_image_pbuffer(void *cgl_ctx, void *pbuffer, int source, int *re
 	for (i = 0; rend && i < MAX_CONTEXTS; i++)
 		if (contexts[i].gld_ctx && contexts[i].rend == rend)
 			c = &contexts[i];
-	if (!c || !r || !c->mesa)
+	if (!c || !r || !c->mesa ||
+	    (rdn_window_server && !owns_engine_dispatch(rend)))
 		return 0;
 	p = pbuffer_find(r[2]);
 	if (!p) {
@@ -631,6 +719,338 @@ static int backing_store(struct context *c, void *backing, uint32_t stride,
 
 int rdn_surface_texture_hook;
 
+static void *foreign_module(unsigned index)
+{
+	static void *handles[4];
+	static unsigned attempts[4];
+	if (!handles[index] && !(attempts[index]++ & 127)) {
+		char path[256], suffix[8] = "";
+		if (index) snprintf(suffix, sizeof(suffix), "%u", index);
+		snprintf(path, sizeof(path), "/System/Library/Extensions/RadeonNIGLDriver%s.bundle/Contents/MacOS/RadeonNIGLDriver%s", suffix, suffix);
+		handles[index] = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+	}
+	return handles[index];
+}
+
+static int migration_textures(void)
+{
+	return rdn_window_server || rdn_gpu_migration_enabled();
+}
+
+static int migration_texture_target(unsigned target)
+{
+	return target == (rdn_window_server ? GL_TEXTURE_RECTANGLE_ARB : GL_TEXTURE_2D);
+}
+
+static unsigned bound_texture(unsigned target)
+{
+	GLint texture = 0;
+	void (*get)(GLenum, GLint *) = OSMesaGetProcAddress("glGetIntegerv");
+	if (get && (target == GL_TEXTURE_RECTANGLE_ARB || target == GL_TEXTURE_2D))
+		get(target == GL_TEXTURE_2D ? GL_TEXTURE_BINDING_2D : GL_TEXTURE_BINDING_RECTANGLE_ARB, &texture);
+	return texture;
+}
+
+static void *texture_group(struct context *c)
+{
+	if (!c) return NULL;
+	if (c->texture_group_key) return c->texture_group_key;
+	struct context *root = c;
+	for (unsigned n = 0; root->share && n < MAX_CONTEXTS; ++n) {
+		struct context *parent = find(root->share);
+		if (!parent || parent == root) break;
+		root = parent;
+	}
+	c->texture_group_key = root->early_rend ? root->early_rend : root->rend;
+	return c->texture_group_key;
+}
+
+__attribute__((visibility("default")))
+int RDNGLCopyTextureV1(void *group, unsigned target, unsigned name, int info[6], void **pixels);
+int RDNGLCopyTextureV1(void *group, unsigned target, unsigned name, int info[6], void **pixels)
+{
+	struct context *c = NULL;
+	if (!migration_textures() || !group || !name) return 0;
+	for (unsigned i = 0; i < MAX_CONTEXTS; ++i)
+		if (contexts[i].mesa && texture_group(&contexts[i]) == group) { c = &contexts[i]; break; }
+	if (!c) return 0;
+	OSMesaContext previous = OSMesaGetCurrentContext();
+	if (!OSMesaAdoptContext(c->mesa)) return 0;
+	GLboolean (*is_texture)(GLuint) = (GLboolean (*)(GLuint))OSMesaGetProcAddress("glIsTexture");
+	void (*get)(GLenum,GLint*) = OSMesaGetProcAddress("glGetIntegerv");
+	void (*bind)(GLenum,GLuint) = OSMesaGetProcAddress("glBindTexture");
+	void (*level)(GLenum,GLint,GLenum,GLint*) = OSMesaGetProcAddress("glGetTexLevelParameteriv");
+	void (*parameter)(GLenum,GLenum,GLint*) = OSMesaGetProcAddress("glGetTexParameteriv");
+	void (*read)(GLenum,GLint,GLenum,GLenum,void*) = OSMesaGetProcAddress("glGetTexImage");
+	void (*store)(GLenum,GLint) = OSMesaGetProcAddress("glPixelStorei");
+	void (*buffer)(GLenum,GLuint) = OSMesaGetProcAddress("glBindBuffer");
+	GLint old = bound_texture(target), pack = 0, saved[5];
+	const GLenum keys[] = {GL_PACK_ALIGNMENT,GL_PACK_ROW_LENGTH,GL_PACK_SKIP_PIXELS,GL_PACK_SKIP_ROWS,GL_PACK_SWAP_BYTES};
+	int ok = 0;
+	*pixels = NULL;
+	if (!is_texture(name)) goto done;
+	bind(target,name);
+	if (!rdn_window_server) {
+		GLint higher = 0, format = 0;
+		level(target, 1, GL_TEXTURE_WIDTH, &higher);
+		level(target, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+		if (higher || (format != GL_RGBA && format != GL_RGBA8 &&
+		               format != GL_RGB && format != GL_RGB8 && format != 3 && format != 4)) {
+			static unsigned warnings;
+			if (warnings++ < 8)
+				fprintf(stderr, "RadeonNI: texture %u migration unsupported (format %x, level 1 width %d)\n", name, format, higher);
+			goto restore;
+		}
+	}
+	level(target,0,GL_TEXTURE_WIDTH,&info[0]);level(target,0,GL_TEXTURE_HEIGHT,&info[1]);
+	if(info[0] <= 0 || info[1] <= 0 || info[0] > 4096 || info[1] > 4096) goto restore;
+	*pixels=malloc((size_t)info[0]*info[1]*4);
+	if(!*pixels)goto restore;
+	parameter(target,GL_TEXTURE_MIN_FILTER,&info[2]);parameter(target,GL_TEXTURE_MAG_FILTER,&info[3]);
+	parameter(target,GL_TEXTURE_WRAP_S,&info[4]);parameter(target,GL_TEXTURE_WRAP_T,&info[5]);
+	get(GL_PIXEL_PACK_BUFFER_BINDING,&pack);buffer(GL_PIXEL_PACK_BUFFER,0);
+	for(unsigned k=0;k<5;k++){get(keys[k],&saved[k]);store(keys[k],k?0:1);}
+	read(target,0,GL_BGRA,GL_UNSIGNED_INT_8_8_8_8_REV,*pixels);
+	for(unsigned k=0;k<5;k++)store(keys[k],saved[k]);
+	buffer(GL_PIXEL_PACK_BUFFER,pack);
+	ok=1;
+restore:
+	bind(target,old);
+done:
+	if (previous && previous != c->mesa) OSMesaAdoptContext(previous);
+	else if (!previous) OSMesaMakeCurrent(NULL, NULL, GL_UNSIGNED_BYTE, 0, 0);
+	return ok;
+}
+
+#include <mach-o/dyld.h>
+
+/* CGL virtual screens share names; each Mesa renderer owns separate textures.
+ * WindowServer uses level-zero rectangle textures for these composites. */
+struct texture_revision {
+	struct texture_revision *next;
+	void *group;
+	unsigned name, owner;
+	uint64_t version, resident[4];
+};
+struct texture_registry {
+	pthread_mutex_t lock;
+	unsigned next_name;
+	struct texture_revision *head;
+};
+
+__attribute__((visibility("default")))
+void *RDNGLTextureRegistryV1(void);
+void *RDNGLTextureRegistryV1(void)
+{
+	static struct texture_registry registry = { PTHREAD_MUTEX_INITIALIZER, 1, NULL };
+	return &registry;
+}
+
+static struct texture_registry *texture_registry(void)
+{
+	static struct texture_registry *registry;
+	if (registry) return registry;
+	/* The first loaded renderer owns the process-wide namespace. */
+	for (unsigned i = 0; i < _dyld_image_count(); ++i) {
+		const char *path = _dyld_get_image_name(i);
+		if (!path || !strstr(path, "/RadeonNIGLDriver")) continue;
+		void *module = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+		void *(*get)(void) = module ? dlsym(module, "RDNGLTextureRegistryV1") : NULL;
+		if (get) { registry = get(); return registry; }
+		if (module) dlclose(module);
+	}
+	return NULL;
+}
+
+static struct context *texture_context(void)
+{
+	OSMesaContext current = OSMesaGetCurrentContext();
+	for (unsigned i = 0; i < MAX_CONTEXTS; ++i)
+		if (contexts[i].gld_ctx && contexts[i].mesa == current) return &contexts[i];
+	return NULL;
+}
+
+static struct texture_revision *texture_revision(struct texture_registry *r,
+                                                 void *group, unsigned name)
+{
+	for (struct texture_revision *t = r->head; t; t = t->next)
+		if (t->group == group && t->name == name) return t;
+	return NULL;
+}
+
+void rdn_texture_generated(int count, unsigned *names)
+{
+	if (!migration_textures() || count <= 0 || !names) return;
+	struct texture_registry *r = texture_registry();
+	if (!r) return;
+	void (*destroy)(GLsizei,const GLuint*) = OSMesaGetProcAddress("glDeleteTextures");
+	/* Mesa reserved local names; CGL's virtual screens need one namespace. */
+	destroy(count, names);
+	pthread_mutex_lock(&r->lock);
+	for (int i = 0; i < count; ++i) names[i] = r->next_name++;
+	pthread_mutex_unlock(&r->lock);
+}
+
+void rdn_texture_changed(unsigned target)
+{
+	if (!migration_textures() || !migration_texture_target(target)) return;
+	struct context *c = texture_context();
+	void *group = texture_group(c);
+	unsigned name = bound_texture(target);
+	if (!group || !name) return;
+	GLint width = 0;
+	void (*level)(GLenum,GLint,GLenum,GLint*) = OSMesaGetProcAddress("glGetTexLevelParameteriv");
+	level(target, 0, GL_TEXTURE_WIDTH, &width);
+	if (!width) return;
+	struct texture_registry *r = texture_registry();
+	if (!r) return;
+	pthread_mutex_lock(&r->lock);
+	struct texture_revision *t = texture_revision(r, group, name);
+	if (!t) {
+		t = calloc(1, sizeof(*t));
+		if (t) { t->group = group; t->name = name; t->next = r->head; r->head = t; }
+	}
+	if (t) {
+		t->owner = RDN_GPU_INDEX;
+		t->resident[RDN_GPU_INDEX] = ++t->version;
+	}
+	pthread_mutex_unlock(&r->lock);
+}
+
+__attribute__((visibility("default")))
+void RDNGLDeleteTextureV1(void *group, unsigned name);
+void RDNGLDeleteTextureV1(void *group, unsigned name)
+{
+	if (!migration_textures()) return;
+	for (unsigned i = 0; i < MAX_CONTEXTS; ++i) {
+		struct context *c = &contexts[i];
+		if (!c->mesa || texture_group(c) != group) continue;
+		OSMesaContext previous = OSMesaGetCurrentContext();
+		if (!OSMesaAdoptContext(c->mesa)) return;
+		void (*destroy)(GLsizei,const GLuint*) = OSMesaGetProcAddress("glDeleteTextures");
+		destroy(1, &name);
+		if (previous && previous != c->mesa) OSMesaAdoptContext(previous);
+		else if (!previous) OSMesaMakeCurrent(NULL, NULL, GL_UNSIGNED_BYTE, 0, 0);
+		return;
+	}
+}
+
+void rdn_texture_deleted(int count, const unsigned *names)
+{
+	if (!migration_textures() || count <= 0 || !names) return;
+	void *group = texture_group(texture_context());
+	struct texture_registry *r = texture_registry();
+	if (!group || !r) return;
+	pthread_mutex_lock(&r->lock);
+	for (int n = 0; n < count; ++n) {
+		struct texture_revision **link = &r->head;
+		while (*link && ((*link)->group != group || (*link)->name != names[n])) link = &(*link)->next;
+		struct texture_revision *t = *link;
+		if (!t) continue;
+		*link = t->next;
+		for (unsigned i = 0; i < 4; ++i) {
+			if (i == RDN_GPU_INDEX || !t->resident[i]) continue;
+			void *module = foreign_module(i);
+			void (*destroy)(void*,unsigned) = module ? dlsym(module, "RDNGLDeleteTextureV1") : NULL;
+			if (destroy) destroy(group, names[n]);
+		}
+		free(t);
+	}
+	pthread_mutex_unlock(&r->lock);
+}
+
+__attribute__((visibility("default")))
+int RDNGLTextureGroupAliveV1(void *group);
+int RDNGLTextureGroupAliveV1(void *group)
+{
+	for (unsigned i = 0; i < MAX_CONTEXTS; ++i)
+		if (contexts[i].gld_ctx && texture_group(&contexts[i]) == group) return 1;
+	return 0;
+}
+
+static void texture_group_destroyed(void *group)
+{
+	if (!migration_textures() || !group || RDNGLTextureGroupAliveV1(group)) return;
+	for (unsigned i = 0; i < 4; ++i) {
+		if (i == RDN_GPU_INDEX) continue;
+		void *module = foreign_module(i);
+		int (*alive)(void*) = module ? dlsym(module, "RDNGLTextureGroupAliveV1") : NULL;
+		if (alive && alive(group)) return;
+	}
+	struct texture_registry *r = texture_registry();
+	if (!r) return;
+	pthread_mutex_lock(&r->lock);
+	struct texture_revision **link = &r->head;
+	while (*link) {
+		struct texture_revision *t = *link;
+		if (t->group == group) { *link = t->next; free(t); }
+		else link = &t->next;
+	}
+	pthread_mutex_unlock(&r->lock);
+}
+
+static void sync_texture(struct context *c, unsigned target, unsigned name)
+{
+	if (!migration_texture_target(target)) return;
+	void *group = texture_group(c);
+	struct texture_registry *r = texture_registry();
+	if (!group || !r) return;
+	pthread_mutex_lock(&r->lock);
+	struct texture_revision *t = texture_revision(r, group, name);
+	if (!t || t->resident[RDN_GPU_INDEX] == t->version) goto done;
+	void *module = foreign_module(t->owner);
+	int (*copy)(void*,unsigned,unsigned,int*,void**) = module ? dlsym(module, "RDNGLCopyTextureV1") : NULL;
+	int info[6];
+	void *pixels = NULL;
+	if (!copy || !copy(group, target, name, info, &pixels)) goto done;
+	OSMesaAdoptContext(c->mesa);
+	int ok = OSMesaTexMemoryImage(c->mesa, target, info[0], info[1], info[0] * 4, pixels, GL_TRUE);
+	free(pixels);
+	if (ok) {
+		void (*parameter)(GLenum,GLenum,GLint) = OSMesaGetProcAddress("glTexParameteri");
+		parameter(target, GL_TEXTURE_MIN_FILTER, info[2]);
+		parameter(target, GL_TEXTURE_MAG_FILTER, info[3]);
+		parameter(target, GL_TEXTURE_WRAP_S, info[4]);
+		parameter(target, GL_TEXTURE_WRAP_T, info[5]);
+		t->resident[RDN_GPU_INDEX] = t->version;
+	}
+done:
+	pthread_mutex_unlock(&r->lock);
+}
+
+/* Import before queries such as glIsTexture, not only on glBindTexture. */
+static void sync_context_textures(struct context *c)
+{
+	if (rdn_window_server || !migration_textures()) return;
+	struct texture_registry *r = texture_registry();
+	void *group = texture_group(c);
+	if (!r || !group) return;
+	struct pending_texture { unsigned target, name; } *pending = NULL;
+	size_t count = 0;
+	pthread_mutex_lock(&r->lock);
+	for (struct texture_revision *t = r->head; t; t = t->next)
+		if (t->group == group && t->resident[RDN_GPU_INDEX] != t->version) ++count;
+	if (count) pending = calloc(count, sizeof(*pending));
+	size_t n = 0;
+	if (pending)
+		for (struct texture_revision *t = r->head; t; t = t->next)
+			if (t->group == group && t->resident[RDN_GPU_INDEX] != t->version) {
+				pending[n].target = GL_TEXTURE_2D;
+				pending[n++].name = t->name;
+			}
+	pthread_mutex_unlock(&r->lock);
+	void (*bind)(GLenum,GLuint) = OSMesaGetProcAddress("glBindTexture");
+	for (size_t i = 0; i < n; ++i) {
+		unsigned old = bound_texture(pending[i].target);
+		bind(pending[i].target, pending[i].name);
+		sync_texture(c, pending[i].target, pending[i].name);
+		bind(pending[i].target, old);
+	}
+	free(pending);
+}
+
+#include "rdn_migration.inc"
+
 int rdn_mesa_cgls_set_integer(void *cgls_ctx, int pname, int *vals, int *result)
 {
 	struct context *c = NULL;
@@ -649,7 +1069,7 @@ int rdn_mesa_cgls_set_integer(void *cgls_ctx, int pname, int *vals, int *result)
 	for (i = 0; rend && i < MAX_CONTEXTS; i++)
 		if (contexts[i].gld_ctx && contexts[i].rend == rend)
 			c = &contexts[i];
-	if (!c || !c->mesa)
+	if (!c || !c->mesa || !owns_engine_dispatch(rend))
 		return 0;
 	void *backing;
 	uint32_t backing_stride, backing_width, backing_height;
@@ -667,6 +1087,7 @@ int rdn_mesa_cgls_set_integer(void *cgls_ctx, int pname, int *vals, int *result)
 		bool found;
 		if (is_backing) {
 			struct context storage = {0};
+			storage.mesa = c->mesa;
 			storage.surface = (uint32_t)vals[0];
 			if (!backing_store(&storage, backing, backing_stride,
 			                   backing_width, backing_height, gpu_backing, 0)) {
@@ -677,7 +1098,8 @@ int rdn_mesa_cgls_set_integer(void *cgls_ctx, int pname, int *vals, int *result)
             *result = OSMesaTexStoreImage(c->mesa, (GLenum)vals[1], RDN_TARGET_VRAM_HANDLE,
                 storage.store_row_bytes, storage.store_offset, backing_width, backing_height,
                 (vals[2] == GL_RGB || vals[2] == GL_RGB8) ? 0 : OSMESA_STORE_ALPHA) ? 0 : 0x2717;
-            return 1;
+            if (!*result) rdn_texture_changed((unsigned)vals[1]);
+		return 1;
 		}
 		rdn_make_current(c->rend);
 		if (rdn_target_surface_query((uint32_t)vals[0], info, &found) &&
@@ -691,6 +1113,7 @@ int rdn_mesa_cgls_set_integer(void *cgls_ctx, int pname, int *vals, int *result)
 				               info[2], info[1], info[3], info[4])) ? 0 : 0x2717;
 			rdn_log("surface 0x%lx explicitly bound to texture target 0x%lx: %ld",
 				vals[0], vals[1], *result);
+			if (!*result) rdn_texture_changed((unsigned)vals[1]);
 			return 1;
 		}
 		*result = 0x2717;
@@ -708,20 +1131,25 @@ int rdn_mesa_cgls_set_integer(void *cgls_ctx, int pname, int *vals, int *result)
 			return 1;
 		}
 		*result = 0;
+		rdn_texture_changed((unsigned)vals[1]);
 		return 1;
 	}
 	if ((c->type == DRAWABLE_SCREEN || c->type == DRAWABLE_BACKING) &&
 	    (unsigned long)vals[0] == c->surface) {
 		/* The screen's surface: what is drawn so far, as a texture. */
 		rdn_make_current(c->rend);
+		/* Backing stores already use Quartz's top-down surface coordinates. */
+		GLint copy_y = c->type == DRAWABLE_BACKING ? 0 :
+			(GLint)c->screen_height - c->origin_y - (GLint)vals[4];
 		*result = OSMesaTexCopyDrawable(c->mesa, (GLenum)vals[1], c->origin_x,
-						(GLint)c->screen_height - c->origin_y - (GLint)vals[4],
+						copy_y,
 						(GLsizei)vals[3], (GLsizei)vals[4]) ? 0 : 0x2717;
 		if (rdn_logging)
 			rdn_log("the screen as a texture of context %p (%ldx%ld at %d,%d of %ux%u): %s",
 				c->gld_ctx, vals[3], vals[4], c->origin_x, c->origin_y,
 				(unsigned)c->screen_width, (unsigned)c->screen_height,
 				*result ? "failed" : "done");
+		if (!*result) rdn_texture_changed((unsigned)vals[1]);
 		return 1;
 	}
 	return 0;
@@ -747,6 +1175,10 @@ static void surface_store(struct context *c, uint32_t width, uint32_t height, in
 	struct surface_store *store = NULL, *empty = NULL;
 	bool found;
 
+	/* Submit old drawable work before its backing can be retired. */
+	if (c->store_width && width && height && width <= 16384 && height <= 16384 &&
+	    (c->store_width != width || c->store_height != height))
+		OSMesaFlushRender(c->mesa, GL_TRUE);
 	c->stored = 0;
 	c->store_new = 0;
 	if (!c->surface || !width || !height || width > 16384 || height > 16384)
@@ -788,6 +1220,13 @@ static void surface_store(struct context *c, uint32_t width, uint32_t height, in
 		store->row_bytes = row_bytes;
 		store->width = width;
 		store->height = height;
+		int initialized = OSMesaClearStoreImage(c->mesa, RDN_TARGET_VRAM_HANDLE,
+		    row_bytes, store->offset, row_bytes / 4, rows);
+		if (initialized != 1) {
+			if (initialized < 0) store->unknown = 1;
+			else { rdn_target_vram_free(store->offset); clear_surface_store(store); }
+			goto out;
+		}
 	}
 	if (publish && !rdn_target_surface_buffer(store->id, store->offset,
 				      store->row_bytes, width, height)) {
@@ -815,8 +1254,15 @@ static int backing_store(struct context *c, void *backing, uint32_t stride,
     if (gpu) {
         OSMesaContext current = OSMesaGetCurrentContext();
         if (current) OSMesaFlushRender(current, GL_FALSE);
-        int result = rdn_target_surface_gpu_copy((uint32_t)c->surface, c->store_offset,
-            c->store_row_bytes, width, height);
+        uint32_t info[5];
+        bool found = false;
+        /* An existing alias is already coherent on the shared graphics queue. */
+        int aliased = !c->store_new &&
+            rdn_target_surface_query((uint32_t)c->surface, info, &found) && found &&
+            info[1] == c->store_offset && info[2] == c->store_row_bytes &&
+            info[3] == width && info[4] == height;
+        int result = aliased ? 0 : rdn_target_surface_gpu_copy((uint32_t)c->surface,
+            c->store_offset, c->store_row_bytes, width, height);
         if (result) {
             static unsigned failures;
             if (failures++ < 16) rdn_log("GPU backing import %lu (%ux%u) failed: %d",
@@ -851,14 +1297,14 @@ static int surface_drawable(struct context *c, struct drawable *d)
 {
 	static int16_t rects[MAX_SCREEN_RECTS][4];
 	volatile uint32_t *pixels;
-	uint32_t count = 0, i;
+	uint32_t count = 0, i, scanout;
 	unsigned width, height;
 	int32_t b[4];
 
 	memset(d, 0, sizeof(*d));
 	if (!c->mesa ||
-	    !rdn_target_screen(&pixels, &c->screen_width, &c->screen_height,
-			       &c->screen_pitch))
+	    !rdn_target_surface_screen((uint32_t)c->surface, &pixels, &c->screen_width,
+		&c->screen_height, &c->screen_pitch, &c->screen_offset, &scanout))
 		return 0;
 	if (!c->window) {
 		/* Quartz-owned surfaces have no CGS window to query. */
@@ -1030,6 +1476,12 @@ int rdn_mesa_attach_surface(void *gld_ctx, unsigned long connection,
 	return 1;
 }
 
+int rdn_mesa_is_compositor(void *gld_ctx)
+{
+	struct context *c = find(gld_ctx);
+	return c && (c->type == DRAWABLE_SCREEN || c->type == DRAWABLE_BACKING);
+}
+
 int rdn_mesa_is_pbuffer(void *gld_ctx)
 {
 	struct context *c = find(gld_ctx);
@@ -1085,7 +1537,6 @@ void rdn_mesa_detach(void *gld_ctx)
  * before.
  */
 #include <pthread.h>
-
 #include <sys/time.h>
 
 #define DEFER_MS 6
@@ -1202,23 +1653,23 @@ int rdn_mesa_attach_screen(void *gld_ctx, unsigned long surface)
 	int32_t b[4];
 	struct context *c = find(gld_ctx);
 	volatile uint32_t *pixels;
-	uint32_t width, height, pitch;
+	uint32_t width, height, pitch, offset, scanout;
 
 	if (!c)
 		return 0;
 	/* The device is opened with the first Mesa context. */
 	if (!c->mesa)
 		mesa_for(c);
-	if (!c->mesa || !rdn_target_screen(&pixels, &width, &height, &pitch)) {
+	if (!c->mesa || !rdn_target_surface_screen((uint32_t)surface, &pixels, &width, &height, &pitch, &offset, &scanout)) {
 		rdn_log("attach: context %p cannot reach the screen", gld_ctx);
 		return 0;
 	}
 	void *backing;
 	uint32_t backing_stride, backing_width, backing_height;
-	int gpu_backing = surface != 1 && rdn_target_surface_gpu_info((uint32_t)surface,
+	int gpu_backing = surface > 1 && rdn_target_surface_gpu_info((uint32_t)surface,
         &backing_stride, &backing_width, &backing_height);
     backing = NULL;
-    if (surface != 1 && (gpu_backing || rdn_target_surface_backing((uint32_t)surface, &backing,
+    if (surface > 1 && (gpu_backing || rdn_target_surface_backing((uint32_t)surface, &backing,
                                                    &backing_stride, &backing_width,
                                                    &backing_height))) {
 		c->surface = surface;
@@ -1234,7 +1685,11 @@ int rdn_mesa_attach_screen(void *gld_ctx, unsigned long surface)
 		c->screen.width = c->screen_width = backing_width;
 		c->screen.height = c->screen_height = backing_height;
 		c->screen.rowbytes = backing_stride;
-		c->screen.base = gpu_backing ? (void *)c : backing;
+		/* Quartz bitmap filters read same-task backing after GL flush. */
+        if (gpu_backing && rdn_window_server)
+            rdn_target_surface_backing((uint32_t)surface, &backing,
+                &backing_stride, &backing_width, &backing_height);
+        c->screen.base = backing ? backing : (void *)c;
 		c->screen_pitch = c->store_row_bytes / 4;
 		if (c->rend == rdn_current_rend) rdn_current_rend = NULL;
 		rdn_log("attach: context %p draws into backing surface %lu, %ux%u",
@@ -1242,7 +1697,7 @@ int rdn_mesa_attach_screen(void *gld_ctx, unsigned long surface)
 		return 1;
 	}
 	/* Unknown surfaces must never alias the display's scanout. */
-	if (surface != 1 && (surface || rdn_window_server)) return 0;
+	if (!scanout) return 0;
 	c->type = DRAWABLE_SCREEN;
 	c->surface = surface;
 	if (rdn_window_server && rdn_ws_core_image())
@@ -1275,6 +1730,7 @@ int rdn_mesa_attach_screen(void *gld_ctx, unsigned long surface)
 	c->screen_width = width;
 	c->screen_height = height;
 	c->screen_pitch = pitch;
+	c->screen_offset = offset;
 	c->origin_x = b[0];
 	c->origin_y = (int)height - (b[1] + b[3]);
 	c->screen.width = (uint32_t)b[2];
@@ -1312,6 +1768,28 @@ void *rdn_mesa_lookup_missing(const char *name, void *cgl_ctx)
 		}
 	}
 	return NULL;
+}
+
+static void *(*cgl_get_current)(void);
+static pthread_once_t cgl_get_current_once = PTHREAD_ONCE_INIT;
+
+static void resolve_cgl_get_current(void)
+{
+	cgl_get_current = (void *(*)(void))dlsym(RTLD_DEFAULT, "CGLGetCurrentContext");
+}
+
+int rdn_mesa_owns_current(void)
+{
+    void *ctx;
+    int i;
+    pthread_once(&cgl_get_current_once, resolve_cgl_get_current);
+    ctx = cgl_get_current ? cgl_get_current() : NULL;
+    if (!ctx || !selected_renderer(ctx)) return 0;
+    for (i = 0; i < MAX_CONTEXTS; ++i)
+        if (contexts[i].gld_ctx && (contexts[i].rend == *(void **)ctx ||
+            contexts[i].early_rend == *(void **)ctx))
+            return !contexts[i].dispatched || owns_engine_dispatch(*(void **)ctx);
+    return 0;
 }
 
 static void missing(const char *name)
@@ -1542,10 +2020,24 @@ void rdn_mesa_context_engine(void *gld_ctx, void *rend)
 		c->early_rend = rend;
 }
 
+static int selected_renderer(void *cgl_ctx)
+{
+	static int (*get_parameter)(void *, int, int *);
+	int renderer = 0;
+
+	if (!get_parameter)
+		get_parameter = (int (*)(void *, int, int *))dlsym(RTLD_DEFAULT, "CGLGetParameter");
+	return cgl_ctx && get_parameter && !get_parameter(cgl_ctx, 309, &renderer) &&
+		(renderer & 0xffff) == (0x1a00 + RDN_GPU_INDEX * 0x100);
+}
+
 void rdn_mesa_early_all(void *cgl_ctx)
 {
 	int i;
 
+	/* Leopard gives each GPU a context sharing this engine dispatch table. */
+	if (cgl_ctx && !selected_renderer(cgl_ctx))
+		return;
 	if (!cgl_ctx) {
 		OSMesaContext m = OSMesaGetCurrentContext();
 
@@ -1589,6 +2081,8 @@ void rdn_mesa_early_all(void *cgl_ctx)
 void rdn_mesa_early(void *gld_ctx)
 {
 	struct context *c = find(gld_ctx);
+	static void *(*get_current)(void);
+	void *current;
 
 	/*
 	 * Again at every call until a drawable is attached: the engine is
@@ -1597,16 +2091,15 @@ void rdn_mesa_early(void *gld_ctx)
 	 */
 	if (!c || !c->early_rend || c->type)
 		return;
+	if (!get_current)
+		get_current = (void *(*)(void))dlsym(RTLD_DEFAULT, "CGLGetCurrentContext");
+	current = get_current ? get_current() : NULL;
+	if (!current || *(void **)current != c->early_rend || !selected_renderer(current))
+		return;
 	/* Leopard 10.5.8 publishes the GL table after gldCreateContext returns. */
 	if (rdn_engine_layout() && !strcmp(rdn_engine_layout()->os, "10.5.8") &&
 	    !c->early_ready) {
-		static void *(*get_current)(void);
-		void *current;
-
 		/* Clients may cache CGLSetCurrentContext before this bundle loads. */
-		if (!get_current)
-			get_current = (void *(*)(void))dlsym(RTLD_DEFAULT, "CGLGetCurrentContext");
-		current = get_current ? get_current() : NULL;
 		if (!current || *(void **)current != c->early_rend)
 			return;
 		c->early_ready = 1;
@@ -1616,7 +2109,7 @@ void rdn_mesa_early(void *gld_ctx)
 			"before a drawable");
 }
 
-void rdn_make_current(void *rend)
+static void make_current_drawable(void *rend, const struct drawable *snapshot)
 {
 	struct context *c = NULL;
 	struct drawable d;
@@ -1631,14 +2124,20 @@ void rdn_make_current(void *rend)
 	 * attach it again, or the picture goes into the old shape.
 	 */
 	if (c && c->type == DRAWABLE_SCREEN && rdn_window_server) {
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		uint64_t us = (uint64_t)now.tv_sec * 1000000 + now.tv_usec;
+		if (us - c->screen_check_us >= 20000) {
+		c->screen_check_us = us;
 		volatile uint32_t *px;
-		uint32_t w, h, p;
+		uint32_t w, h, p, offset, scanout;
 
-		if (rdn_target_screen(&px, &w, &h, &p) &&
-		    (w != c->screen_width || h != c->screen_height || p != c->screen_pitch)) {
+		if (rdn_target_surface_screen((uint32_t)c->surface, &px, &w, &h, &p, &offset, &scanout) &&
+		    (w != c->screen_width || h != c->screen_height || p != c->screen_pitch || offset != c->screen_offset)) {
 			rdn_log("the screen is now %ux%u, pitch %u: attached again", (unsigned)w,
 				(unsigned)h, (unsigned)p);
 			rdn_mesa_attach_screen(c->gld_ctx, c->surface);
+		}
 		}
 	}
 	if (!c) {
@@ -1687,7 +2186,9 @@ void rdn_make_current(void *rend)
 					c->record[k + 6], c->record[k + 7]);
 		}
 	}
-	if (!read_record(c, &d)) {
+	if (snapshot)
+		d = *snapshot;
+	if (!snapshot && !read_record(c, &d)) {
 		/*
 		 * No drawable yet: programs load textures and build display
 		 * lists before their window exists. Mesa needs something
@@ -1728,8 +2229,10 @@ void rdn_make_current(void *rend)
 		if (!OSMesaMakeCurrentStore(c->mesa, RDN_TARGET_VRAM_HANDLE,
 		                            c->store_row_bytes, c->store_offset,
 		                            d.width, d.height, 0)) return;
-		if (!OSMesaStoreBacking(c->mesa, c->gpu_backing ? NULL : d.base,
-            c->gpu_backing ? 0 : d.rowbytes)) return;
+		int cpu_backing = !c->gpu_backing ||
+            (rdn_window_server && d.base != (void *)c);
+        if (!OSMesaStoreBacking(c->mesa, cpu_backing ? d.base : NULL,
+            cpu_backing ? d.rowbytes : 0)) return;
 		OSMesaReadbackRects(c->mesa, 0, NULL);
 		c->drawable = d;
 		c->bound = 1;
@@ -1745,10 +2248,10 @@ void rdn_make_current(void *rend)
 			surface_store(c, d.width, d.height, 1);
 		OSMesaSurfaceStorage(c->mesa, c->stored ? RDN_TARGET_VRAM_HANDLE : 0,
 				     (GLsizei)c->store_row_bytes, c->store_offset);
-		if (!OSMesaMakeCurrentSurface(c->mesa, RDN_TARGET_SCREEN_HANDLE,
+		if (!OSMesaMakeCurrentSurface(c->mesa, RDN_TARGET_VRAM_HANDLE,
 					      (GLsizei)c->screen_width,
 					      (GLsizei)c->screen_height,
-					      (GLsizei)(c->screen_pitch * 4), 0,
+					      (GLsizei)(c->screen_pitch * 4), c->screen_offset,
 					      c->origin_x, c->origin_y,
 					      (GLsizei)d.width, (GLsizei)d.height)) {
 			rdn_log("OSMesaMakeCurrentSurface failed for context %p",
@@ -1771,10 +2274,10 @@ void rdn_make_current(void *rend)
 		return;
 	}
 	if (c->type == DRAWABLE_SCREEN && c->direct) {
-		if (!OSMesaMakeCurrentDirect(c->mesa, RDN_TARGET_SCREEN_HANDLE,
+		if (!OSMesaMakeCurrentDirect(c->mesa, RDN_TARGET_VRAM_HANDLE,
 					     (GLsizei)c->screen_width,
 					     (GLsizei)c->screen_height,
-					     (GLsizei)(c->screen_pitch * 4), 0)) {
+					     (GLsizei)(c->screen_pitch * 4), c->screen_offset)) {
 			rdn_log("OSMesaMakeCurrentDirect failed for context %p",
 				c->gld_ctx);
 			return;
@@ -1880,12 +2383,13 @@ void rdn_make_current(void *rend)
 	rdn_current_rend = rend;
 }
 
-/* True if the engine's record no longer says what Mesa is bound to. */
-static int drawable_changed(const struct context *c)
+void rdn_make_current(void *rend)
 {
-	struct drawable d;
-
-	return !read_record(c, &d) || memcmp(&d, &c->drawable, sizeof(d)) != 0;
+	make_current_drawable(rend, NULL);
+	if (!rdn_window_server && migration_textures()) {
+		struct context *c = texture_context();
+		if (c) { sync_context_textures(c); sync_legacy_context(c); }
+	}
 }
 
 /*
@@ -1995,7 +2499,7 @@ static void watch_upload(unsigned target, int width, int height,
 	FILE *fp;
 	int y;
 
-	if (count >= 24 || target != GL_TEXTURE_RECTANGLE_ARB ||
+	if (count >= 4 || target != GL_TEXTURE_RECTANGLE_ARB ||
 	    width < 128 || width > 512 || height < 128 || height > 512 ||
 	    format != GL_BGRA || type != GL_UNSIGNED_INT_8_8_8_8_REV || !pixels ||
 	    access("/tmp/rdngld.uploads", F_OK))
@@ -2010,6 +2514,8 @@ static void watch_upload(unsigned target, int width, int height,
 	get(GL_UNPACK_SKIP_PIXELS, &skip_x);
 	get(GL_UNPACK_SKIP_ROWS, &skip_y);
 	get(GL_TEXTURE_BINDING_RECTANGLE_ARB, &texture);
+	GLint byte_stride = rdn_mesa_unpack_row_bytes(rdn_current_rend, -1);
+	if (byte_stride > 0 && !(byte_stride & 3)) row = byte_stride / 4;
 	if (!row)
 		row = width;
 	if (row < width || row > 16384 || skip_x < 0 || skip_y < 0)
@@ -2026,10 +2532,117 @@ static void watch_upload(unsigned target, int width, int height,
 	fclose(fp);
 }
 
+__attribute__((visibility("default")))
+int RDNGLReadSurfaceV1(unsigned width, unsigned height, unsigned stride, void **pixels);
+int RDNGLReadSurfaceV1(unsigned width, unsigned height, unsigned stride, void **pixels)
+{
+	if (!rdn_window_server || !width || !height || width > 16384 || height > 16384)
+		return 0;
+	uint32_t id = rdn_target_surface_locked(), info[5];
+	bool found = false;
+	if (!id || !rdn_target_surface_query(id, info, &found) || !found ||
+	    info[3] != width || info[4] != height || info[2] != stride) return 0;
+	OSMesaContext previous = OSMesaGetCurrentContext(), current = previous;
+	if (!current) {
+		for (unsigned i = 0; i < MAX_CONTEXTS; ++i)
+			if (contexts[i].mesa && contexts[i].bound) { current = contexts[i].mesa; break; }
+		if (!current || !OSMesaAdoptContext(current)) return 0;
+	}
+	*pixels = malloc((size_t)width * height * 4);
+	int ok = *pixels && OSMesaReadStoreImage(current, RDN_TARGET_VRAM_HANDLE,
+	                                        stride, info[1], width, height, *pixels);
+	if (!previous) OSMesaMakeCurrent(NULL, NULL, GL_UNSIGNED_BYTE, 0, 0);
+	if (!ok) { free(*pixels); *pixels = NULL; }
+	return ok;
+}
+
+__attribute__((visibility("default")))
+void *RDNGLMapSurfaceV2(unsigned width, unsigned height, unsigned stride,
+                       const void **pixels, unsigned *row_bytes);
+void *RDNGLMapSurfaceV2(unsigned width, unsigned height, unsigned stride,
+                       const void **pixels, unsigned *row_bytes)
+{
+   if (!rdn_window_server || !width || !height || width > 16384 || height > 16384)
+      return NULL;
+   uint32_t id = rdn_target_surface_locked(), info[5];
+   bool found = false;
+   if (!id || !rdn_target_surface_query(id, info, &found) || !found ||
+       info[3] != width || info[4] != height || info[2] != stride) return NULL;
+   OSMesaContext previous = OSMesaGetCurrentContext(), current = previous;
+   if (!current) {
+      for (unsigned i = 0; i < MAX_CONTEXTS; ++i)
+         if (contexts[i].mesa && contexts[i].bound) { current = contexts[i].mesa; break; }
+      if (!current || !OSMesaAdoptContext(current)) return NULL;
+   }
+   void *lease = OSMesaMapStoreImage(current, RDN_TARGET_VRAM_HANDLE,
+                                     stride, info[1], width, height, pixels, row_bytes);
+   if (!previous) OSMesaMakeCurrent(NULL, NULL, GL_UNSIGNED_BYTE, 0, 0);
+   return lease;
+}
+
+__attribute__((visibility("default")))
+void RDNGLUnmapSurfaceV2(void *lease);
+void RDNGLUnmapSurfaceV2(void *lease)
+{
+   OSMesaUnmapStoreImage(lease);
+}
+
+int rdn_surface_texture_upload(unsigned target, int level, int internalformat,
+                               int width, int height, int border, unsigned format,
+                               unsigned type, const void *pixels)
+{
+	if (!rdn_window_server || target != GL_TEXTURE_RECTANGLE_ARB || level || border ||
+	    width <= 0 || height <= 0 || !pixels || format != GL_BGRA ||
+	    type != GL_UNSIGNED_INT_8_8_8_8_REV ||
+	    (internalformat != GL_RGB8 && internalformat != GL_RGBA8 &&
+	     internalformat != GL_RGB && internalformat != GL_RGBA)) return 0;
+	struct context *c = texture_context();
+	if (!c) return 0;
+	void (*get)(GLenum,GLint*) = OSMesaGetProcAddress("glGetIntegerv");
+	GLint pbo=0, row=0, skip_x=0, skip_y=0;
+	get(GL_PIXEL_UNPACK_BUFFER_BINDING,&pbo);get(GL_UNPACK_ROW_LENGTH,&row);
+	get(GL_UNPACK_SKIP_PIXELS,&skip_x);get(GL_UNPACK_SKIP_ROWS,&skip_y);
+	if (pbo || skip_x || skip_y) return 0;
+	GLint stride = c->unpack_row_bytes > 0 ? c->unpack_row_bytes : (row ? row : width) * 4;
+	for (unsigned i=0; i<4; ++i) {
+		if (i == RDN_GPU_INDEX) continue;
+		void *module = foreign_module(i);
+		void *(*map)(unsigned,unsigned,unsigned,const void**,unsigned*) = module ? dlsym(module,"RDNGLMapSurfaceV2") : NULL;
+		void (*unmap)(void*) = module ? dlsym(module,"RDNGLUnmapSurfaceV2") : NULL;
+		const void *data = NULL;
+		unsigned row_bytes = 0;
+		void *lease = map && unmap ? map(width,height,stride,&data,&row_bytes) : NULL;
+		if (!lease) continue;
+		OSMesaAdoptContext(c->mesa);
+		int alpha = internalformat == GL_RGBA || internalformat == GL_RGBA8;
+		GLint accepted = 0;
+		int ok = OSMesaTexHostImage(c->mesa,target,width,height,row_bytes,data,alpha,lease,unmap,&accepted);
+		static unsigned noted_paths;
+		unsigned path = ok > 0 ? 1 : 2;
+		if (!(noted_paths & path)) {
+			noted_paths |= path;
+			syslog(LOG_NOTICE, "RadeonNI: cross-GPU %u -> %u uses %s (%dx%d, stride %u)",
+			       i, RDN_GPU_INDEX, ok > 0 ? "GPU host import" : "CPU upload fallback", width, height, row_bytes);
+		}
+		if (!accepted) {
+			if (!ok) ok = OSMesaTexMemoryImage(c->mesa,target,width,height,row_bytes,data,alpha);
+			unmap(lease);
+		}
+		if (ok) { rdn_texture_changed(target); return 1; }
+	}
+	return 0;
+}
+
+void rdn_texture_bound(unsigned target, unsigned name)
+{
+	if (!migration_textures() || !name || !migration_texture_target(target)) return;
+	struct context *c = texture_context();
+	if (c) sync_texture(c, target, name);
+}
+
 void rdn_watch_bind_texture(unsigned target, unsigned texture)
 {
-	if (target == GL_TEXTURE_RECTANGLE_ARB)
-		watch_texture_has_image = 0;
+	if (target == GL_TEXTURE_RECTANGLE_ARB) watch_texture_has_image = 0;
 }
 
 void rdn_watch_tex_image2D(unsigned target, int level, int internalformat,
@@ -2214,7 +2827,6 @@ static int surface_direct(void)
 void rdn_flush_surface(void *rend)
 {
 	int i;
-
 	for (i = 0; i < MAX_CONTEXTS; i++)
 		if (contexts[i].gld_ctx && contexts[i].rend == rend &&
 		    contexts[i].type == DRAWABLE_SURFACE) {
@@ -2228,6 +2840,59 @@ void rdn_flush_surface(void *rend)
 			}
 			return;
 		}
+}
+
+static int present_profile_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *value = getenv("RDN_PRESENT_PROFILE");
+		enabled = value && strcmp(value, "0") && !rdn_window_server;
+	}
+	return enabled;
+}
+
+static int profile_compare(const void *a, const void *b)
+{
+	double x = *(const double *)a, y = *(const double *)b;
+	return (x > y) - (x < y);
+}
+
+static void present_profile(struct context *c, uint64_t start,
+                            uint64_t presented, uint64_t end)
+{
+	mach_timebase_info_data_t tb;
+	double sorted[512], scale;
+	unsigned n = c->profile_count, column, i;
+	mach_timebase_info(&tb);
+	scale = (double)tb.numer / tb.denom / 1000.0;
+	if (!c->profile_previous) {
+		c->profile_previous = start;
+		return;
+	}
+	c->profile_samples[n][0] = (start - c->profile_previous) * scale;
+	c->profile_samples[n][1] = (presented - start) * scale;
+	c->profile_samples[n][2] = (end - presented) * scale;
+	c->profile_previous = start;
+	for (column = 0; column < 3; column++)
+		c->profile_samples[n][column + 3] = c->profile_stage[column] * scale;
+	if (++c->profile_count != 512) return;
+	for (column = 0; column < 6; column++) {
+		double total = 0;
+		for (i = 0; i < 512; i++) {
+			sorted[i] = c->profile_samples[i][column];
+			total += sorted[i];
+		}
+		qsort(sorted, 512, sizeof(double), profile_compare);
+		fprintf(stderr, "RDN present gpu=%d context=%p metric=%s n=512 mean_us=%.3f median_us=%.3f p95_us=%.3f p99_us=%.3f\n",
+		        RDN_GPU_INDEX, c->gld_ctx,
+		        column == 0 ? "frame" : column == 1 ? "mesa" : column == 2 ? "cgs" :
+		        column == 3 ? "bind" : column == 4 ? "swap" : "finish",
+		        total / 512, sorted[256], sorted[486], sorted[506]);
+	}
+	c->profile_count = 0;
+	/* Exclude diagnostic output from the next frame interval. */
+	c->profile_previous = mach_absolute_time();
 }
 
 int rdn_swap(void *rend)
@@ -2271,9 +2936,14 @@ int rdn_swap(void *rend)
 					usleep(10000);
 				}
 			}
+			int profile = present_profile_enabled();
+			uint64_t start = profile ? mach_absolute_time() : 0;
 			rdn_mesa_present(contexts[i].gld_ctx);
+			uint64_t presented = profile ? mach_absolute_time() : 0;
 			rdn_surface_flush(contexts[i].connection, contexts[i].window,
 					  contexts[i].surface);
+			if (profile)
+				present_profile(&contexts[i], start, presented, mach_absolute_time());
 			return 1;
 		}
 	}
@@ -2360,37 +3030,56 @@ void rdn_mesa_present(void *gld_ctx)
 {
 	struct context *c = find(gld_ctx);
 	struct drawable d;
+	int profile = present_profile_enabled();
+	uint64_t start = profile ? mach_absolute_time() : 0, swapped = 0;
 
-	if (!c || !c->rend || !mesa_finish || !read_record(c, &d))
-		return;
+	if (!c || !c->rend || !mesa_finish) return;
+	uint32_t screen_width = c->screen_width, screen_height = c->screen_height;
+	uint32_t screen_pitch = c->screen_pitch, screen_offset = c->screen_offset;
+	if (!read_record(c, &d)) return;
 	fps_count();
-	/* A surface may have moved or been covered since the last frame. */
-	if (c->rend != rdn_current_rend || !c->bound || drawable_changed(c) ||
-	    c->type == DRAWABLE_SURFACE)
-		rdn_make_current(c->rend);
+	/* CGS places retained window surfaces; only geometry changes require rebinding. */
+	int retained = c->type == DRAWABLE_SURFACE && c->window && c->stored &&
+	               !rdn_window_server && !surface_direct() &&
+	               !getenv("RDN_GLD_REBIND_EVERY_SWAP");
+	if (c->rend != rdn_current_rend || !c->bound || memcmp(&d, &c->drawable, sizeof(d)) ||
+	    (c->type == DRAWABLE_SURFACE && !retained) ||
+	    screen_width != c->screen_width || screen_height != c->screen_height ||
+	    screen_pitch != c->screen_pitch || screen_offset != c->screen_offset)
+		make_current_drawable(c->rend, &d);
 	if (c->rend != rdn_current_rend || !c->bound)
 		return;
+	if (profile) {
+		c->profile_stage[0] = mach_absolute_time() - start;
+		start = mach_absolute_time();
+	}
 	if (c->dbl) {
 		/*
 		 * A full-screen program does not wait for its picture: the swap
 		 * is queued behind the frame in glthread's thread. A surface is
-		 * read by the window server at once, so that swap is waited for.
+		 * read by the window server, so its submission must finish first.
 		 */
 		if (c->type == DRAWABLE_SCREEN && !rdn_window_server && !swap_finish())
 			OSMesaSwapBuffersAsync(c->mesa);
 		else
 			OSMesaSwapBuffers(c->mesa);
 	}
-	/*
-	 * A program that has the whole screen need not wait for its picture:
-	 * the copy to the screen is queued behind the drawing, and the
-	 * winsys keeps the program from running far ahead of the GPU. A
-	 * surface's picture is read by the window server, so that one is
-	 * waited for. RDN_GLD_SWAP_FINISH=1 waits in both cases.
-	 */
+	if (profile) {
+		swapped = mach_absolute_time();
+		c->profile_stage[1] = swapped - start;
+		c->profile_stage[2] = 0;
+	}
+	/* SwapBuffers has submitted the copy. GPU consumers share its ordered ring;
+	 * CPU surface locks wait in the kext, and retired stores remain pinned. */
+	const char *queued = getenv("RDN_GLD_SURFACE_QUEUE");
+	if (c->dbl && c->type == DRAWABLE_SURFACE && c->stored &&
+	    !rdn_window_server && !swap_finish() && (!queued || atoi(queued)) &&
+	    rdn_target_queued_surface_present())
+		return;
 	if (c->type == DRAWABLE_SCREEN && !rdn_window_server && mesa_flush &&
 	    !swap_finish())
 		mesa_flush();
 	else
 		mesa_finish();
+	if (profile) c->profile_stage[2] = mach_absolute_time() - swapped;
 }

@@ -1,0 +1,81 @@
+--- a/src/gallium/drivers/r600/r600_state_common.c
++++ b/src/gallium/drivers/r600/r600_state_common.c
+@@ -2550,6 +2550,64 @@
+ 	}
+ }
+ 
++#if UTIL_ARCH_BIG_ENDIAN
++static void r600_draw_native_indirect(struct pipe_context *ctx,
++                                      const struct pipe_draw_info *info,
++                                      unsigned drawid_offset,
++                                      const struct pipe_draw_indirect_info *indirect)
++{
++	struct r600_context *rctx = (struct r600_context *)ctx;
++	unsigned count = indirect->draw_count;
++	if (indirect->indirect_draw_count) {
++		struct pipe_resource *counter = indirect->indirect_draw_count;
++		unsigned offset = indirect->indirect_draw_count_offset;
++		if ((offset & 3) || offset > counter->width0 || 4 > counter->width0 - offset)
++			return;
++		const uint32_t *value = r600_buffer_map_sync_with_rings(&rctx->b,
++			r600_as_resource(counter), PIPE_MAP_READ);
++		if (!value)
++			return;
++		count = MIN2(count, value[offset / 4]);
++	}
++	if (!count)
++		return;
++
++	unsigned words = info->index_size ? 5 : 4;
++	unsigned stride = indirect->stride;
++	uint64_t bytes = (uint64_t)(count - 1) * stride + words * 4;
++	if ((indirect->offset & 3) || (stride & 3) ||
++	    indirect->offset > indirect->buffer->width0 ||
++	    bytes > indirect->buffer->width0 - indirect->offset)
++		return;
++	uint32_t (*commands)[5] = calloc(count, sizeof(*commands));
++	if (!commands)
++		return;
++	/* A bounded command read avoids a VRAM-to-GTT staging copy. */
++	const uint8_t *source = r600_buffer_map_sync_with_rings(&rctx->b,
++		r600_as_resource(indirect->buffer), PIPE_MAP_READ);
++	if (!source) {
++		free(commands);
++		return;
++	}
++	for (unsigned i = 0; i < count; ++i)
++		memcpy(commands[i], source + indirect->offset + (uint64_t)i * stride, words * 4);
++
++	/* Keep native arguments; direct packets avoid the CP's indirect fetch path. */
++	struct pipe_draw_info direct = *info;
++	for (unsigned i = 0; i < count; ++i) {
++		struct pipe_draw_start_count_bias draw = {
++			.count = commands[i][0],
++			.start = commands[i][2],
++			.index_bias = info->index_size ? (int32_t)commands[i][3] : 0,
++		};
++		direct.instance_count = commands[i][1];
++		direct.start_instance = commands[i][words - 1];
++		ctx->draw_vbo(ctx, &direct, drawid_offset + i, NULL, &draw, 1);
++	}
++	free(commands);
++}
++#endif
++
+ static void r600_draw_vbo(struct pipe_context *ctx, const struct pipe_draw_info *info,
+                           unsigned drawid_offset,
+                           const struct pipe_draw_indirect_info *indirect,
+@@ -2560,6 +2618,13 @@
+ 		util_draw_multi(ctx, info, drawid_offset, indirect, draws, num_draws);
+ 		return;
+ 	}
++
++#if UTIL_ARCH_BIG_ENDIAN
++	if (indirect && indirect->buffer && !indirect->count_from_stream_output) {
++		r600_draw_native_indirect(ctx, info, drawid_offset, indirect);
++		return;
++	}
++#endif
+ 
+ 	struct r600_context *rctx = (struct r600_context *)ctx;
+ 	struct pipe_resource *indexbuf = !info->index_size || info->has_user_indices ? NULL : info->index.resource;

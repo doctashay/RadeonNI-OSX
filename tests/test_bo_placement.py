@@ -18,22 +18,26 @@ HARNESS = r'''
 #define FREE free
 #define MAX2(a,b) ((a) > (b) ? (a) : (b))
 enum radeon_bo_domain { RADEON_DOMAIN_GTT = 2, RADEON_DOMAIN_VRAM = 4 };
-enum radeon_bo_flag { RADEON_FLAG_NO_CPU_ACCESS = 1, RADEON_FLAG_NO_INTERPROCESS_SHARING = 2 };
-enum rdn_place { RDN_VISIBLE, RDN_HIDDEN, RDN_GART, RDN_SEGMENT };
+enum radeon_bo_flag { RADEON_FLAG_NO_CPU_ACCESS = 1, RADEON_FLAG_NO_INTERPROCESS_SHARING = 2, RADEON_FLAG_NO_SUBALLOC = 4 };
+struct list_head { int unused; };
+enum rdn_place { RDN_VISIBLE, RDN_HIDDEN, RDN_GART, RDN_USER, RDN_SEGMENT };
 struct pb_buffer_lean { int reference, alignment_log2, usage; uint64_t size; };
-struct rdn_bo { struct pb_buffer_lean base; unsigned diagnostic_id; uint64_t offset;
-               enum rdn_place region; unsigned domain, flags; };
-struct rdn_device { int (*alloc)(struct rdn_device *,uint64_t,unsigned,uint64_t *);
+struct rdn_bo { struct pb_buffer_lean base; bool suballocated; unsigned diagnostic_id; uint64_t offset;
+               enum rdn_place region; unsigned domain, flags; uint64_t managed_alias,managed_size; struct list_head managed_link; };
+struct rdn_device { int (*alloc_small)(struct rdn_device *,uint64_t,unsigned,uint64_t *); bool (*is_small)(struct rdn_device *,uint64_t); int (*alloc)(struct rdn_device *,uint64_t,unsigned,uint64_t *);
                     int (*alloc_hidden)(struct rdn_device *,uint64_t,unsigned,uint64_t *);
                     int (*gart_alloc)(struct rdn_device *,uint64_t,unsigned,uint64_t *);
                     int (*uvd_alloc)(struct rdn_device *,uint64_t,unsigned,uint64_t *);
                     bool uvd_start;
-                    void (*free)(struct rdn_device *,uint64_t); };
+                    void (*free)(struct rdn_device *,uint64_t);
+                    int (*managed_alias)(struct rdn_device *,uint64_t,uint64_t,unsigned,uint64_t *); };
 struct radeon_winsys { int unused; };
-struct radeon_drm_winsys { bool video,uvd_seg,uvd_split; int lock; struct rdn_device *dev; uint64_t allocated_bytes;
+struct radeon_drm_winsys { bool video,uvd_seg,uvd_split; int lock; struct rdn_device *dev; uint64_t allocated_bytes,cached_bytes[5],managed_budget,managed_resident; struct list_head managed_buffers;
                          struct { unsigned creates, cache_hits, overflowed; } mem_stats; };
+static bool rdn_evict_one(struct radeon_drm_winsys *w) { return false; }
+static void list_addtail(struct list_head *a,struct list_head *b) {}
 static struct radeon_drm_winsys ws;
-static unsigned calls[4], trims, scenario, frees, filler_calls, event_count;
+static unsigned calls[5], trims, scenario, frees, filler_calls, event_count;
 static char events[128];
 static bool cache_hit;
 static void event(char c) { assert(event_count<sizeof(events)-1);events[event_count++]=c;events[event_count]=0; }
@@ -47,14 +51,15 @@ static struct radeon_drm_winsys *rdn_winsys(struct radeon_winsys *p) { return &w
 static void simple_mtx_lock(int *p) { assert(!*p);*p=1; }
 static void simple_mtx_unlock(int *p) { assert(*p);*p=0; }
 static bool rdn_cache_get(struct radeon_drm_winsys *w,uint64_t s,unsigned a,
-                          enum rdn_place p,uint64_t *o) { assert(w->lock);*o=4096;return cache_hit; }
+                          enum rdn_place p,bool allow_small,uint64_t *o) { assert(w->lock);*o=4096;return cache_hit; }
 static void rdn_cache_trim(struct radeon_drm_winsys *w,bool all) { assert(w->lock && all);trims++;event('T'); }
+static void rdn_cache_reclaim(struct radeon_drm_winsys *w,bool all,bool wait) { assert(w->lock && all);trims++;event(wait?'T':'C'); }
 static void rdn_mem_stats_account(struct radeon_drm_winsys *w,uint64_t s,enum rdn_place p,int n) {}
 static bool rdn_mem_stats_on(void) { return false; }
 static void rdn_mem_stats_print(const char *s) {}
 static void pipe_reference_init(int *p,int n) { *p=n; }
 static int allocate(unsigned region,uint64_t *offset) {
-   assert(ws.lock);calls[region]++;*offset=4096;event("VHGS"[region]);
+   assert(ws.lock);calls[region]++;*offset=4096;event("VHGUS"[region]);
    if (scenario==1 && trims) return 0;
    if (scenario==2 && region==RDN_VISIBLE) return 0;
    if (scenario==3 && region==RDN_GART) return 0;
@@ -76,16 +81,16 @@ static void reset(unsigned mode) {
 '''
 CASES = r'''
 int main(void) {
-   struct rdn_device dev={visible,hidden,gart,segment,true,release};
+   struct rdn_device dev={.alloc=visible,.alloc_hidden=hidden,.gart_alloc=gart,.uvd_alloc=segment,.uvd_start=true,.free=release};
    struct pb_buffer_lean *b;
    ws.dev=&dev;
    unsetenv("RDN_HIDDEN_FILL_MB");
    for(unsigned mode=0;mode<4;mode++) {
       reset(mode);
       b=rdn_buffer_create(NULL,65536,4096,RADEON_DOMAIN_VRAM,RADEON_FLAG_NO_CPU_ACCESS);
-      assert(!calls[RDN_GART] && trims==1 && calls[RDN_HIDDEN]==2);
-      if(mode==1) { assert(b && ((struct rdn_bo *)b)->region==RDN_HIDDEN);assert(!strcmp(events,"HTH")); }
-      else if(mode==2) { assert(b && ((struct rdn_bo *)b)->region==RDN_VISIBLE);assert(!strcmp(events,"HTHV")); }
+      assert(!calls[RDN_GART] && trims==(mode==1?1:2) && calls[RDN_HIDDEN]==(mode==1?2:3));
+      if(mode==1) { assert(b && ((struct rdn_bo *)b)->region==RDN_HIDDEN);assert(!strcmp(events,"HCH")); }
+      else if(mode==2) { assert(b && ((struct rdn_bo *)b)->region==RDN_VISIBLE);assert(!strcmp(events,"HCHTHV")); }
       else assert(!b);
       free(b);
    }
@@ -103,11 +108,11 @@ int main(void) {
    assert(b && !strcmp(events,"G") && ((struct rdn_bo *)b)->domain==RADEON_DOMAIN_GTT);free(b);
    reset(3);
    b=rdn_buffer_create(NULL,65536,4096,RADEON_DOMAIN_GTT,0);
-   assert(!b && !calls[RDN_GART] && !strcmp(events,"VTV"));
+   assert(!b && !calls[RDN_GART] && !strcmp(events,"VCVTV"));
    reset(3);dev.alloc_hidden=NULL;
    b=rdn_buffer_create(NULL,65536,4096,RADEON_DOMAIN_GTT,
                        RADEON_FLAG_NO_CPU_ACCESS|RADEON_FLAG_NO_INTERPROCESS_SHARING);
-   assert(!b && !calls[RDN_GART] && !strcmp(events,"VTV"));
+   assert(!b && !calls[RDN_GART] && !strcmp(events,"VCVTV"));
    dev.alloc_hidden=hidden;
    /* Decoder-segment failure must not allocate in any other heap. */
    for(unsigned mode=0;mode<5;mode++) {
@@ -130,7 +135,7 @@ int main(void) {
    assert(b && !event_count && ((struct rdn_bo *)b)->region==RDN_SEGMENT);free(b);
    reset(1);setenv("RDN_HIDDEN_FILL_MB","2",1);
    b=rdn_buffer_create(NULL,256<<10,4096,RADEON_DOMAIN_VRAM,RADEON_FLAG_NO_CPU_ACCESS);
-   assert(b && !strcmp(events,"FHfTFHf") && frees==2 && filler_calls==2);free(b);
+   assert(b && !strcmp(events,"FHfCFHf") && frees==2 && filler_calls==2);free(b);
    unsetenv("RDN_HIDDEN_FILL_MB");
    puts("PASS retry-before-fallback, both GART guards, segment/split placement, cache and hidden-fill lifetime");
    return 0;
@@ -182,6 +187,12 @@ int main(void) {
    fail_busy=-1;
    rdn_cache_trim(&ws,true);
    assert(nodes[0].removed && freed==6 && !ws.cached_bytes[0]);
+   ws.cached_bytes[1]=200;
+   nodes[0]=(struct rdn_cached){.region=1,.size=100,.stamp=90,.busy=77};
+   nodes[1]=(struct rdn_cached){.region=1,.size=100,.stamp=91};
+   nodes[2].removed=true;fail_busy=77;
+   rdn_cache_reclaim(&ws,true,false);
+   assert(!nodes[0].removed && nodes[1].removed && ws.cached_bytes[1]==100);
    puts("PASS per-pool cache budget and failed graphics fence retains cached allocation");
    return 0;
 }
@@ -250,7 +261,7 @@ class PlacementTest(unittest.TestCase):
 
     def test_per_pool_cache_budget(self):
         source = (ROOT / "mesa/winsys/rdn_winsys.c").read_text()
-        begin = source.index("static void rdn_cache_trim(")
+        begin = source.index("static void rdn_cache_reclaim(")
         end = source.index("\n/*", begin)
         self.compile_run(CACHE_HARNESS + source[begin:end] + CACHE_CASES)
 

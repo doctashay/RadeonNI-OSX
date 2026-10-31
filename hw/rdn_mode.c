@@ -43,6 +43,10 @@ static bool dtd_mode(const uint8_t *d, struct rdn_mode *mode)
 	vso = (uint16_t)((d[10] >> 4) | (((d[11] >> 2) & 3) << 4));
 	vsw = (uint16_t)((d[10] & 0xf) | ((d[11] & 3) << 4));
 
+	if (!hact || !vact || !hblank || !vblank || !hsw || !vsw ||
+	    hso + hsw > hblank || vso + vsw > vblank)
+		return false;
+
 	memset(mode, 0, sizeof(*mode));
 	mode->clock = clock;
 	mode->hdisplay = hact;

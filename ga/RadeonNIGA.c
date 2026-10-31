@@ -476,13 +476,29 @@ static IOReturn ga_start(void *self, CFDictionaryRef properties,
 			 io_service_t service)
 {
 	struct ga *ga = self;
-	io_service_t accel = IOServiceGetMatchingService(kIOMasterPortDefault,
-				IOServiceMatching(RDN_UC_SERVICE_CLASS));
+	io_service_t accel = 0;
+	static const io_name_t accel_class = RDN_UC_SERVICE_CLASS;
+	CFTypeRef target;
+	io_string_t path;
 	vm_address_t addr = 0;
 	vm_size_t len = 0;
 	kern_return_t kr;
 
 	ga_stats_switch();
+	if (IOObjectConformsTo(service, accel_class)) {
+		IOObjectRetain(service);
+		accel = service;
+	} else {
+		target = IORegistryEntryCreateCFProperty(service, CFSTR("IOAccelTypes"), NULL, 0);
+		if (target && CFGetTypeID(target) == CFStringGetTypeID() &&
+		    CFStringGetCString(target, path, sizeof(path), kCFStringEncodingUTF8))
+			accel = IORegistryEntryFromPath(kIOMasterPortDefault, path);
+		if (target) CFRelease(target);
+	}
+	if (accel && !IOObjectConformsTo(accel, accel_class)) {
+		IOObjectRelease(accel);
+		accel = 0;
+	}
 	if (!accel)
 		return kIOReturnNoDevice;
 	kr = IOServiceOpen(accel, mach_task_self(), RDN_UC_TYPE, &ga->conn);

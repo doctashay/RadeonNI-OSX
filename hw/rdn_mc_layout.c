@@ -1,6 +1,6 @@
 /*
  * Cold address relocation following Linux evergreen_mc_stop/program/resume.
- * The first diagnostic supports only the HD 7570's 1 GiB DVI/TMDS layout.
+ * Supports 1/2 GiB Turks and Cayman layouts before clients start.
  * SPDX-License-Identifier: MIT
  */
 #ifdef KERNEL
@@ -14,7 +14,7 @@
 #include "rdn_reg.h"
 
 #define OLD_BASE 0xf00000000ull
-#define VRAM_BYTES 0x40000000u
+#define CAYMAN_BASE 0xf800000000ull
 #define WAIT_US 100000u
 #define CRTC_READ_DISABLE (1u << 24)
 #define CRTC_STATUS 0x6e8cu
@@ -171,7 +171,8 @@ int rdn_mc_layout_rebase_zero(struct rdn_card *c, uint32_t conditions,
 {
 	struct layout_save old, next;
 	unsigned i, j;
-	uint64_t end, primary, secondary;
+	uint64_t end, primary, secondary, vram_bytes;
+	uint32_t pci, memory_mb;
 	int r = -EINVAL, blackout_attempted = 0, mapping_written = 0;
 
 	if (!out)
@@ -182,22 +183,27 @@ int rdn_mc_layout_rebase_zero(struct rdn_card *c, uint32_t conditions,
 	    !c->os->cfg_read32 || !c->os->delay_us ||
 	    conditions != RDN_MC_LAYOUT_CONDITIONS ||
 	    scratch_offset != RDN_MC_LAYOUT_SCRATCH_OFFSET ||
-	    (scratch_offset & 4095) || scratch_offset > VRAM_BYTES - 4096)
+	    (scratch_offset & 4095))
 		return -EINVAL;
-	if (c->os->cfg_read32(c->os->cookie, 0) != 0x675d1002u ||
-	    !equal(c, out, 0x5428, 1024, UINT32_MAX))
+	pci = c->os->cfg_read32(c->os->cookie, 0);
+	memory_mb = rd(c, 0x5428);
+	if ((pci != 0x675d1002u && pci != 0x67581002u && pci != 0x67041002u) ||
+	    (memory_mb != 1024 && memory_mb != 2048))
 		return -EINVAL;
+	vram_bytes = (uint64_t)memory_mb << 20;
 	for (i = 0; i < 10; i++)
 		old.layout[i] = rd(c, layout_regs[i]);
 	out->old_base = (uint64_t)(old.layout[3] & 0xffff) << 24;
 	end = ((uint64_t)(old.layout[3] >> 16) << 24) | 0xffffff;
-	if (out->old_base != OLD_BASE || end != OLD_BASE + VRAM_BYTES - 1) {
+	if ((out->old_base != OLD_BASE &&
+	     !(pci == 0x67041002u && out->old_base == CAYMAN_BASE)) ||
+	    end != out->old_base + vram_bytes - 1) {
 		out->failed_reg = 0x2024;
-		out->expected = 0x0f3f0f00;
+		out->expected = (uint32_t)(((out->old_base + vram_bytes - 1) >> 24) << 16) | (uint32_t)(out->old_base >> 24);
 		out->actual = old.layout[3];
 		return -EINVAL;
 	}
-	if (!equal(c, out, 0x2c04, (uint32_t)(OLD_BASE >> 8), UINT32_MAX) ||
+	if (!equal(c, out, 0x2c04, (uint32_t)(out->old_base >> 8), UINT32_MAX) ||
 	    !equal(c, out, CP_CONTROL, CP_HALTED, CP_HALTED) ||
 	    !equal(c, out, GRBM_STATUS, 0, 0x80000000u) ||
 	    !equal(c, out, SRBM_STATUS2, 0, DMA_BUSY) ||
@@ -227,15 +233,15 @@ int rdn_mc_layout_rebase_zero(struct rdn_card *c, uint32_t conditions,
 		primary = ((uint64_t)old.addresses[i][0] << 32) | old.addresses[i][2];
 		secondary = ((uint64_t)old.addresses[i][1] << 32) | old.addresses[i][3];
 		if ((old.control[i] & EVERGREEN_CRTC_MASTER_EN) &&
-		    ((primary & 255) || (secondary & 255) || primary < OLD_BASE ||
-		     primary > end || secondary < OLD_BASE || secondary > end))
+		    ((primary & 255) || (secondary & 255) || primary < out->old_base ||
+		     primary > end || secondary < out->old_base || secondary > end))
 			return -EINVAL;
 	}
 	next = old;
 	next.layout[0] = 0;
-	next.layout[1] = (VRAM_BYTES - 1) >> 12;
+	next.layout[1] = (vram_bytes - 1) >> 12;
 	next.layout[2] = scratch_offset >> 12;
-	next.layout[3] = 0x003f0000;
+	next.layout[3] = (uint32_t)(((vram_bytes - 1) >> 24) << 16);
 	next.layout[4] = 0;
 	next.layout[5] = (2u << 7) | (1u << 30);
 	next.layout[6] = 0x3fffffff;
@@ -245,9 +251,9 @@ int rdn_mc_layout_rebase_zero(struct rdn_card *c, uint32_t conditions,
 	for (i = 0; i < 6; i++) {
 		if (old.control[i] & EVERGREEN_CRTC_MASTER_EN) {
 			next.addresses[i][2] = (uint32_t)((((uint64_t)old.addresses[i][0] << 32) |
-				old.addresses[i][2]) - OLD_BASE);
+				old.addresses[i][2]) - out->old_base);
 			next.addresses[i][3] = (uint32_t)((((uint64_t)old.addresses[i][1] << 32) |
-				old.addresses[i][3]) - OLD_BASE);
+				old.addresses[i][3]) - out->old_base);
 		} else {
 			next.addresses[i][2] = next.addresses[i][3] = 0;
 		}

@@ -31,6 +31,7 @@ extern "C" {
 }
 
 class RadeonNIAccel;
+struct rdn_user_board_sensors;
 
 class RadeonNI : public IOFramebuffer
 {
@@ -100,23 +101,38 @@ public:
 	virtual IOReturn setCursorState(SInt32 x, SInt32 y, bool visible);
 
 	/* Register access for the OS layer. */
+	IOReturn readTelemetry(bool clocks,UInt32 *temperature,UInt32 *core,UInt32 *memory);
+	IOReturn readBoardSensors(struct rdn_user_board_sensors *out);
 	UInt32 readReg(UInt32 offset);
 	void writeReg(UInt32 offset, UInt32 value);
 	IOPCIDevice *device() { return fDevice; }
 
 	/* For the accelerator. */
 	struct rdn_card *card() { return &fCard; }
+	bool tryPowerLock() { return fLock && IOLockTryLock(fLock); }
+ void lockPower() { IOLockLock(fLock); }
+	void unlockPower() { IOLockUnlock(fLock); }
 	struct rdn_os *os() { return &fOS; }
 	volatile void *aperture();
 	UInt32 apertureSize();
 	IOMemoryDescriptor *apertureDescriptor();
 	/* What is on screen now, at any depth; false before the first mode. */
 	bool screen(struct rdn_fb *fb);
+	bool screenAt(UInt32 index, struct rdn_fb *fb);
 	/* The screen as a render target; false unless it is 32 bits deep. */
 	bool selftestTarget(struct rdn_accel *accel,
 			    struct rdn_selftest_target *target);
 
 private:
+	RadeonNI *fParent, *fHeads[RDN_NUM_CRTC];
+	struct rdn_card *fDisplayCards[RDN_NUM_CRTC];
+	struct rdn_output fHeadOutput;
+	UInt32 fScanoutOffset, fCursorOffset, fHeadIndex, fHeadPll;
+	bool fMultiHead, fHeadAllocation, fAcceleratorClaimed;
+	UInt32 fAcceleratorIndex;
+	bool startHead(IOService *provider);
+	void startHeads();
+	void linkHeadAccelerator();
 	IOPCIDevice *fDevice;
 	IOMemoryMap *fRegMap;
 	IOMemoryMap *fFbMap;
@@ -127,7 +143,7 @@ private:
 	RadeonNIAccel *fAccel;
 	bool fModeSet;
 	bool fMCRebaseRequested, fMCProviderLocked, fMCProviderOpen;
-	bool fMCConsoleSuspended, fMCRebased, fMCFatal;
+	bool fMCConsoleSuspended, fMCConsoleOwned, fMCRebased, fMCFatal;
 
 	struct rdn_os fOS;
 	struct rdn_card fCard;
@@ -209,6 +225,7 @@ private:
 	void describeFb(const struct rdn_mode *mode, IOIndex depth,
 			struct rdn_fb *fb);
 	IOReturn programMode(IODisplayModeID id, IOIndex depth);
+ IOReturn programModeHardware(IODisplayModeID id, IOIndex depth);
 	bool useHDMI();
 	void loadColors();
 	void cleanUp();

@@ -197,7 +197,7 @@ int main(int argc, char **argv)
 	bad += entry(aperture, 5) != (0x1abcde000ull | 0x67);
 	rdn_gart_clear_page(&gart, 5);
 	bad += entry(aperture, 5) != (DUMMY | 0x67);
-	bad += rdn_gart_addr(3) != 0x40003000ull;
+	bad += rdn_gart_addr(&accel, 3) != 0x40003000ull;
 
 	if (r || m.failed || bad || m.matched != 17) {
 		printf("FAIL: result %d, %zu accesses matched, %d wrong table entries\n",

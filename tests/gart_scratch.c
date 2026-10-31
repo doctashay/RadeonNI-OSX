@@ -4,7 +4,7 @@
 #include <string.h>
 #include "../hw/rdn_gart.h"
 
-#define APERTURE (8u << 20)
+#define APERTURE (16u << 20)
 #define TABLE (2u << 20)
 #define SCRATCH 0x1000u
 static unsigned checks, failures, writes;
@@ -61,6 +61,12 @@ int main(void)
 		check(mem[TABLE] == 0x67 && mem[TABLE+1] == 0x50 && mem[TABLE+2] == 0x34 &&
 		      mem[TABLE+3] == 0x12 && !mem[TABLE+4] && !mem[TABLE+5] && !mem[TABLE+6] && !mem[TABLE+7],
 		      "PTE bytes remain little endian without changing the existing translation format");
+		rdn_gart_set_vram_page(&gart, RDN_GART_PAGES - 1, accel.vram_base + 0x12345000);
+		uint32_t last = TABLE + (RDN_GART_PAGES - 1) * 8;
+		check(mem[last] == 0x61 && mem[last + 1] == 0x50 &&
+		      mem[last + 2] == 0x34 && mem[last + 3] == 0x12 &&
+		      mem[last + 4] == (i ? 15 : 0),
+		      "last VRAM alias PTE retains high address and clears SYSTEM/SNOOPED");
 		rdn_gart_set_page(&gart, 17, 0x87654000); memcpy(saved, mem + TABLE, RDN_GART_TABLE_BYTES);
 		rdn_gart_disable(&gart); regs[0x203c / 4] = 0xdeadbeef;
 		check(!rdn_gart_resume(&gart) && gart.ready &&
@@ -115,6 +121,18 @@ int main(void)
 	check(!rdn_gart_resume(&gart) && regs[0x203c/4] == TABLE/4096 &&
 	      !memcmp(saved, mem + TABLE, RDN_GART_TABLE_BYTES),
 	      "legacy resume preserves mappings and does not consult the separate-default field");
+	accel.vram_base = 0; accel.vram_size = 2ull << 30;
+	check(!rdn_gart_enable_with_scratch(&gart, &accel, TABLE, 0x1000, SCRATCH) &&
+	      regs[0x155c/4] == 0x80000 && regs[0x157c/4] == 0x17ffff &&
+	      rdn_gart_addr(&accel, 3) == 0x80003000ull,
+	      "2 GiB low VRAM places the 4 GiB GART above physical VRAM");
+	rdn_gart_set_page(&gart, 19, 0x87654000); memcpy(saved, mem + TABLE, RDN_GART_TABLE_BYTES);
+	rdn_gart_disable(&gart);
+	check(!rdn_gart_resume(&gart) && regs[0x155c/4] == 0x80000 &&
+	      !memcmp(saved, mem + TABLE, RDN_GART_TABLE_BYTES), "2 GiB resume preserves the relocated GART and bindings");
+	accel.vram_size = 4ull << 30; before = writes;
+	check(rdn_gart_enable_with_scratch(&gart, &accel, TABLE, 0x1000, SCRATCH) < 0 && writes == before,
+	      "GART requiring a 64-bit user ABI is rejected before writes");
 	free(saved); free(mem);
 	printf("%s: %u GART scratch checks\n", failures ? "FAIL" : "PASS", checks);
 	return failures ? 1 : 0;

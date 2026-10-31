@@ -3,8 +3,8 @@
  *
  * Memory model: everything the GPU reads (ring, indirect buffers, vertex
  * data, shaders, textures) lives in video memory and is reached by the CPU
- * through the aperture (BAR0). There is no GART, no bus mastering and no
- * interrupt; completion is polled.
+ * through the aperture (BAR0). Completion uses register or VRAM fences;
+ * the kernel can enable interrupt-driven waits.
  *
  * Byte order: data (vertices, shaders, textures written by this library)
  * is stored little-endian by the accessors below, on any host. Command
@@ -45,6 +45,10 @@ struct rdn_gpu_config {
 	uint32_t tile_config;
 	uint32_t backend_map;
 	uint32_t active_simds;
+	uint32_t max_texture_channel_caches;
+	uint32_t mem_row_size_in_kb, shader_engine_tile_size;
+	uint32_t num_gpus, multi_gpu_tile_size, num_tile_pipes;
+	uint32_t mem_max_burst_length_bytes;
 };
 
 /* Microcode images as shipped (big-endian words). */
@@ -54,6 +58,9 @@ struct rdn_accel_fw {
 	const uint8_t *me;
 	size_t me_size;
 };
+
+struct rdn_accel;
+int rdn_rlc_start(struct rdn_accel *accel, const uint8_t *firmware, size_t size);
 
 struct rdn_accel {
 	struct rdn_card *card;
@@ -78,6 +85,10 @@ struct rdn_accel {
 	bool swapped;
 
 	uint32_t fence_emitted;
+	uint32_t fence_offset;
+	bool fence_memory, fence_interrupt;
+	int (*before_submit)(void *cookie);
+	void *submit_cookie;
 };
 
 static inline void rdn_vram_write32(struct rdn_accel *accel, uint32_t offset,
@@ -118,6 +129,10 @@ void rdn_accel_fini(struct rdn_accel *accel);
 
 /* rdn_gpu.c */
 void rdn_gpu_init(struct rdn_accel *accel);
+void rdn_cayman_gpu_init(struct rdn_accel *accel);
+void rdn_cayman_ring_setup(struct rdn_accel *accel);
+uint32_t rdn_remap_render_backend(uint32_t pipes, uint32_t max_rb,
+				uint32_t total_rb, uint32_t disabled);
 
 /*
  * Flush the card's cache of host accesses to video memory: needed after

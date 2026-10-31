@@ -64,6 +64,7 @@
 #define RDN_UVD_MAX_RING_BYTES (1u << 20)
 #define RDN_UVD_MAX_TIMEOUT_MS 10000u
 #define RDN_UVD_RLC_BYTES 3072u
+uint32_t rdn_uvd_rlc_bytes(const struct rdn_card *card);
 
 struct rdn_uvd {
 	struct rdn_accel *accel;

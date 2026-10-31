@@ -16,8 +16,11 @@
 #define RADEONNIACCEL_H
 
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/graphics/IOAccelerator.h>
 #include <IOKit/pci/IOAGPDevice.h>
 
@@ -29,6 +32,7 @@ extern "C" {
 #include "rdn_gart.h"
 #include "rdn_mem.h"
 #include "rdn_pm.h"
+#include "rdn_cayman_dpm.h"
 #include "rdn_user.h"
 #include "rdn_uvd.h"
 }
@@ -74,6 +78,11 @@ class RadeonNIAccel : public IOAccelerator
 	OSDeclareDefaultStructors(RadeonNIAccel)
 
 public:
+	IOReturn managedAlias(UInt32 physical, UInt32 size, UInt32 alignment, void *owner, UInt32 *alias);
+	IOReturn managedEvict(UInt32 alias, task_t task, UInt64 address, void *owner);
+	IOReturn managedPromote(UInt32 alias, UInt32 physical, void *owner);
+	IOReturn managedInfo(UInt32 *version);
+	UInt64 gartAddress(UInt32 offset) const { return rdn_gart_gpu_start(&fAccel) + offset; }
 	/* Create, attach under the PCI device and publish. */
 	static RadeonNIAccel *withFramebuffer(RadeonNI *fb, IOService *provider);
 	virtual void free(void);
@@ -104,8 +113,13 @@ public:
 
 	/* For the user client. All of these take the lock themselves. */
 	void getInfo(struct rdn_user_info *info);
+ /* Caller holds the framebuffer power lock; success retains fLock until end. */
+ IOReturn beginDisplayPowerChange();
+ int prepareVideoPower(bool alreadyLocked);
+ void endDisplayPowerChange();
+	void memoryUsage(struct rdn_user_memory_usage *info);
 	IOReturn allocVram(UInt32 size, UInt32 align, UInt32 *offset,
-			   bool hidden = false, bool segment = false);
+			   bool hidden = false, bool segment = false, bool command = false);
 	void hiddenInfo(UInt32 *offset, UInt32 *size);
 	/* A program's memory in the GART (rdn_user.h). */
 	void gartInfo(UInt32 *on, UInt32 *gpuStart, UInt32 *pages);
@@ -120,6 +134,8 @@ public:
 	bool fenceWait(UInt32 fence, UInt32 timeoutMs);
 	void syncForCPU(void);
 	IOReturn waitForCPU(void);
+	IOReturn fenceControl(UInt32 mode, UInt32 *active, UInt32 *events, UInt32 *fallbacks);
+	void stopFenceInterrupts();
 	IOReturn power(UInt32 state, UInt32 what, UInt32 *sclk, UInt32 *mclk,
 		       UInt32 *temperature);
 	IOReturn regRead(UInt32 offset, UInt32 *value);
@@ -160,8 +176,9 @@ public:
 	UInt32 apertureBytes(void);
 	/* The shapes of the window server's surfaces, by surface ID. */
 	bool setSurfaceRegion(UInt32 wid, const IOAccelDeviceRegion *rgn,
-			      UInt32 rects);
+			      UInt32 rects, UInt32 fbIndex, bool scanout);
 	bool getSurfaceRegion(UInt32 wid, struct rdn_user_region *region);
+	bool getSurfaceScreen(UInt32 wid, struct rdn_user_screen *screen);
 	void forgetSurface(UInt32 wid);
 	/*
 	 * With the gate on (personality key SurfaceGate), setIDMode takes
@@ -182,9 +199,9 @@ public:
     IOReturn surfaceGpuCopy(UInt32 wid, task_t task, bool administrator,
         UInt32 offset, UInt32 stride, UInt32 width, UInt32 height);
     IOReturn surfaceGpuTransfer(UInt64 source, UInt32 sourceStride,
-        UInt64 destination, UInt32 destinationStride, UInt32 width, UInt32 height, UInt32 surface = 0, bool locked = false);
+        UInt64 destination, UInt32 destinationStride, UInt32 width, UInt32 height, UInt32 surface = 0, bool locked = false, bool wait = true);
     IOReturn syncSurfaceGpu(UInt32 surface, UInt64 ram, UInt32 stride, UInt32 width, UInt32 height, bool toCPU);
-    IOReturn refreshSurfaceGpuOwner(void *owner);
+    IOReturn refreshSurfaceGpuOwner(void *owner, UInt32 *fence);
     IOReturn initializeSurfaceGpu(UInt32 wid, task_t task);
     bool surfaceDestination(UInt32 offset, UInt32 stride, UInt32 width, UInt32 height);
     UInt64 surfaceVramAddress(UInt32 offset) { return rdn_vram_addr(&fAccel, offset); }
@@ -212,11 +229,33 @@ private:
 	RadeonNI *fFramebuffer;
 	IOService *fUvdProvider;
 	IOLock *fLock;
+	struct RetiredVram { UInt32 offset, fence; RetiredVram *next; };
+	RetiredVram *fRetiredVram;
+	void reapRetiredVram();
+	IOLock *fFenceControlLock;
+	void stopFenceInterruptsUnlocked();
+	IOWorkLoop *fFenceLoop;
+	IOFilterInterruptEventSource *fFenceSource;
+	volatile bool fFenceIRQEnabled;
+	UInt32 fFenceRingOffset, fFenceEvents, fFenceFallbacks;
+	volatile UInt32 fFenceRptr;
+	UInt32 fFenceSavedControl, fFenceSavedCPControl, fFenceSavedDummy;
+	bool fFenceRlcPrepared;
+	static bool fenceInterruptFilter(OSObject *, IOFilterInterruptEventSource *);
+	static void fenceInterruptAction(OSObject *, IOInterruptEventSource *, int);
+	IOReturn startFenceInterrupts();
+
 	IOLock *fUvdLock;
+	// Selected session is only accessed while fUvdLock is held.
 	RadeonNIVideoSession *fVideoSession;
+	RadeonNIVideoSession *fVideoSessions[RDN_VIDEO_MAX_SESSIONS];
+	UInt32 fVideoSessionCount;
+	RadeonNIVideoSession *videoFind(RadeonNIVideoUserClient *owner);
 	UInt64 fVideoEpoch;
 	volatile UInt32 fVideoCpuBytes;
 	bool fVideoBusy;
+	UInt32 fVideoStagingOffset, fVideoStagingBytes;
+	void videoReserveStaging(void);
 	bool videoReady(bool administrator, bool validation);
 	int videoCommand(UInt32 type, const struct rdn_uvd_h264_picture *picture,
 		UInt32 bitstreamBytes);
@@ -232,6 +271,8 @@ private:
 	bool fRetiring;
 	struct rdn_accel fAccel;
 	struct rdn_mem fMem;
+	struct rdn_mem fCommandMem;
+	struct rdn_mem *heapForOffset(UInt32 offset);
 	/* Video memory beyond the aperture; fHiddenSize 0 if there is none. */
 	struct rdn_mem fHidden;
 	UInt32 fHiddenOffset, fHiddenSize;
@@ -314,8 +355,31 @@ private:
 	UInt32 fUvdFixtureOffset, fUvdFixtureBytes;
 	UInt8 *fUvdFixtureSnapshot;
 	/* The power state the card was last put in (hw/rdn_pm.h). */
+	struct rdn_cayman_dpm *fHardwarePower;
+	bool fThermalFallback, fManualPowerCap, fPerformanceMode;
+	unsigned fPowerPolls;
+ bool fDisplayPowerHeld;
+ bool fClockTuning;
+ UInt64 fTuneDeadline;
+ struct rdn_pm_state fTuneStock;
+ bool ensurePowerTimer();
+ void pollClockTuning();
+	bool startHardwarePower(bool diagnostic = false);
+	void stopHardwarePower();
+	void pollHardwarePower();
 	struct rdn_pm_state fPower;
 	bool fPowerKnown;
+	struct rdn_pm_state fIdlePower, fPerformancePower;
+	IOWorkLoop *fPowerLoop;
+	IOTimerEventSource *fPowerTimer;
+	UInt64 fLastPowerWork, fLastVideoPowerWork;
+	bool fIdleGovernor, fPowerIdle, fPowerFault;
+	static int powerBeforeSubmit(void *cookie);
+	static void powerTimerFired(OSObject *owner, IOTimerEventSource *sender);
+	void startIdleGovernor();
+	void stopIdleGovernor();
+	int applyGovernorPower(const struct rdn_pm_state *target);
+
 	/* Hand out surface clients (RadeonNISurface.h)? */
 	bool fSurfaces;
 	bool fSurfaceGate;
@@ -325,7 +389,8 @@ private:
     enum { kSurfaceMirrors = 1024 };
     SurfaceMirror fSurfaceMirrors[kSurfaceMirrors];
 	struct SurfaceRecord {
-		UInt32 wid;
+		UInt32 wid, fbIndex;
+		bool scanout;
 		bool used;
 		/* announced by its owner (RDN_UC_SURFACE_BUFFER) */
 		bool gl;
@@ -342,9 +407,7 @@ private:
 	UInt32 fShapeCapacity;
 	int surfaceSlot(UInt32 wid, bool create);
 	UInt32 fReadLocked;
-	/* flushSurface(): the last copy's fence, and its rectangles. */
-	bool fBlitPending;
-	UInt32 fBlitFence;
+	/* Surface copies share the fenced screen work-area pool. */
 	struct rdn_blit_rect fBlitRects[RDN_BLIT_MAX_RECTS];
 	/*
 	 * screenFill() and screenCopy(): work areas used in turn, each with
@@ -361,7 +424,7 @@ private:
 	/* screenCopy()'s scratch surface; fMoveBytes 0 before the first copy. */
 	UInt32 fMoveOffset, fMoveBytes;
 	bool fMoveHidden;
-	IOReturn screenBegin(struct rdn_selftest_target *screen, UInt32 *slot);
+	IOReturn screenBegin(struct rdn_selftest_target *screen, UInt32 *slot, UInt32 fbIndex = 0);
 	void screenEnd(UInt32 slot);
 	IOReturn moveScratch(const struct rdn_selftest_target *screen,
 			     struct rdn_draw_surface *scratch);
@@ -371,6 +434,7 @@ private:
 
 	bool startEngine(void);
 	static void prepareUvdBeforeCP(void *cookie);
+	static void prepareBeforeCP(void *cookie);
 	IOReturn uvdDiagnosticInitImpl(UInt32 *status, bool prepareOnly);
 	void releaseUvdFixtureSnapshot(void);
 	/* rdn_gart=1: the page table for system memory, and a test of it. */
@@ -380,10 +444,10 @@ private:
 	UInt32 fGartTable;
 	/* What programs have bound: byte offsets of the GART's range. */
 	struct rdn_mem fGartSpace;
-	enum { kMaxGartBindings = 512 };
+	enum { kMaxGartBindings = 4096 };
 	struct {
 		IOMemoryDescriptor *memory;
-		UInt32 offset, size;
+		UInt32 offset, size, vram;
 		void *owner;
 	} fGartBound[kMaxGartBindings];
 	void *copyFirmware(const char *key, UInt32 *size);
@@ -408,12 +472,21 @@ public:
 					     IOMemoryDescriptor **memory);
 
 	/* Methods, in the order of hw/rdn_user.h. */
+	IOReturn methodManagedInfo(UInt32 *version);
+	IOReturn methodManagedAlias(UInt32 physical, UInt32 size, UInt32 alignment, UInt32 *alias);
+	IOReturn methodManagedEvict(UInt32 alias, UInt32 addressLow, UInt32 addressHigh);
+	IOReturn methodManagedPromote(UInt32 alias, UInt32 physical);
+	IOReturn methodCommandInfo(UInt32 *version);
+	IOReturn methodMemoryUsage(struct rdn_user_memory_usage *info, IOByteCount *size);
+	IOReturn methodAllocCommand(UInt32 size, UInt32 align, UInt32 *offset);
 	IOReturn methodGetInfo(struct rdn_user_info *info, IOByteCount *size);
 	IOReturn methodAlloc(UInt32 size, UInt32 align, UInt32 *offset);
 	IOReturn methodFree(UInt32 offset);
 	IOReturn methodSubmit(UInt32 offset, UInt32 words, UInt32 *fence);
 	IOReturn methodFenceWait(UInt32 fence, UInt32 timeoutMs, UInt32 *reached);
 	IOReturn methodSyncForCPU(void);
+	IOReturn methodSurfaceScreen(UInt32 wid, struct rdn_user_screen *screen,
+		IOByteCount *size);
 	IOReturn methodSurfaceRegion(UInt32 wid, struct rdn_user_region *region,
 				     IOByteCount *size);
 	IOReturn methodSurfaceBuffer(UInt32 wid, UInt32 offset, UInt32 rowBytes,
@@ -424,6 +497,7 @@ public:
     IOReturn methodSurfaceGpuCopy(UInt32 wid, UInt32 offset, UInt32 stride, UInt32 width, UInt32 height);
 	IOReturn methodSurfaceList(struct rdn_user_surfaces *list, IOByteCount *size);
 	IOReturn methodSurfaceLocked(UInt32 *wid);
+	IOReturn methodFenceControl(UInt32 mode, UInt32 *active, UInt32 *events, UInt32 *fallbacks);
 	IOReturn methodRegRead(UInt32 offset, UInt32 *value);
 	IOReturn methodUvdInit(UInt32 flags, UInt32 *status);
 	IOReturn methodUvdSubmit(UInt32 offset, UInt32 words, UInt32 *fence);
@@ -465,7 +539,7 @@ private:
     bool fSurfaceGpuFailed;
     bool fSurfaceCompositor;
     IOLock *fAllocationLock;
-    IOReturn allocateMemory(UInt32 size, UInt32 align, UInt32 *offset, bool hidden, bool segment);
+    IOReturn allocateMemory(UInt32 size, UInt32 align, UInt32 *offset, bool hidden, bool segment, bool command = false);
 	/* What this client allocated, so that it can be freed when it goes. */
 	UInt32 *fOffsets;
 	UInt32 fCount;

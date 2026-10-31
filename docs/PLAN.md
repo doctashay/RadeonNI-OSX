@@ -1,5 +1,89 @@
 # Plan
 
+## Evergreen and Aruba expansion plan (2026-10-26)
+
+Planning only. No new family is implemented or hardware-qualified by this
+section. Keep the existing Turks/Cayman qualification work independent.
+
+### Scope and order
+
+| Family | Initial target | Required distinction |
+|---|---|---|
+| Redwood | HD 5550/5570/5670 desktop variants | Evergreen VLIW5, DCE4, 6 CRTCs; first shared Evergreen bring-up target |
+| Cedar | HD 5450 desktop variants | Evergreen VLIW5, DCE4, 4 CRTCs; no vertex cache and different thread allocation |
+| Juniper | HD 5750/5770 desktop variants | Evergreen VLIW5, DCE4, 6 CRTCs; own engine geometry and firmware |
+| Cypress | HD 5850/5870 desktop variants | Evergreen VLIW5, DCE4, 6 CRTCs; larger engine/backend configuration and own firmware |
+| Aruba | Trinity/Richland integrated graphics | VLIW4, DCE6.1, 4 CRTCs; integrated memory and platform dependencies |
+
+Preferred order is Redwood, Cedar, Juniper, Cypress, then Aruba research.
+The first available physical Evergreen card may change the order. Marketing
+names are examples; match upstream PCI IDs and distinguish mobile, integrated
+and dual-GPU devices. Do not include Hemlock dual-GPU board qualification in
+the initial Cypress milestone.
+
+Aruba is not a discrete PCIe Power Mac upgrade. Define the intended host or
+emulation environment before implementing platform initialization. Linux's
+Trinity callbacks reuse Cayman routines, but this does not establish that our
+discrete Cayman memory, POST or power path works on an APU.
+
+### Implementation stages
+
+1. **Explicit family capabilities.** Extend `hw/rdn_device_ids.h` with upstream
+   identities and a descriptor for graphics/display generation, CRTC limits,
+   memory model and firmware selection. Replace two-way Cayman/Turks choices
+   in `rdn_gpu.c`, `rdn_cp.c`, `rdn_mc.c`, the Mesa winsys and profile generator.
+   Unknown or incomplete configurations must not fall through to Turks.
+2. **Evergreen framebuffer.** Audit `rdn_post.c`, `rdn_modeset.c`, watermarks,
+   cursor/LUT and interrupt registers against DCE4. Port generation-specific
+   PLL, DIG allocation and AtomBIOS command revisions. Reuse BIOS connector
+   discovery and transmitter validation where applicable. Start with one
+   digital output and CPU scanout, then modesets and additional outputs.
+   Test warm handoff and cold BIOS POST separately. OpenFirmware boot-console
+   support remains a separate task.
+3. **Memory and engines.** Port each Evergreen case from Linux
+   `evergreen_gpu_init`, golden register setup and startup ordering. Preserve
+   fuse-disabled units and actual VRAM geometry. Validate each family's PFP,
+   ME, RLC and any required MC firmware, including byte order. Bring up GART,
+   ring scratch, IB completion and fences before blits or shaders. Do not
+   reuse Turks MC training, clock tables or board-specific tuning.
+4. **Mesa and OS X acceleration.** Publish the actual Mesa chip family,
+   graphics level, tiling/backend configuration and qualified capabilities.
+   Check buffer/texture readback before native OpenGL, then GLD, QE/CI and
+   application workloads. Keep the existing winsys performance improvements
+   where their hardware assumptions hold. Advertise features from verified
+   capabilities, without promising an OpenGL version from the family name.
+5. **Video and power.** Add family-qualified decode firmware, engine setup
+   and codec limits after graphics stability. Evergreen UVD is not the current
+   Northern Islands UVD path. Qualify display sleep, system sleep, reset and
+   thermal behavior independently; retain BIOS clocks initially.
+6. **Aruba platform track.** Audit integrated/stolen-memory discovery,
+   aperture/GART coherency, platform firmware data, SMU interactions, DCE6.1
+   and bridge-based outputs against the Trinity path. Only after a viable host
+   and memory model exist, adapt Cayman-derived rendering with Aruba-specific
+   firmware/configuration. Leave UVD/VCE unavailable until separately ported.
+
+### Acceptance gates
+
+- Host model tests: complete PCI classification, no unimplemented-engine I/O,
+  DCE register/CRTC bounds, AtomBIOS revisions, firmware rejection and startup
+  failure unwinding. Run endian-sensitive cases on big-endian PPC.
+- Build both PPC32 and PPC64 driver/Mesa paths and generated personalities.
+  Re-run existing Turks/Cayman and Barts/Caicos model regressions.
+- Physical qualification per family: cold boot, warm handoff, EDID/modesets,
+  framebuffer pixels, sustained ring/fence completion, memory pressure,
+  rendering readbacks, WindowServer/application load and recovery. Exercise
+  each advertised connector and qualify Tiger/Leopard separately.
+- Update the compatibility matrix by achieved stage: source/model checked,
+  framebuffer hardware tested, accelerated hardware tested, then video/power.
+  Models and successful builds do not constitute a hardware pass.
+
+References: Linux v6.12
+[`radeon_asic.c`](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/radeon/radeon_asic.c),
+[`evergreen.c`](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/radeon/evergreen.c),
+[`ni.c`](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/radeon/ni.c),
+[`drm_pciids.h`](https://github.com/torvalds/linux/blob/v6.12/include/drm/drm_pciids.h),
+and the X.Org [Radeon hardware tables](https://www.x.org/RadeonFeature/).
+
 ## Active roadmap: Leopard stability and family support (2026-10-18)
 
 This roadmap supersedes the historical milestone claims below for Leopard.
@@ -30,6 +114,156 @@ system sleep/wake. Tiger has a separate qualification track.
   `~/Desktop/Picture 1.png` on the G5's Leopard volume, copy in `images/leopard-finder-corruption-20261022.png`
   on arch-server. `scripts/mac.sh g5 grab` does not work on Leopard (the Tiger-built `~/gl/rdnuc grab` returns
   nothing), so look at a user's screenshot or fix the grab first. Start after the Sims 2 investigation.
+
+### Upcoming upstream ports and performance work (2026-10-25)
+
+Source audit, not implemented or hardware-qualified. Linux Radeon was reviewed
+at `21a7f44fd0765fcc5194130b28767786eba1d1e7`, including the latest 100
+Radeon-directory commits. Mesa inputs are the official 26.2.4 archive (SHA256
+`bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9`).
+Review covers suspend/resume, rings, DMA, fences, synchronization, memory
+placement, r600, the DRM winsys, shader caching and application configuration;
+it is not an exhaustive review of every Linux/Mesa change.
+
+#### System sleep: port the upstream lifecycle
+
+- [ ] **UP-01: Port hardware suspend/resume.** Use
+  [Cayman `cayman_suspend/resume`](https://github.com/torvalds/linux/blob/21a7f44fd0765fcc5194130b28767786eba1d1e7/drivers/gpu/drm/radeon/ni.c)
+  and [Turks `evergreen_suspend/resume`](https://github.com/torvalds/linux/blob/21a7f44fd0765fcc5194130b28767786eba1d1e7/drivers/gpu/drm/radeon/evergreen.c).
+  Adapt the register/firmware ordering into `hw/`; do not import Linux DRM
+  lifecycle objects into IOKit. Preserve per-family differences.
+- [ ] **UP-02: Preserve memory and clients across sleep.** Follow
+  [`radeon_suspend_kms/resume_kms`](https://github.com/torvalds/linux/blob/21a7f44fd0765fcc5194130b28767786eba1d1e7/drivers/gpu/drm/radeon/radeon_device.c)
+  for eviction, fence drains, BIOS scratch and PCI restoration. Adapt to our
+  live BO handles, hidden VRAM, GART bindings, surfaces and video sessions.
+  Existing `retire/startEngine` destroys or resets this state and is unsuitable.
+- [ ] **UP-03: Connect IOGraphics power transitions.** One coordinator per
+  physical card, shared across its heads; gate submissions/timers, restore
+  hardware and mappings before wake acknowledgement, and retain the current
+  sleep veto until qualification. See `POWER-MANAGEMENT.md`, implementation
+  audit, for failure ordering and staged tests. Test powered quiesce/restore
+  before real sleep, then both GPU families and a dual-card configuration.
+
+#### Performance candidates, in investigation order
+
+| ID | Priority | Work and upstream basis | Local evidence / required proof |
+|---|---|---|---|
+| UP-04 | High | Restore r600 disk shader caching (`r600_pipe_common.c`, `util/disk_cache*`). | Both Leopard build scripts explicitly use `-Dshader-cache=disabled`. Establish a Mach-O-compatible function/build identity and stable cache directory; key by compiler build, GPU and relevant options. Measure cold/warm launches and compilation spikes; this is a stutter/startup candidate, not a promised steady-FPS gain. Test invalidation, concurrent writers and corrupt entries on PPC32/PPC64. |
+| UP-05 | High | Profile and reduce presentation serialization using upstream per-resource fence ownership and deferred retirement. | Jak traces identify presentation as a major cost. Local queued-surface and async-fullscreen work already exists; finish its qualification instead of duplicating it. Linux KMS page flipping is not a replacement for Leopard CGS surface flushing. Measure GLD completion, CGS IPC and compositor work separately; retain all producer/consumer fences and resize/occlusion correctness. |
+| UP-06 | High | Port small-BO slab allocation/reclamation from Mesa `radeon_drm_bo.c` and its submission tracking. | The custom winsys caches whole allocations but has no BO slabs, and rounds small allocations to 4 KB. Add suballocation only with checked relocation ranges and per-entry completion/ownership. Measure allocation/IOKit-call counts, fragmentation and frame-time tails under small-buffer churn. |
+| UP-07 | High | Audit residency/heap reporting against upstream `radeon_drm_winsys.c` and `radeon_ttm.c`. | `rdn_winsys_create` still reports GART size as visible VRAM and caps `max_heap_size_kb` to that region despite GART/hidden-memory support. Replace placeholders with actual budgets and per-allocation constraints after the managed-memory work is reconciled. Prove fewer pressure flushes without overcommitting pinned or CPU-visible memory. |
+| UP-08 | Medium | Port asynchronous DMA-ring support (`ni_dma.c`, `r600_dma.c`, ASIC callbacks). | Our CP-DMA copies already exist; Mesa currently advertises zero SDMA queues. Cayman has two async DMA engines; Turks requires its own upstream path. Add ring/fence/interrupt, tiling and endian tests before exposing a queue. Benchmark upload/copy overlap against CP-DMA; small transfers may not benefit. |
+| UP-09 | Medium | Replace applicable CPU cross-engine waits with upstream-style GPU dependencies (`radeon_sync.c`, `radeon_semaphore.c`). | `rdn_cs_wait_dependencies` blocks the CPU for graphics/video dependencies. Requires real per-engine fence ownership and reset handling; prioritize concurrent video/compositor and future DMA workloads. It is not a reason to remove same-resource synchronization. |
+| UP-10 | Medium | Compare ring-pointer writeback and submission batching with upstream Radeon rings/DRM winsys. | `rdn_ring_free` and IB admission read `CP_RB_RPTR` over MMIO. Compare a coherent system-memory writeback path, retaining a verified MMIO fallback. Measure PCIe register reads and CPU submission cost; validate PPC cache ordering, endian layout, wrap and reset. Existing command-pool/reserve work must be reconciled first. |
+| UP-11 | Qualification | Qualify the existing Cayman DPM/SMC port and Turks power policy under real game workloads. | This work already exists. Compare effective clocks and thermal/power limits with upstream PM behavior; distinguish thermal limits from CPU/presentation stalls. Preserve hardware protection and use sustained-load recovery tests. No higher-clock or thermal-limit change is implied by this audit. |
+
+#### UP-04 through UP-09 qualification (2026-10-25)
+
+- **UP-04:** Both Leopard architectures now build with the 64 MB disk shader
+  cache enabled. Mach-O UUID and CPU type identify the loaded compiler; r600
+  includes its debug options in the key. Native PPC32/PPC64 tests on Cayman and
+  Turks verify 32 shader outputs, cold/warm reuse, new entries after rebuilding,
+  option invalidation and recovery from truncated entries. Concurrent cold
+  writers also pass on Cayman in both architectures. Final warm samples were
+  101–148 ms versus 217–431 ms cold under concurrent desktop/video load.
+- **UP-05:** Direct swap submits drawing and the presentation copy together.
+  Stable stored surfaces avoid redundant drawable rebinding; resize, changed
+  screen geometry, direct-screen rendering and WindowServer retain rebinding.
+  Producer/consumer completion is unchanged. Five unobscured OpenMark runs per
+  card improved median throughput from 797 to 915 FPS on Cayman and 794 to
+  878 FPS on Turks. Median block p99 frame times changed from 1.508 to 1.324 ms
+  and 1.570 to 1.401 ms respectively. YouTube remained running; Cayman clocks
+  varied between 250 and 550 MHz, so these are desktop observations, not an
+  isolated GPU comparison. `RDN_PRESENT_PROFILE=1` separates binding, swap,
+  explicit finish and CGS costs. Migration/state and resize pixel tests pass.
+- **UP-06:** `RDN_SMALL_BO_SLABS=1` enables private visible-VRAM allocations up to
+  4 KB in 64 KB parents. Shared/NO_SUBALLOC requests cannot reuse slab entries;
+  existing per-entry fences gate cache reuse and parent release. The host test
+  packs 257 entries into two allocations. Native 1024-buffer, eight-round
+  data checks pass on both cards and architectures; traces show five parents
+  for over a thousand live buffers. This remains opt-in: OpenMark measurements
+  with slabs had variable WindowServer load and do not establish a speedup.
+  A final off/on/on/off check gave Cayman 982/981/834/834 FPS and Turks
+  951/899/813/813 FPS; the workload shift persisted with slabs disabled.
+  Existing GART chunk suballocation is separate from this addition.
+- **UP-07:** Heap limits use the device's visible and hidden allocation pools
+  plus the capped GART budget. Native output: Cayman 2014 MB total/222 MB visible,
+  Turks 990 MB total/222 MB visible, and 512 MB GART each. Local winsys accounting
+  separates VRAM/GART, cached storage, host imports and evicted residency; it
+  does not measure global occupancy across other clients or slab-parent slack.
+  CGL reads physical memory from the matched GPU's registry instead of reporting
+  256 MB for every card. Its legacy signed byte field saturates at INT32_MAX
+  for 2 GB; the Mesa heap uses the full allocatable capacity. Native PPC32/PPC64
+  CGL tests report positive values for both cards. A forced 24 MB residency
+  budget test on each card verified 64 MiB of textures through 35 evictions,
+  12 promotions, GPU sampling/writes and reuse. Larger per-allocation pressure
+  and global residency reporting still need broader qualification.
+- **UP-08/09 remain incomplete:** `hw/rdn_dma.c` ports the Turks/Cayman ring
+  setup, five-word linear-copy packets, high addresses, fence/trap packets and
+  CP/DMA semaphore emission from Linux revision
+  `21a7f44fd0765fcc5194130b28767786eba1d1e7`. Fences carry ring ownership and an
+  epoch; quiescence requires completion and engine idle before storage release.
+  Host and native PPC32/PPC64 packet models pass, and the Leopard kernel links
+  the module. No DMA queue is advertised or started. Kernel ring allocation,
+  client/resource lifetime, reset/IRQ integration, tiling/endian hardware tests,
+  copy-overlap benchmarks and winsys dependency submission remain outstanding.
+  Existing CPU cross-engine waits are still active. Do not treat the packet
+  model or the OpenMark improvement as hardware DMA qualification.
+
+Evidence is in the build workspace's
+`h264-validation-20261022/command-reserve-20261025`: OpenMark logs and metadata,
+`openmark-optimization-summary.json`, `cache-final-qualification.json`,
+`small-slabs-native-validation.json`, `small-slabs-allocation-stats.json`,
+`memory-budget-native.json`, and the native kernel build log. Changes are not
+staged or committed.
+
+#### Game profiles and shader paths
+
+- [ ] **UP-12: Load applicable upstream application options in the custom
+  frontend.** Both Leopard builds disable `xmlconfig`; `OSMesaCreateContextAttribs`
+  sets only four explicit options and does not load the common upstream
+  `src/util/00-mesa-defaults.conf` profiles. Add native executable/bundle/version
+  matching and map only options supported by our frontend. Keep process-specific
+  rules and log the selected profile; do not relax shader correctness globally.
+- [ ] **UP-13: Validate profile candidates against the actual Mac renderer.**
+  Upstream examples include Savage 2's GLSL line-continuation workaround and
+  Unigine's shader/extension compatibility options. Match the same affected
+  shader path before adopting them. The Windows Doom 3 BFG rules do not establish
+  a fix for original Mac Doom 3; TF2 Linux64, Wine, Vulkan/WSI and modern GCN/RDNA
+  rules are not automatically relevant to native PPC OpenGL.
+- [ ] **UP-14: Benchmark existing NIR/SB, HyperZ and glthread paths by game.**
+  These are already in Mesa/the port, not missing upstream implementations.
+  Preserve our id Tech 3/4 and Unreal Engine 2 profile decisions until new
+  measurements support a change. Check shader compile time, generated code,
+  depth-heavy scenes, client-array uploads, blend correctness and frame-time
+  tails. In the inspected 26.2.4 source `R600_DEBUG=precompile` aliases shader-db
+  diagnostics; do not treat that name as a production shader-cache optimization.
+
+#### Recent fixes reviewed; avoid duplicate or incompatible backports
+
+- Linux [`f59ad4cca219`](https://github.com/torvalds/linux/commit/f59ad4cca219)
+  restores hardware polling in fence-signaled checks to avoid delayed completion
+  and sync-heavy performance regressions. Our `rdn_number_wait` zero-timeout
+  path already calls `fence_done`, and `rdn_fence_done` reads the GPU counter.
+  Preserve this behavior and regression-test missed/delayed interrupts; there
+  is no demonstrated missing equivalent to cherry-pick.
+- Linux [`617562bbe12d`](https://github.com/torvalds/linux/commit/617562bbe12d)
+  corrects MSI address limits using the device DMA mask. Our current fence path
+  uses legacy INTx, so this is a requirement for a future MSI port, not a direct
+  performance fix for the installed path.
+- Linux [`82f1d6042611`](https://github.com/torvalds/linux/commit/82f1d6042611)
+  frees ring-backup storage after restore-lock failure. Carry its failure-path
+  invariant into sleep/reset ring preservation; our current code has no matching
+  `radeon_ring_restore` implementation to patch directly.
+- CP-DMA, whole-BO caching, fence interrupts, glthread and its measured 64 KB
+  batch adjustment are already present locally. HyperZ is enabled by default
+  upstream. Re-measure these paths; do not list them as newly imported features.
+
+Acceptance for each performance item: a source/patch identity, affected ASIC/OS,
+reduced correctness test, five comparable runs with median/p95/p99 frame times,
+and an uninstrumented game/desktop regression run. No speedup is established by
+this source audit. Source copies, commit metadata and checksums are under
+`F:/radeonni-leopard-build/h264-validation-20261022/upstream-performance-audit-20261025/`.
 
 ### Implementation contracts
 

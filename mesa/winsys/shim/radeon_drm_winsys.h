@@ -74,6 +74,8 @@ struct radeon_drm_winsys {
       uint64_t class_bytes[5][24], class_count[5][24];
       uint64_t peak_bytes[5], creates, cache_hits, overflowed;
    } mem_stats;
+   struct list_head managed_buffers;
+   uint64_t managed_resident, managed_budget, evictions, promotions;
    uint64_t num_flushes;
 };
 

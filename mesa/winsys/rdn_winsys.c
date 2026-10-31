@@ -1,3 +1,4 @@
+#include "rdn_host.h"
 /*
  * Mesa winsys for the Radeon HD 7570 without the Linux DRM.
  *
@@ -28,6 +29,7 @@
  */
 
 #include <stdio.h>
+#include "rdn_device_ids.h"
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
@@ -99,8 +101,14 @@ struct rdn_bo {
    struct rdn_busy last_uvd;
    /* Memory that is not from the allocator (the screen). */
    bool foreign;
+   bool suballocated;
    void *external_store;
    uint32_t diagnostic_id;
+   struct list_head managed_link;
+   uint64_t managed_alias, managed_size;
+   void *evicted_storage;
+   void *host_lease;
+   void (*host_release)(void *);
    enum rdn_place region;
    /* The program's own memory behind the GART (rdn_buffer_from_ptr). */
    void *user;
@@ -272,7 +280,7 @@ static void rdn_ws_fence_reference(struct radeon_winsys *rws,
  * is called with the lock held.
  */
 #define RDN_CACHE_FLUSHES 128
-static const uint64_t RDN_CACHE_BYTES[RDN_REGIONS] = { 32ull << 20, 128ull << 20, 64ull << 20, 0, 0 };
+static const uint64_t RDN_CACHE_BYTES[RDN_REGIONS] = { 8ull << 20, 128ull << 20, 64ull << 20, 0, 0 };
 
 static struct list_head *rdn_cache_bucket(struct radeon_drm_winsys *ws,
                                           uint64_t size, enum rdn_place region)
@@ -326,7 +334,7 @@ static void rdn_cache_put(struct radeon_drm_winsys *ws, uint64_t offset,
 
 /* Memory of exactly this size that the GPU has finished with, if any. */
 static bool rdn_cache_get(struct radeon_drm_winsys *ws, uint64_t size,
-                          uint64_t alignment, enum rdn_place region, uint64_t *offset)
+                          uint64_t alignment, enum rdn_place region, bool allow_small, uint64_t *offset)
 {
    struct list_head *bucket = rdn_cache_bucket(ws, size, region);
    unsigned looked = 0;
@@ -336,9 +344,12 @@ static bool rdn_cache_get(struct radeon_drm_winsys *ws, uint64_t size,
          break;
       if (c->size != size || c->region != region || (c->offset & (alignment - 1)))
          continue;
-      /* The oldest first: if the GPU still has that one, it has the rest. */
+      if (!allow_small && region == RDN_VISIBLE && ws->dev->is_small &&
+          ws->dev->is_small(ws->dev, c->offset))
+         continue;
+      /* Release order need not match submission order across contexts. */
       if (!rdn_busy_wait(ws, &c->busy, 0))
-         break;
+         continue;
       *offset = c->offset;
       rdn_cache_drop(ws, c);
       return true;
@@ -346,11 +357,8 @@ static bool rdn_cache_get(struct radeon_drm_winsys *ws, uint64_t size,
    return false;
 }
 
-/*
- * Give back to the kext what has been kept too long or is too much; with
- * `all`, everything, waiting for the GPU where it has to.
- */
-static void rdn_cache_trim(struct radeon_drm_winsys *ws, bool all)
+/* Reclaim over-budget/old storage, or all entries; waiting is explicit. */
+static void rdn_cache_reclaim(struct radeon_drm_winsys *ws, bool all, bool wait)
 {
    list_for_each_entry_safe(struct rdn_cached, c, &ws->cache_all, all) {
       bool old = ws->num_flushes - c->stamp > RDN_CACHE_FLUSHES;
@@ -358,14 +366,16 @@ static void rdn_cache_trim(struct radeon_drm_winsys *ws, bool all)
 
       if (!all && !old && !much)
          continue;
-      if (!rdn_busy_wait(ws, &c->busy, all ? OS_TIMEOUT_INFINITE : 0)) {
-         if (all)
-            continue;
-         break;
-      }
+      if (!rdn_busy_wait(ws, &c->busy, wait ? OS_TIMEOUT_INFINITE : 0))
+         continue;
       rdn_region_free(ws, c->region, c->offset, c->size);
       rdn_cache_drop(ws, c);
    }
+}
+
+static void rdn_cache_trim(struct radeon_drm_winsys *ws, bool all)
+{
+   rdn_cache_reclaim(ws, all, all);
 }
 
 /*
@@ -401,10 +411,10 @@ static void rdn_mem_stats_account(struct radeon_drm_winsys *ws, uint64_t size,
 {
    unsigned c = rdn_size_class(size);
 
+   ws->mem_stats.bytes[region] += sign * (int64_t)size;
    if (!rdn_mem_stats_on())
       return;
-   /* The kext gives memory out at multiples of 4 KB. */
-   ws->mem_stats.bytes[region] += sign * (int64_t)size;
+   /* Whole visible allocations are page-rounded; slabs are accounted separately. */
    ws->mem_stats.count[region] += sign;
    ws->mem_stats.padding[region] += sign * (int64_t)(align64(size, 4096) - size);
    ws->mem_stats.class_bytes[region][c] += sign * (int64_t)size;
@@ -541,6 +551,54 @@ static void *rdn_segment_shadow(struct radeon_drm_winsys *ws, struct rdn_bo *bo,
    return bo->shadow;
 }
 
+static bool rdn_evict_one(struct radeon_drm_winsys *ws)
+{
+   list_for_each_entry(struct rdn_bo, bo, &ws->managed_buffers, managed_link) {
+      if (bo->evicted_storage || bo->last_use.unknown || bo->last_uvd.unknown ||
+          !rdn_busy_wait(ws, &bo->last_use, 0) || !rdn_busy_wait(ws, &bo->last_uvd, 0))
+         continue;
+      void *backing = NULL;
+      int error = ws->dev->managed_evict(ws->dev, bo->managed_alias, bo->managed_size, &backing);
+      if (error) {
+         if (error != -ENOMEM) bo->last_use.unknown = true;
+         continue;
+      }
+      ws->dev->free(ws->dev, bo->offset);
+      bo->evicted_storage = backing;
+      bo->domain = RADEON_DOMAIN_GTT;
+      ws->managed_resident -= bo->managed_size;
+      ws->evictions++;
+      if (rdn_mem_stats_on()) fprintf(stderr, "rdn: evicted live BO %u (%llu bytes), stable VA offset=%llx\n",
+          bo->diagnostic_id, (unsigned long long)bo->managed_size, (unsigned long long)bo->managed_alias);
+      return true;
+   }
+   return false;
+}
+
+static bool rdn_promote_buffer(struct radeon_drm_winsys *ws, struct rdn_bo *bo)
+{
+   if (!bo->managed_alias || !bo->evicted_storage) return true;
+   if (bo->last_use.unknown) return false;
+   if (ws->managed_budget && ws->managed_resident + bo->managed_size > ws->managed_budget)
+      return true;
+   uint64_t physical;
+   if (ws->dev->alloc_hidden(ws->dev, bo->managed_size,
+                             1u << bo->base.alignment_log2, &physical)) return true;
+   if (ws->dev->managed_promote(ws->dev, bo->managed_alias, physical,
+                                bo->managed_size, bo->evicted_storage)) {
+      bo->last_use.unknown = true;
+      return false;
+   }
+   bo->offset = physical;
+   bo->evicted_storage = NULL;
+   bo->domain = RADEON_DOMAIN_VRAM;
+   ws->managed_resident += bo->managed_size;
+   ws->promotions++;
+   if (rdn_mem_stats_on()) fprintf(stderr, "rdn: promoted live BO %u, stable VA offset=%llx\n",
+       bo->diagnostic_id, (unsigned long long)bo->managed_alias);
+   return true;
+}
+
 static struct pb_buffer_lean *
 rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
                   enum radeon_bo_domain domain, enum radeon_bo_flag flags)
@@ -549,6 +607,8 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
    struct rdn_bo *bo = CALLOC_STRUCT(rdn_bo);
    enum rdn_place want;
    int r;
+   int results[RDN_SEGMENT + 1] = {0};
+   unsigned attempted = 0;
 
    if (!bo)
       return NULL;
@@ -581,8 +641,16 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
       want = RDN_GART;
    else
       want = RDN_VISIBLE;
+   bool allow_small = ws->dev->alloc_small && size <= 4096 && alignment <= 4096 &&
+                      (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING) &&
+                      !(flags & RADEON_FLAG_NO_SUBALLOC);
+   bool movable = want == RDN_HIDDEN && !ws->video && size >= 65536 &&
+                  (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING) && ws->dev->managed_alias;
+   if (movable) { size = align64(size, 4096); alignment = MAX2(alignment, 4096); }
+   if (movable && ws->managed_budget)
+      while (ws->managed_resident + align64(size, 4096) > ws->managed_budget && rdn_evict_one(ws)) {}
    r = -1;
-   if (rdn_cache_get(ws, size, alignment, want, &bo->offset)) {
+   if (rdn_cache_get(ws, size, alignment, want, allow_small, &bo->offset)) {
       bo->region = want;
       r = 0;
       ws->mem_stats.cache_hits++;
@@ -596,14 +664,16 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
             rdn_cache_trim(ws, true);
             r = ws->dev->uvd_alloc(ws->dev, size, alignment, &bo->offset);
          }
+         results[RDN_SEGMENT] = r;
+         attempted |= 1u << RDN_SEGMENT;
          if (!r)
             bo->region = RDN_SEGMENT;
       }
       goto placed;
    }
-   for (unsigned attempt = 0; r && attempt < 2; ++attempt) {
+   for (unsigned attempt = 0; r && attempt < 3; ++attempt) {
       if (attempt)
-         rdn_cache_trim(ws, true);
+         rdn_cache_reclaim(ws, true, attempt == 2);
       if (want == RDN_HIDDEN) {
          /* Optional placement probe for the decoder's second segment. */
          const char *fill = getenv("RDN_HIDDEN_FILL_MB");
@@ -619,36 +689,67 @@ rdn_buffer_create(struct radeon_winsys *rws, uint64_t size, unsigned alignment,
       } else if (want == RDN_GART) {
          r = ws->dev->gart_alloc(ws->dev, size, alignment, &bo->offset);
       } else {
-         r = ws->dev->alloc(ws->dev, size, alignment, &bo->offset);
+         if (allow_small) r = ws->dev->alloc_small(ws->dev, size, alignment, &bo->offset);
+         if (r) r = ws->dev->alloc(ws->dev, size, alignment, &bo->offset);
       }
+      results[want] = r;
+      attempted |= 1u << want;
       if (!r)
          bo->region = want;
    }
+   while (r && want == RDN_HIDDEN && ws->dev->managed_alias && rdn_evict_one(ws)) {
+      r = ws->dev->alloc_hidden(ws->dev, size, alignment, &bo->offset);
+      if (!r) bo->region = RDN_HIDDEN;
+   }
    if (r && want != RDN_VISIBLE) {
       r = ws->dev->alloc(ws->dev, size, alignment, &bo->offset);
+      results[RDN_VISIBLE] = r;
+      attempted |= 1u << RDN_VISIBLE;
       if (!r)
          bo->region = RDN_VISIBLE;
    }
-   /* GPU-only tiled storage and shareable video/display buffers stay in VRAM. */
+   /* Initial placement keeps GPU-only and shared storage out of ordinary GART chunks. */
    if (r && want != RDN_GART && !(flags & RADEON_FLAG_NO_CPU_ACCESS) &&
        (flags & RADEON_FLAG_NO_INTERPROCESS_SHARING) && ws->dev->gart_alloc) {
       r = ws->dev->gart_alloc(ws->dev, size, alignment, &bo->offset);
+      results[RDN_GART] = r;
+      attempted |= 1u << RDN_GART;
       if (!r) {
          bo->region = RDN_GART;
          ws->mem_stats.overflowed++;
       }
    }
 placed:
+   if (!r && movable && bo->region == RDN_HIDDEN) {
+      bo->managed_size = align64(size, 4096);
+      if (!ws->dev->managed_alias(ws->dev, bo->offset, bo->managed_size,
+                                  alignment, &bo->managed_alias)) {
+         list_addtail(&bo->managed_link, &ws->managed_buffers);
+         ws->managed_resident += bo->managed_size;
+      }
+   }
    if (!r) {
+      bo->suballocated = bo->region == RDN_VISIBLE && ws->dev->is_small &&
+                         ws->dev->is_small(ws->dev, bo->offset);
       ws->allocated_bytes += size;
       rdn_mem_stats_account(ws, size, bo->region, 1);
+   }
+   if (r) {
+      static const char *names[] = {"visible", "hidden", "GART", "user", "decoder"};
+      fprintf(stderr, "rdn: buffer allocation failed (bytes=%llu align=%u domain=0x%x flags=0x%x, "
+              "this context live=%llu cached=%llu; preferred=%s)\n",
+              (unsigned long long)size, alignment, (unsigned)domain, (unsigned)flags,
+              (unsigned long long)ws->allocated_bytes,
+              (unsigned long long)(ws->cached_bytes[RDN_VISIBLE] + ws->cached_bytes[RDN_HIDDEN] +
+                                  ws->cached_bytes[RDN_GART] + ws->cached_bytes[RDN_SEGMENT]), names[want]);
+      for (unsigned i = 0; i <= RDN_SEGMENT; ++i)
+         if (attempted & (1u << i))
+            fprintf(stderr, "rdn:   %s allocation result=0x%08x\n", names[i], (unsigned)results[i]);
    }
    simple_mtx_unlock(&ws->lock);
    if (r) {
       static bool said;
 
-      fprintf(stderr, "rdn: out of video memory (%llu bytes asked, %llu in use)\n",
-              (unsigned long long)size, (unsigned long long)ws->allocated_bytes);
       /* Again whenever 128 MB more are in use than the last time. */
       static uint64_t said_at;
 
@@ -657,7 +758,7 @@ placed:
       if (rdn_mem_stats_on() && !said) {
          said = true;
          said_at = ws->allocated_bytes;
-         rdn_mem_stats_print("when it ran out");
+         rdn_mem_stats_print("peak snapshot before allocation failure");
       }
       FREE(bo);
       return NULL;
@@ -679,21 +780,48 @@ static void rdn_buffer_destroy(struct radeon_winsys *rws, struct pb_buffer_lean 
 
    if (!rdn_busy_wait(ws, &bo->last_uvd, OS_TIMEOUT_INFINITE))
       return; /* Do not recycle storage with unknown decoder completion. */
+   if (bo->managed_alias) {
+      if (!rdn_busy_wait(ws, &bo->last_use, OS_TIMEOUT_INFINITE)) return;
+      simple_mtx_lock(&ws->lock);
+      if (ws->dev->managed_release(ws->dev, bo->managed_alias,
+                                   bo->managed_size, bo->evicted_storage)) {
+         simple_mtx_unlock(&ws->lock); return;
+      }
+      if (!bo->evicted_storage) {
+         ws->dev->free(ws->dev, bo->offset);
+         ws->managed_resident -= bo->managed_size;
+      }
+      list_del(&bo->managed_link);
+      ws->allocated_bytes -= bo->base.size;
+      rdn_mem_stats_account(ws, bo->base.size, bo->region, -1);
+      simple_mtx_unlock(&ws->lock);
+      FREE(bo);
+      return;
+   }
    if (bo->external_store) {
       if (!rdn_busy_wait(ws, &bo->last_use, OS_TIMEOUT_INFINITE))
          return; /* Keep the allocation pinned if completion is unknown. */
       ws->dev->release_external(ws->dev, bo->external_store);
    }
-   if (bo->user) {
-      /*
-       * The program's memory. The pages must stay behind the GART until
-       * the GPU has read what it was told to; the cache keeps them until
-       * then (nothing is ever handed out from RDN_USER) and unbinds.
-       */
+   if (bo->host_release) {
+      if (!rdn_busy_wait(ws, &bo->last_use, OS_TIMEOUT_INFINITE)) return;
       simple_mtx_lock(&ws->lock);
-      rdn_cache_put(ws, bo->offset, bo->base.size, RDN_USER, &bo->last_use);
-      rdn_cache_trim(ws, false);
+      int error = ws->dev->gart_unbind_user(ws->dev, bo->offset, bo->base.size);
+      if (!error) rdn_mem_stats_account(ws, bo->base.size, RDN_USER, -1);
       simple_mtx_unlock(&ws->lock);
+      if (error) return;
+      bo->host_release(bo->host_lease);
+      FREE(bo);
+      return;
+   }
+   if (bo->user) {
+      /* The caller can reuse its pages as soon as destruction returns. */
+      if (!rdn_busy_wait(ws, &bo->last_use, OS_TIMEOUT_INFINITE)) return;
+      simple_mtx_lock(&ws->lock);
+      int error = ws->dev->gart_unbind_user(ws->dev, bo->offset, bo->base.size);
+      if (!error) rdn_mem_stats_account(ws, bo->base.size, RDN_USER, -1);
+      simple_mtx_unlock(&ws->lock);
+      if (error) return;
    } else if (!bo->foreign) {
       /*
        * The GPU may still be using the memory. Waiting for it here would
@@ -804,6 +932,19 @@ static void rdn_cs_flush_for_map(struct radeon_cmdbuf *rcs, struct rdn_cs *cs, u
       rdn_cs_flush(rcs, flags, NULL);
 }
 
+static void *rdn_map_failed(struct rdn_bo *bo, unsigned usage, const char *reason)
+{
+   static unsigned reports;
+   if (reports++ < 32)
+      fprintf(stderr, "rdn: map failed %s bo=%u place=%u offset=%llx bytes=%llu flags=%x usage=%x write=%u/%u/%u use=%u/%u/%u uvd=%u/%u/%u\n",
+              reason, bo->diagnostic_id, bo->region, (unsigned long long)bo->offset,
+              (unsigned long long)bo->base.size, bo->flags, usage,
+              bo->last_write.number, bo->last_write.used, bo->last_write.unknown,
+              bo->last_use.number, bo->last_use.used, bo->last_use.unknown,
+              bo->last_uvd.number, bo->last_uvd.used, bo->last_uvd.unknown);
+   return NULL;
+}
+
 static void *rdn_buffer_map(struct radeon_winsys *rws, struct pb_buffer_lean *buf,
                             struct radeon_cmdbuf *rcs, enum pipe_map_flags usage)
 {
@@ -812,7 +953,7 @@ static void *rdn_buffer_map(struct radeon_winsys *rws, struct pb_buffer_lean *bu
    struct rdn_cs *cs = rcs ? (struct rdn_cs *)rcs->priv : NULL;
 
    if (bo->region == RDN_HIDDEN)
-      return NULL;
+      return rdn_map_failed(bo, usage, "hidden storage");
    if (!(usage & PIPE_MAP_UNSYNCHRONIZED)) {
       /* Reading needs pending writes done; writing needs every use done. */
       unsigned conflicts = (usage & PIPE_MAP_WRITE) ? RADEON_USAGE_READWRITE
@@ -823,18 +964,18 @@ static void *rdn_buffer_map(struct radeon_winsys *rws, struct pb_buffer_lean *bu
       if (usage & PIPE_MAP_DONTBLOCK) {
          if (cs && rdn_cs_is_buffer_referenced(rcs, buf, conflicts)) {
             rdn_cs_flush_for_map(rcs, cs, RADEON_FLUSH_ASYNC_START_NEXT_GFX_IB_NOW);
-            return NULL;
+            return rdn_map_failed(bo, usage, "nonblocking flush");
          }
          if (!rdn_buffer_wait(rws, buf, 0, wait_usage))
-            return NULL;
+            return rdn_map_failed(bo, usage, "nonblocking fence");
       } else {
          if (cs && rdn_cs_is_buffer_referenced(rcs, buf, conflicts)) {
             rdn_cs_flush_for_map(rcs, cs, RADEON_FLUSH_START_NEXT_GFX_IB_NOW);
             if (rdn_cs_is_buffer_referenced(rcs, buf, conflicts))
-               return NULL;
+               return rdn_map_failed(bo, usage, "flush retained references");
          }
          if (!rdn_buffer_wait(rws, buf, OS_TIMEOUT_INFINITE, wait_usage))
-            return NULL;
+            return rdn_map_failed(bo, usage, "fence wait");
       }
       /* The aperture's cache of host accesses; system memory has none. */
       if (bo->region != RDN_GART && bo->region != RDN_SEGMENT)
@@ -864,12 +1005,30 @@ static void rdn_buffer_set_metadata(struct radeon_winsys *rws, struct pb_buffer_
 {
 }
 
+static struct pb_buffer_lean *rdn_buffer_from_ptr(struct radeon_winsys *, void *,
+                                                 uint64_t, enum radeon_bo_flag);
+
 static struct pb_buffer_lean *
 rdn_buffer_from_handle(struct radeon_winsys *rws, struct winsys_handle *whandle,
                        unsigned vm_alignment, bool is_prime_linear_buffer)
 {
    struct radeon_drm_winsys *ws = rdn_winsys(rws);
    struct rdn_bo *bo;
+
+   if (whandle->type == WINSYS_HANDLE_TYPE_KMS &&
+       whandle->handle == RDN_WINSYS_HANDLE_HOST) {
+      struct rdn_host_import *host = (struct rdn_host_import *)whandle->name;
+      if (!host || !host->pages || !host->release || !whandle->size ||
+          ((uintptr_t)host->pages & 4095) || (whandle->size & 4095)) return NULL;
+      struct pb_buffer_lean *buffer = rdn_buffer_from_ptr(rws, host->pages, whandle->size,
+                                                        RADEON_FLAG_NO_INTERPROCESS_SHARING);
+      if (buffer) {
+         rdn_bo(buffer)->host_lease = host->lease;
+         rdn_bo(buffer)->host_release = host->release;
+         host->accepted = 1;
+      }
+      return buffer;
+   }
 
    bool screen = whandle->handle == RDN_WINSYS_HANDLE_SCREEN;
 
@@ -918,6 +1077,7 @@ rdn_buffer_from_ptr(struct radeon_winsys *rws, void *pointer, uint64_t size,
    bo->diagnostic_id = p_atomic_inc_return(&rdn_next_diagnostic_id);
    simple_mtx_lock(&ws->lock);
    r = ws->dev->gart_bind_user(ws->dev, pointer, size, &bo->offset);
+   if (!r) rdn_mem_stats_account(ws, size, RDN_USER, 1);
    simple_mtx_unlock(&ws->lock);
    if (r) {
       FREE(bo);
@@ -937,6 +1097,11 @@ rdn_buffer_from_ptr(struct radeon_winsys *rws, void *pointer, uint64_t size,
 static bool rdn_buffer_false(struct pb_buffer_lean *buf)
 {
    return false;
+}
+
+static bool rdn_buffer_is_suballocated(struct pb_buffer_lean *buf)
+{
+   return rdn_bo(buf)->suballocated;
 }
 
 static bool rdn_buffer_is_user_ptr(struct pb_buffer_lean *buf)
@@ -962,6 +1127,8 @@ static uint64_t rdn_buffer_get_virtual_address(struct pb_buffer_lean *buf)
    extern uint64_t rdn_vram_gpu_base;
    extern uint64_t rdn_gart_gpu_base;
 
+   if (rdn_bo(buf)->managed_alias)
+      return rdn_gart_gpu_base + rdn_bo(buf)->managed_alias;
    if (rdn_bo(buf)->region == RDN_GART)
       return rdn_gart_gpu_base + rdn_bo(buf)->offset;
    return rdn_vram_gpu_base + rdn_bo(buf)->offset;
@@ -1003,11 +1170,14 @@ static enum pipe_reset_status
 rdn_ctx_query_reset_status(struct radeon_winsys_ctx *ctx, bool full_reset_only,
                            bool *needs_reset, bool *reset_completed)
 {
+   struct radeon_drm_winsys *ws = (struct radeon_drm_winsys *)ctx;
+   bool fault = ws->dev->graphics_fault && ws->dev->graphics_fault(ws->dev) > 0;
    if (needs_reset)
-      *needs_reset = false;
+      *needs_reset = fault;
    if (reset_completed)
       *reset_completed = false;
-   return PIPE_NO_RESET;
+   /* The fault is card-wide; the kernel has not attributed or recovered it. */
+   return fault ? PIPE_UNKNOWN_CONTEXT_RESET : PIPE_NO_RESET;
 }
 
 static bool rdn_cs_create(struct radeon_cmdbuf *rcs, struct radeon_winsys_ctx *ctx,
@@ -1239,7 +1409,8 @@ static void rdn_reap_ibs(struct radeon_drm_winsys *ws, bool wait)
    list_for_each_entry_safe(struct rdn_pending_ib, ib, &ws->pending_ibs, list) {
       if (!rdn_busy_wait(ws, &ib->busy, wait ? OS_TIMEOUT_INFINITE : 0))
          break;
-      rdn_cache_put(ws, ib->offset, ib->size, RDN_VISIBLE, &ib->busy);
+      if (ws->dev->alloc_command) ws->dev->free(ws->dev, ib->offset);
+      else rdn_cache_put(ws, ib->offset, ib->size, RDN_VISIBLE, &ib->busy);
       list_del(&ib->list);
       FREE(ib);
    }
@@ -1251,7 +1422,7 @@ static void rdn_reap_ibs(struct radeon_drm_winsys *ws, bool wait)
  */
 #define RDN_MAX_PENDING_IBS 4
 
-static void rdn_throttle(struct radeon_drm_winsys *ws)
+static int rdn_throttle(struct radeon_drm_winsys *ws)
 {
    for (;;) {
       struct rdn_pending_ib *oldest = NULL;
@@ -1263,10 +1434,10 @@ static void rdn_throttle(struct radeon_drm_winsys *ws)
          pending++;
       }
       if (pending < RDN_MAX_PENDING_IBS)
-         return;
-      /* A wait that timed out must not keep us here. */
+         return 0;
+      /* Do not enqueue more work when the oldest submission cannot retire. */
       if (!rdn_busy_wait(ws, &oldest->busy, OS_TIMEOUT_INFINITE))
-         return;
+         return -EIO;
       rdn_reap_ibs(ws, false);
    }
 }
@@ -1281,8 +1452,15 @@ static int rdn_ib_alloc(struct radeon_drm_winsys *ws, uint64_t size, uint64_t *o
 
    rdn_reap_ibs(ws, false);
    rdn_cache_trim(ws, false);
-   rdn_throttle(ws);
-   r = rdn_cache_get(ws, size, 4096, RDN_VISIBLE, offset) ? 0 :
+   r = rdn_throttle(ws);
+   if (r)
+      return r;
+   if (ws->dev->alloc_command) {
+      r = ws->dev->alloc_command(ws->dev, size, 4096, offset);
+      if (r) { rdn_reap_ibs(ws, true); r = ws->dev->alloc_command(ws->dev, size, 4096, offset); }
+      return r;
+   }
+   r = rdn_cache_get(ws, size, 4096, RDN_VISIBLE, false, offset) ? 0 :
        ws->dev->alloc(ws->dev, size, 4096, offset);
    if (r) {
       /* Wait for the earlier ones to finish and try once more. */
@@ -1862,7 +2040,9 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    uint32_t *traced = NULL;
    unsigned submit_words;
    const char *trace_mode = getenv("RDN_CAPTURE_MARKERS");
-   bool trace_complete = trace_mode && !strcmp(trace_mode, "complete");
+   enum rdn_trace_mode marker_mode = trace_mode && !strcmp(trace_mode, "complete") ?
+      RDN_TRACE_COMPLETE : trace_mode && !strcmp(trace_mode, "retire") ?
+      RDN_TRACE_RETIRE : RDN_TRACE_CP;
    bool submit_attempted = false;
    int r;
 
@@ -1872,6 +2052,19 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
       rdn_cs_fail_fence(cs, pfence);
       return -EIO;
    }
+
+   simple_mtx_lock(&ws->lock);
+   bool resident = true;
+   for (unsigned i = 0; i < cs->num_buffers; ++i) {
+      struct rdn_bo *bo = cs->buffers[i].bo;
+      if (!rdn_promote_buffer(ws, bo)) { resident = false; break; }
+      if (bo->managed_alias) {
+         list_del(&bo->managed_link);
+         list_addtail(&bo->managed_link, &ws->managed_buffers);
+      }
+   }
+   simple_mtx_unlock(&ws->lock);
+   if (!resident) { rdn_cs_fail_fence(cs, pfence); return -EIO; }
 
    /* Pad to 8 words, as the command processor fetches (radeon_drm_cs.c). */
    while (rcs->current.cdw & 7)
@@ -1902,7 +2095,7 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
    /* In steps of 64 KB, so that the cache has one of the size again. */
    submit_words = rcs->current.cdw;
    if (getenv("RDN_CAPTURE_DIR") && trace_mode) {
-      size_t count = rdn_trace_words(rcs->current.buf, rcs->current.cdw, trace_complete);
+      size_t count = rdn_trace_words(rcs->current.buf, rcs->current.cdw, marker_mode);
 
       if (count) {
          traced = MALLOC(count * 4);
@@ -1922,7 +2115,7 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
          marker_offset = offset + ib_size - 256;
          if (rdn_trace_encode(rcs->current.buf, rcs->current.cdw, traced,
                               submit_words, ws->dev->info.vram_gpu_base + marker_offset,
-                              trace_complete)) {
+                              marker_mode)) {
             *(uint32_t *)((uint8_t *)ws->dev->aperture + marker_offset) = 0;
             words = traced;
          } else {
@@ -1938,6 +2131,8 @@ static int rdn_cs_flush(struct radeon_cmdbuf *rcs, unsigned flags,
        */
       memcpy((uint8_t *)ws->dev->aperture + offset, words, submit_words * 4);
       FILE *capture = rdn_capture_submission(rcs, offset, words, submit_words, marker_offset);
+      /* Publish aperture writes on this CPU before the submission can migrate. */
+      __sync_synchronize();
       submit_attempted = true;
       r = ws->dev->submit(ws->dev, offset, submit_words, &fence->number);
       rdn_capture_result(capture, r, r ? 0 : fence->number);
@@ -2031,18 +2226,31 @@ static uint64_t rdn_query_value(struct radeon_winsys *rws, enum radeon_value_id 
 {
    struct radeon_drm_winsys *ws = rdn_winsys(rws);
 
+   if (value == RADEON_NUM_GFX_IBS) return ws->num_flushes;
+   if (value == RADEON_TIMESTAMP) return os_time_get_nano();
+   simple_mtx_lock(&ws->lock);
+   uint64_t evicted = 0, result = 0;
+   list_for_each_entry(struct rdn_bo, bo, &ws->managed_buffers, managed_link)
+      if (bo->evicted_storage) evicted += bo->managed_size;
+   uint64_t visible = ws->mem_stats.bytes[RDN_VISIBLE] + ws->cached_bytes[RDN_VISIBLE];
+   uint64_t vram = visible + ws->mem_stats.bytes[RDN_HIDDEN] + ws->cached_bytes[RDN_HIDDEN] +
+                  ws->mem_stats.bytes[RDN_SEGMENT] + ws->cached_bytes[RDN_SEGMENT];
+   uint64_t gtt = ws->mem_stats.bytes[RDN_GART] + ws->cached_bytes[RDN_GART] +
+                 ws->mem_stats.bytes[RDN_USER] + ws->cached_bytes[RDN_USER];
+   /* Local owned storage; imported display surfaces belong to WindowServer. */
    switch (value) {
-   case RADEON_VRAM_USAGE:
-   case RADEON_REQUESTED_VRAM_MEMORY:
-   case RADEON_MAPPED_VRAM:
-      return ws->allocated_bytes;
-   case RADEON_NUM_GFX_IBS:
-      return ws->num_flushes;
-   case RADEON_TIMESTAMP:
-      return os_time_get_nano();
-   default:
-      return 0;
+   case RADEON_REQUESTED_VRAM_MEMORY: result = vram; break;
+   case RADEON_REQUESTED_GTT_MEMORY: result = gtt; break;
+   case RADEON_VRAM_USAGE: result = vram - evicted; break;
+   case RADEON_GTT_USAGE: result = gtt + evicted; break;
+   case RADEON_VRAM_VIS_USAGE:
+   case RADEON_MAPPED_VRAM: result = visible; break;
+   case RADEON_MAPPED_GTT: result = gtt + evicted; break;
+   case RADEON_NUM_EVICTIONS: result = ws->evictions; break;
+   default: break;
    }
+   simple_mtx_unlock(&ws->lock);
+   return result;
 }
 
 static bool rdn_read_registers(struct radeon_winsys *rws, unsigned reg_offset,
@@ -2075,7 +2283,7 @@ static void rdn_winsys_destroy(struct radeon_winsys *rws)
 }
 
 /* What do_winsys_init() in radeon_drm_winsys.c derives for an Evergreen card. */
-static void rdn_init_info(struct radeon_drm_winsys *ws)
+static bool rdn_init_info(struct radeon_drm_winsys *ws)
 {
    const struct rdn_device_info *dev = &ws->dev->info;
    struct radeon_info *info = &ws->info;
@@ -2089,29 +2297,41 @@ static void rdn_init_info(struct radeon_drm_winsys *ws)
    info->is_amdgpu = false;
 
    info->pci_id = dev->pci_device_id;
-   info->family = CHIP_TURKS;
-   info->gfx_level = EVERGREEN;
+   const enum rdn_family family = rdn_family_from_device(dev->pci_device_id);
+   const struct rdn_family_caps *caps = rdn_family_caps(family);
+   switch (family) {
+   case RDN_FAMILY_TURKS: info->family = CHIP_TURKS; break;
+   case RDN_FAMILY_CAYMAN: info->family = CHIP_CAYMAN; break;
+   case RDN_FAMILY_BARTS: info->family = CHIP_BARTS; break;
+   case RDN_FAMILY_CAICOS: info->family = CHIP_CAICOS; break;
+   case RDN_FAMILY_REDWOOD: info->family = CHIP_REDWOOD; break;
+   case RDN_FAMILY_CEDAR: info->family = CHIP_CEDAR; break;
+   case RDN_FAMILY_JUNIPER: info->family = CHIP_JUNIPER; break;
+   case RDN_FAMILY_CYPRESS: info->family = CHIP_CYPRESS; break;
+   case RDN_FAMILY_ARUBA: info->family = CHIP_ARUBA; break;
+   default: return false;
+   }
+   switch (caps->gfx_level) {
+   case 4: info->gfx_level = EVERGREEN; break;
+   case 5: info->gfx_level = CAYMAN; break;
+   default: return false;
+   }
    ws->gen = DRV_R600;
-   info->has_dedicated_vram = true;
+   info->has_dedicated_vram = !caps->integrated;
 
    info->ip[AMD_IP_GFX].num_queues = 1;
-   info->ip[AMD_IP_GFX].ver_major = 5;
+   info->ip[AMD_IP_GFX].ver_major = caps->gfx_level;
    info->ip[AMD_IP_GFX].ib_alignment = 4096;
    info->ip[AMD_IP_SDMA].num_queues = 0;
    /* r600 offers the decoder when this is not 0. */
    info->ip[AMD_IP_UVD].num_queues = ws->dev->uvd_submit ? 1 : 0;
 
    info->has_userptr = ws->dev->gart_bind_user != NULL;
-   /*
-    * There is no GART, but r600 measures what one command buffer may
-    * reference and what texture transfers may allocate against this size.
-    * With zero it flushes on every draw (radeon_cs_memory_below_limit).
-    * Buffers it asks for in the GTT domain come from video memory too.
-    */
-   info->gart_size_kb = vram_kb;
+   /* Without GART, GTT requests still consume the visible heap. */
+   info->gart_size_kb = dev->gart_size ? dev->gart_size / 1024 : vram_kb;
    info->vram_size_kb = vram_kb + hidden_kb;
    info->vram_vis_size_kb = vram_kb;
-   info->max_heap_size_kb = vram_kb;
+   info->max_heap_size_kb = info->vram_size_kb;
    info->gart_page_size = 4096;
    info->min_alloc_size = 4096;
    info->pte_fragment_size = 64 * 1024;
@@ -2144,14 +2364,22 @@ static void rdn_init_info(struct radeon_drm_winsys *ws)
    info->tcc_cache_line_size = 64;
    info->has_graphics = true;
    info->has_image_opcodes = true;
+   return true;
 }
 
 struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
                                         const struct pipe_screen_config *config,
                                         rdn_screen_create_t screen_create)
 {
-   struct radeon_drm_winsys *ws = CALLOC_STRUCT(radeon_drm_winsys);
+   struct radeon_drm_winsys *ws;
 
+   if (!rdn_family_has_acceleration(rdn_family_from_device(dev->info.pci_device_id))) {
+      fprintf(stderr, "RadeonNI: no accelerated profile for PCI device 0x%04x\n",
+              dev->info.pci_device_id);
+      dev->destroy(dev);
+      return NULL;
+   }
+   ws = CALLOC_STRUCT(radeon_drm_winsys);
    if (!ws) {
       dev->destroy(dev);
       return NULL;
@@ -2160,6 +2388,9 @@ struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
    pipe_reference_init(&ws->reference, 1);
    simple_mtx_init(&ws->lock, mtx_plain);
    list_inithead(&ws->pending_ibs);
+   list_inithead(&ws->managed_buffers);
+   const char *budget = getenv("RDN_VRAM_BUDGET_MB");
+   if (budget) ws->managed_budget = strtoull(budget, NULL, 10) << 20;
    if (rdn_mem_stats_on()) {
       static bool registered;
 
@@ -2172,7 +2403,8 @@ struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
       list_inithead(&ws->cache_buckets[b]);
    rdn_vram_gpu_base = dev->info.vram_gpu_base;
    rdn_gart_gpu_base = dev->info.gart_gpu_base;
-   rdn_init_info(ws);
+   if (!rdn_init_info(ws))
+      goto fail;
 
    rdn_shim_device_id = dev->info.pci_device_id;
    rdn_shim_tiling_config = dev->info.tile_config;
@@ -2200,7 +2432,7 @@ struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
    ws->base.buffer_from_handle = rdn_buffer_from_handle;
    ws->base.buffer_from_ptr = rdn_buffer_from_ptr;
    ws->base.buffer_is_user_ptr = rdn_buffer_is_user_ptr;
-   ws->base.buffer_is_suballocated = rdn_buffer_false;
+   ws->base.buffer_is_suballocated = rdn_buffer_is_suballocated;
    ws->base.buffer_get_handle = rdn_buffer_get_handle;
    ws->base.buffer_commit = rdn_buffer_commit;
    ws->base.buffer_get_virtual_address = rdn_buffer_get_virtual_address;

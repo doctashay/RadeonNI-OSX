@@ -13,6 +13,7 @@
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include "rdn_user.h"
+#include "rdn_probe_device.h"
 
 int main(int argc, char **argv)
 {
@@ -24,14 +25,13 @@ int main(int argc, char **argv)
 	uint32_t version = 0;
 	int status = 0, result = 1;
 	kern_return_t kr;
-	int initialize = argc == 2 && !strcmp(argv[1], "init");
+	int initialize = argc >= 2 && !strcmp(argv[1], "init");
 
-	if (argc > 2 || (argc == 2 && !initialize && strcmp(argv[1], "info"))) {
-		fprintf(stderr, "usage: %s [info|init]\n", argv[0]);
+	if (argc > 3 || (argc >= 2 && !initialize && strcmp(argv[1], "info"))) {
+		fprintf(stderr, "usage: %s [info|init] [PCI_DEVICE_HEX]\n", argv[0]);
 		return 2;
 	}
-	service = IOServiceGetMatchingService(kIOMasterPortDefault,
-		IOServiceMatching(RDN_UC_SERVICE_CLASS));
+	service = rdn_probe_device(argc == 3 ? argv[2] : 0);
 	if (!service) {
 		fprintf(stderr, "RadeonNI accelerator is not available\n");
 		return 1;

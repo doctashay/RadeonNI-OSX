@@ -79,13 +79,52 @@ static const uint32_t turks_io_mc_regs[BTC_IO_MC_REGS_SIZE][2] = {
 	{0x0000009f, 0x00936a00}
 };
 
+static const uint32_t cayman_io_mc_regs[BTC_IO_MC_REGS_SIZE][2] = {
+	{0x00000077, 0xff010100},
+	{0x00000078, 0x00000000},
+	{0x00000079, 0x00001434},
+	{0x0000007a, 0xcc08ec08},
+	{0x0000007b, 0x00040000},
+	{0x0000007c, 0x000080c0},
+	{0x0000007d, 0x09000000},
+	{0x0000007e, 0x00210404},
+	{0x00000081, 0x08a8e800},
+	{0x00000082, 0x00030444},
+	{0x00000083, 0x00000000},
+	{0x00000085, 0x00000001},
+	{0x00000086, 0x00000002},
+	{0x00000087, 0x48490000},
+	{0x00000088, 0x20244647},
+	{0x00000089, 0x00000005},
+	{0x0000008b, 0x66030000},
+	{0x0000008c, 0x00006603},
+	{0x0000008d, 0x00000100},
+	{0x0000008f, 0x00001c0a},
+	{0x00000090, 0xff000001},
+	{0x00000094, 0x00101101},
+	{0x00000095, 0x00000fff},
+	{0x00000096, 0x00116fff},
+	{0x00000097, 0x60010000},
+	{0x00000098, 0x10010000},
+	{0x00000099, 0x00006000},
+	{0x0000009a, 0x00001000},
+	{0x0000009f, 0x00976b00}
+};
+
 int rdn_mc_load_microcode(struct rdn_card *card, const void *fw, size_t size)
 {
 	const uint8_t *p = fw;
 	uint32_t mem_type, running;
 	int i;
+	const uint32_t (*regs)[2];
+	uint32_t words = rdn_family_caps(card->family)->mc_words;
 
-	if (!fw || size != RDN_MC_UCODE_WORDS * 4)
+	switch (card->family) {
+	case RDN_FAMILY_TURKS: regs = turks_io_mc_regs; break;
+	case RDN_FAMILY_CAYMAN: regs = cayman_io_mc_regs; break;
+	default: return -EINVAL;
+	}
+	if (!fw || size != words * 4)
 		return -EINVAL;
 
 	mem_type = (rdn_rreg(card, MC_SEQ_MISC0) & MC_SEQ_MISC0_GDDR5_MASK) >>
@@ -100,11 +139,11 @@ int rdn_mc_load_microcode(struct rdn_card *card, const void *fw, size_t size)
 
 	/* load mc io regs */
 	for (i = 0; i < BTC_IO_MC_REGS_SIZE; i++) {
-		rdn_wreg(card, MC_SEQ_IO_DEBUG_INDEX, turks_io_mc_regs[i][0]);
-		rdn_wreg(card, MC_SEQ_IO_DEBUG_DATA, turks_io_mc_regs[i][1]);
+		rdn_wreg(card, MC_SEQ_IO_DEBUG_INDEX, regs[i][0]);
+		rdn_wreg(card, MC_SEQ_IO_DEBUG_DATA, regs[i][1]);
 	}
 	/* load the MC ucode: big-endian words in the file */
-	for (i = 0; i < RDN_MC_UCODE_WORDS; i++, p += 4)
+	for (i = 0; i < (int)words; i++, p += 4)
 		rdn_wreg(card, MC_SEQ_SUP_PGM,
 			 ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
 			 ((uint32_t)p[2] << 8) | p[3]);
@@ -178,6 +217,8 @@ static void reloc_wait_idle(struct rdn_card *card)
 
 int rdn_mc_relocate(struct rdn_card *card, uint64_t new_base)
 {
+	if (!rdn_family_has_acceleration(card->family))
+		return -EINVAL;
 	uint32_t old_loc = rdn_rreg(card, MC_RELOC_FB_LOCATION);
 	uint64_t old_base = (uint64_t)(old_loc & 0xffff) << 24;
 	uint64_t size = (uint64_t)rdn_rreg(card, MC_RELOC_CONFIG_MEMSIZE) << 20;
@@ -196,7 +237,7 @@ int rdn_mc_relocate(struct rdn_card *card, uint64_t new_base)
 	vga_render = rdn_rreg(card, MC_RELOC_VGA_RENDER_CONTROL);
 	vga_hdp = rdn_rreg(card, MC_RELOC_VGA_HDP_CONTROL);
 	rdn_wreg(card, MC_RELOC_VGA_RENDER_CONTROL, 0);
-	for (i = 0; i < RDN_NUM_CRTC; i++) {
+	for (i = 0; i < rdn_crtc_count(card); i++) {
 		uint32_t off = reloc_crtc[i];
 
 		if (!(rdn_rreg(card, MC_RELOC_CRTC_CONTROL + off) & MC_RELOC_CRTC_MASTER_EN))
@@ -244,7 +285,7 @@ int rdn_mc_relocate(struct rdn_card *card, uint64_t new_base)
 	reloc_wait_idle(card);
 
 	/* evergreen_mc_resume(): the display controllers' surfaces at the new base, then let the MC and the CPU back */
-	for (i = 0; i < RDN_NUM_CRTC; i++) {
+	for (i = 0; i < rdn_crtc_count(card); i++) {
 		rdn_wreg(card, MC_RELOC_GRPH_PRIMARY_HIGH + reloc_crtc[i], (uint32_t)(new_base >> 32));
 		rdn_wreg(card, MC_RELOC_GRPH_SECONDARY_HIGH + reloc_crtc[i], (uint32_t)(new_base >> 32));
 		rdn_wreg(card, MC_RELOC_GRPH_PRIMARY + reloc_crtc[i], (uint32_t)new_base);
@@ -271,7 +312,7 @@ void rdn_display_hold(struct rdn_card *card, bool hold)
 {
 	unsigned i;
 
-	for (i = 0; i < RDN_NUM_CRTC; i++) {
+	for (i = 0; i < rdn_crtc_count(card); i++) {
 		uint32_t off = reloc_crtc[i], tmp = rdn_rreg(card, MC_RELOC_CRTC_CONTROL + off);
 
 		if (!(tmp & MC_RELOC_CRTC_MASTER_EN))

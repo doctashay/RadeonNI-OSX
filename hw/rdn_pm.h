@@ -17,6 +17,7 @@
 #define RDN_PM_H
 
 #include "rdn_card.h"
+#include "rdn_user.h"
 
 struct rdn_pm_state {
 	uint32_t sclk;		/* engine clock, 10 kHz units */
@@ -24,6 +25,16 @@ struct rdn_pm_state {
 	uint16_t vddc;		/* core voltage in mV; 0 leaves it alone */
 	uint16_t vddci;		/* I/O voltage in mV; 0 leaves it alone */
 };
+
+#define RDN_PM_BIOS_LEVELS 8
+enum rdn_pm_bios_kind { RDN_PM_BIOS_PERFORMANCE, RDN_PM_BIOS_VIDEO, RDN_PM_BIOS_ULV };
+struct rdn_pm_bios_state {
+ struct rdn_pm_state level[RDN_PM_BIOS_LEVELS];
+ uint32_t count, caps, vclk, dclk;
+ uint16_t classification, classification2;
+};
+int rdn_pm_bios_state(struct rdn_card *, enum rdn_pm_bios_kind, struct rdn_pm_bios_state *);
+int rdn_pm_fan_percent(struct rdn_card *, unsigned percent);
 
 /* What rdn_pm_set() may change. */
 #define RDN_PM_VOLTAGE		(1 << 0)
@@ -40,8 +51,23 @@ int rdn_pm_boot_state(struct rdn_card *card, struct rdn_pm_state *state);
  */
 int rdn_pm_performance_state(struct rdn_card *card, struct rdn_pm_state *state);
 
+int rdn_pm_idle_state(struct rdn_card *card, struct rdn_pm_state *state);
+
+/* Select a BIOS UI state without changing the current memory clock. */
+int rdn_pm_display_idle_state(struct rdn_card *card, uint32_t mclk,
+			      struct rdn_pm_state *state);
+
+/* Resolve NI virtual voltage IDs before applying a clock state. */
+int rdn_pm_resolve_state(struct rdn_card *card, struct rdn_pm_state *state);
+
 /* Log every state and clock mode of the PowerPlay table. */
 void rdn_pm_log_states(struct rdn_card *card);
+
+/* GDDR5 clock changes require its running memory sequencer. */
+bool rdn_pm_memory_clock_ready(struct rdn_card *card);
+
+/* Limited DDR3 tuning; the returned state retains the BIOS voltages. */
+int rdn_pm_tuning_state(struct rdn_card *,unsigned core_mhz,unsigned memory_mhz,struct rdn_pm_state *);
 
 /* The clocks the card runs at now, as the VBIOS reads them back. */
 int rdn_pm_get_clocks(struct rdn_card *card, uint32_t *sclk, uint32_t *mclk);
@@ -54,6 +80,10 @@ int rdn_pm_get_clocks(struct rdn_card *card, uint32_t *sclk, uint32_t *mclk);
  */
 int rdn_pm_set(struct rdn_card *card, const struct rdn_pm_state *from,
 	       const struct rdn_pm_state *to, unsigned what);
+
+/* Request the Cayman fan controller's configured maximum PWM. */
+int rdn_pm_fan_full(struct rdn_card *card);
+void rdn_pm_board_sensors(struct rdn_card *card, struct rdn_user_board_sensors *out);
 
 /* The GPU's own temperature sensor, in thousandths of a degree Celsius. */
 int rdn_pm_temperature(struct rdn_card *card);

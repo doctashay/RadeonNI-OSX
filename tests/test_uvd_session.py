@@ -2,6 +2,8 @@
 import os,pathlib,shlex,subprocess,tempfile,unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 PREFIX=r"""
+#define RDN_LEOPARD 1
+#define OSDefineMetaClassAndStructors(x,y)
 #include <cassert>
 #include <cstdio>
 #include <cstdarg>
@@ -12,6 +14,8 @@ PREFIX=r"""
 #include <mutex>
 #include <string>
 #include <vector>
+#include <map>
+#include <set>
 #include <atomic>
 #include <thread>
 #include <condition_variable>
@@ -32,6 +36,8 @@ enum { kIOReturnSuccess,kIOReturnBadArgument,kIOReturnNotReady,kIOReturnNoMemory
 kIOReturnUnsupported,kIOReturnVMError,kIOReturnBusy,kIOReturnNoResources,kIOReturnIOError,kIOReturnNotPermitted };
 enum { kIODirectionInOut=3,kIOMapDefaultCache=0,kIOMapCacheMask=0xf00,kIOMapReadOnly=0x1000 };
 struct Calls {
+ std::map<void*,uint64_t> gartMappings;
+ std::set<UInt32> firmwareHandles;
  std::vector<std::string> feedbackLogs,timingLogs,failureLogs,memoryLogs; UInt64 clockReads=0;
  UInt32 feedbackStatus=0;bool staleFeedback=false;
  int alloc=0,freed=0,submits=0,polls=0,sleeps=0,wake=0,idle=0;
@@ -64,7 +70,7 @@ void IOLog(const char *format,...){
  assert(!gfxDepth&&uvdDepth==1);
  char buffer[512];va_list args;va_start(args,format);
  int n=vsnprintf(buffer,sizeof(buffer),format,args);va_end(args);
- assert(n>0&&unsigned(n)<sizeof(buffer));
+ assert(n>0&&unsigned(n)<sizeof(buffer));if(strstr(format,"create failed"))fprintf(stderr,"%s",buffer);
  if(strstr(format,"UVD memory"))calls.memoryLogs.push_back(buffer);else if(strstr(format,"create failed"))calls.failureLogs.push_back(buffer);else if(strstr(format,"timing"))calls.timingLogs.push_back(buffer);else calls.feedbackLogs.push_back(buffer);
 }
 void clock_get_uptime(UInt64 *value){*value=++calls.clockReads*1000;}
@@ -122,7 +128,7 @@ public:
   if(calls.badSegment==3)--s->fLength;if(calls.badSegment==4)++s->fIOVMAddr;
   return 0;
  }
- IOReturn clearMemoryDescriptor(){assert(!gfxDepth&&!calls.cpInflight&&calls.gartAlloc==calls.gartFree);++calls.dmaClear;if(calls.failDMA==3)return kIOReturnVMError;if(memory){memory->release();memory=nullptr;}return 0;}
+ IOReturn clearMemoryDescriptor(){assert(!gfxDepth&&!calls.cpInflight&&!calls.gartMappings.count(memory));++calls.dmaClear;if(calls.failDMA==3)return kIOReturnVMError;if(memory){memory->release();memory=nullptr;}return 0;}
  void release(){assert(!memory);++calls.dmaRelease;delete this;}
 };
 #define OSDeclareDefaultStructors(x)
@@ -133,8 +139,14 @@ public:
  Service fb,provider; Service *fFramebuffer=&fb,*fUvdProvider=&provider;
  IOLock gfx{true},uvd{false}; IOLock *fLock=&gfx,*fUvdLock=&uvd;
  bool fRetiring=false,fEngineUp=true,fVideoBusy=false;
+ UInt32 fVideoStagingOffset=0,fVideoStagingBytes=0;
+ void videoReserveStaging();
+ int prepareVideoPower(bool locked){assert(!locked&&!gfxDepth);return 0;}
+ UInt64 gartAddress(UInt32 offset) const { return rdn_gart_gpu_start(&fAccel)+offset; }
  rdn_accel fAccel{}; rdn_mem fMem{},fHidden{},fGartSpace{}; rdn_gart fGart{}; rdn_uvd fUvd{};
  UInt32 fUvdState=1,fUvdUsers=0,fUvdLive=0,fUvdScratch=0; SInt32 fUvdError=0;
+ RadeonNIVideoSession *fVideoSessions[10]{}; UInt32 fVideoSessionCount=0;
+ RadeonNIVideoSession *videoFind(RadeonNIVideoUserClient*);
  RadeonNIVideoSession *fVideoSession=nullptr; UInt64 fVideoEpoch=0;
  volatile UInt32 fVideoCpuBytes=0; unsigned refs=1;
  UInt32 fHiddenOffset=0x10000000,fHiddenSize=128*1024*1024;
@@ -177,10 +189,10 @@ RadeonNIAccel::RadeonNIAccel():aperture(64*1024*1024/4),hidden(fHiddenSize/4) {
  assert(!rdn_mem_init(&fHidden,&heapOS,fHiddenOffset,fHiddenSize));fGart.ready=true; fAccel.aperture=aperture.data();fAccel.aperture_size=aperture.size()*4;
  fUvd.guarded=true;fUvd.ready=true;fUvd.vcpu_gpu=0x100000;fUvd.vcpu_bytes=0x80000;fUvd.ring_gpu=0x200000;fUvd.ring_words=1024;
 }
-RadeonNIAccel::~RadeonNIAccel(){videoClose(nullptr);if(fVideoSession){calls.inflight=calls.cpInflight=false;if(fVideoSession->readbackDMA){calls.gartFree=calls.gartAlloc;calls.failDMA=0;fVideoSession->readbackDMA->clearMemoryDescriptor();fVideoSession->readbackDMA->release();}if(fVideoSession->readback){fVideoSession->readback->complete();fVideoSession->readback->release();}IOFree(fVideoSession,sizeof(*fVideoSession));fVideoSession=nullptr;}assert(!fVideoCpuBytes&&refs==1);rdn_mem_fini(&fMem);rdn_mem_fini(&fHidden);}
-extern "C" int rdn_mem_alloc(rdn_mem *mem,uint64_t bytes,uint64_t align,uint64_t *out){assert(gfxDepth==1&&align==4096);if(mem==&active->fGartSpace){++calls.gartAlloc;*out=4096;return 0;}++calls.alloc;if(calls.allocFail)return -ENOMEM;return actual_mem_alloc(mem,bytes,align,out);}
+RadeonNIAccel::~RadeonNIAccel(){videoClose(nullptr);if(fVideoSession){calls.inflight=calls.cpInflight=false;if(fVideoSession->readbackDMA){calls.gartFree=calls.gartAlloc;calls.gartMappings.clear();calls.failDMA=0;fVideoSession->readbackDMA->clearMemoryDescriptor();fVideoSession->readbackDMA->release();}if(fVideoSession->readback){fVideoSession->readback->complete();fVideoSession->readback->release();}IOFree(fVideoSession,sizeof(*fVideoSession));fVideoSession=nullptr;}assert(!fVideoCpuBytes&&refs==1);rdn_mem_fini(&fMem);rdn_mem_fini(&fHidden);}
+extern "C" int rdn_mem_alloc(rdn_mem *mem,uint64_t bytes,uint64_t align,uint64_t *out){assert(gfxDepth==1&&align==4096);if(mem==&active->fGartSpace){++calls.gartAlloc;*out=4096ull+(calls.gartAlloc-1)*8ull*1024*1024;calls.gartMappings[active->fVideoSession->readback]=*out;return 0;}++calls.alloc;if(calls.allocFail)return -ENOMEM;return actual_mem_alloc(mem,bytes,align,out);}
 extern "C" int rdn_mem_alloc_in_range(rdn_mem *mem,uint64_t bytes,uint64_t align,uint64_t lo,uint64_t hi,uint64_t *out){assert(gfxDepth==1&&align==4096);++calls.alloc;if(calls.allocFail)return -ENOMEM;return actual_mem_alloc_in_range(mem,bytes,align,lo,hi,out);}
-extern "C" void rdn_mem_free(rdn_mem *mem,uint64_t at){assert(gfxDepth==1&&!calls.inflight&&!calls.cpInflight);if(mem==&active->fGartSpace){assert(at==4096);++calls.gartFree;return;}++calls.freed;actual_mem_free(mem,at);}
+extern "C" void rdn_mem_free(rdn_mem *mem,uint64_t at){assert(gfxDepth==1&&!calls.inflight&&!calls.cpInflight);if(mem==&active->fGartSpace){assert(at>=4096);bool found=false;for(auto i=calls.gartMappings.begin();i!=calls.gartMappings.end();++i)if(i->second==at){calls.gartMappings.erase(i);found=true;break;}assert(found);++calls.gartFree;return;}++calls.freed;actual_mem_free(mem,at);}
 static UInt8 *gpuBytes(UInt64 address,UInt32 bytes){
  assert(address>=active->fAccel.vram_base);UInt64 offset=address-active->fAccel.vram_base;
  if(offset<active->aperture.size()*4){assert(bytes<=active->aperture.size()*4-offset);return (UInt8*)active->aperture.data()+offset;}
@@ -201,6 +213,12 @@ extern "C" bool rdn_uvd_fence_done(rdn_uvd*,uint32_t){
  if(calls.failWait==calls.submits)return false;
  calls.inflight=false;
  RadeonNIVideoSession *s=active->fVideoSession;
+ if(s){
+  UInt32 handle=rdn_get_le32(s->message,8),type=rdn_get_le32(s->message,4);
+  assert(handle==s->handle&&handle>=1&&handle<=10);
+  if(type==0)assert(calls.firmwareHandles.insert(handle).second);
+  else {assert(calls.firmwareHandles.count(handle));if(type==2)calls.firmwareHandles.erase(handle);}
+ }
  if(s && rdn_get_le32(s->message,4)==1){
   UInt8 *base=(UInt8*)active->fAccel.aperture+s->allocation;
   for(UInt32 row=0;row<s->config.coded_height;++row){
@@ -226,7 +244,7 @@ extern "C" bool rdn_uvd_fence_done(rdn_uvd*,uint32_t){
  return true;
 }
 
-extern "C" void rdn_gart_set_page(rdn_gart*,uint32_t page,uint64_t bus){assert(gfxDepth==1&&page&&bus==calls.busBase+(page-1)*4096ull&&!(bus&4095));calls.lastPTE=bus;}
+extern "C" void rdn_gart_set_page(rdn_gart*,uint32_t page,uint64_t bus){assert(gfxDepth==1&&page&&bus==calls.busBase+(page-active->fVideoSession->gartOffset/4096)*4096ull&&!(bus&4095));calls.lastPTE=bus;}
 extern "C" void rdn_gart_clear_page(rdn_gart*,uint32_t page){assert(gfxDepth==1&&page);}
 extern "C" int rdn_gart_flush_checked(rdn_gart*){assert(gfxDepth==1);++calls.gartFlush;return calls.failGartFlush==calls.gartFlush?-ETIMEDOUT:0;}
 extern "C" int rdn_ib_try_submit(rdn_accel*,uint64_t address,uint32_t count,uint32_t *fence){
@@ -299,7 +317,7 @@ static void lifetime(){RadeonNIAccel a;RadeonNIVideoUserClient owner;auto s=crea
 static void retired(){RadeonNIAccel a;RadeonNIVideoUserClient owner;auto s=create(a,owner);auto d=picture(s);rdn_video_output out{};calls.retireBeforeSubmit=true;assert(a.videoDecode(&owner,&d,&out)==kIOReturnNotReady);assert(calls.submits==1&&!out.output_sequence);a.videoClose(&owner);assert(a.fVideoSession&&a.fVideoSession->quarantined&&!calls.freed);}
 static void errors(int which){RadeonNIAccel a;RadeonNIVideoUserClient owner;auto s=create(a,owner);auto d=picture(s);rdn_video_output out{};if(which==0)calls.failSubmit=2;if(which==1)calls.failWait=2;if(which==2)calls.corrupt=true;assert(a.videoDecode(&owner,&d,&out)==kIOReturnIOError&&!out.output_sequence);a.videoClose(&owner);assert(a.fVideoSession&&a.fVideoSession->quarantined&&!calls.freed&&a.fVideoCpuBytes==a.fVideoSession->readbackBytes);calls.inflight=false;}
 static void busy(){RadeonNIAccel a;RadeonNIVideoUserClient owner;auto s=create(a,owner);auto d=picture(s);rdn_video_output out{};calls.busySubmit=2;assert(a.videoDecode(&owner,&d,&out)==kIOReturnBusy&&!a.fUvd.failed&&!a.fVideoSession->quarantined&&a.fVideoSession->nextRequest==1);assert(a.videoDecode(&owner,&d,&out)==0&&out.request_sequence==1);}
-static void quota(){RadeonNIAccel a;std::vector<RadeonNIVideoMemory*> held;for(int i=0;i<5;++i){auto*p=RadeonNIVideoMemory::withBytes(&a,4*1024*1024,false);assert(p);held.push_back(p);}assert(!RadeonNIVideoMemory::withBytes(&a,1,false));RadeonNIVideoUserClient owner;auto c=config();rdn_video_session s{};assert(a.videoCreate(&owner,true,&c,&s)==kIOReturnNoMemory&&!calls.submits&&calls.freed==3);for(auto*p:held)p->release();assert(!a.fVideoCpuBytes);}
+static void quota(){RadeonNIAccel a;std::vector<RadeonNIVideoMemory*> held;for(unsigned i=0;i<RDN_VIDEO_CPU_BUDGET/(4*1024*1024);++i){auto*p=RadeonNIVideoMemory::withBytes(&a,4*1024*1024,false);assert(p);held.push_back(p);}assert(!RadeonNIVideoMemory::withBytes(&a,1,false));RadeonNIVideoUserClient owner;auto c=config();rdn_video_session s{};assert(a.videoCreate(&owner,true,&c,&s)==kIOReturnNoMemory&&!calls.submits&&calls.freed==3);for(auto*p:held)p->release();assert(!a.fVideoCpuBytes);}
 static void invalid(int which){RadeonNIAccel a;RadeonNIVideoUserClient owner;auto c=config();rdn_video_session s{};if(which==0)c.flags=2;if(which==1)c.reserved[3]=1;if(which==2)c.config.frame_mbs_only_flag=0;if(which==3)c.config.coded_width=0;if(which==4)a.fb.validation=false;assert(a.videoCreate(&owner,true,&c,&s)!=0&&!calls.alloc&&!calls.submits);}
 
 static void creationFailure(int mode){
@@ -341,7 +359,7 @@ static void dmaFailure(int mode){
  RadeonNIAccel a;RadeonNIVideoUserClient owner;auto c=config();rdn_video_session out{};
  if(mode<2)calls.failDMA=mode+1;else calls.badSegment=mode-1;
  assert(a.videoCreate(&owner,true,&c,&out)==kIOReturnVMError&&!a.fVideoSession&&!calls.submits&&!a.fVideoCpuBytes);
- assert(calls.freed==3&&calls.gartAlloc==calls.gartFree);
+ assert(calls.freed==3&&calls.gartMappings.empty());
 }
 static void queryBusy(){
  RadeonNIAccel a;rdn_video_query q{};IOLockLock(a.fUvdLock);
@@ -586,13 +604,99 @@ static void broker(unsigned mode) {
  assert(a.uvdAcquireRaw(&claimed)==wanted&&!claimed&&!a.fUvdScratch);
  assert(a.fUvdUsers==(mode==8?UINT32_MAX:0));
 }
-int main(int argc,char**argv){assert(argc==2);std::string test=argv[1];if(test.rfind("gpu-lease",0)==0)gpuLease(atoi(argv[1]+9));else if(test.rfind("broker",0)==0)broker(atoi(argv[1]+6));else if(test.rfind("hidden",0)==0)hiddenMemory(atoi(argv[1]+6));else if(test.rfind("feedback-error",0)==0)feedbackFailure(atoi(argv[1]+14));else if(test.rfind("init-failure",0)==0)initializationFailure(atoi(argv[1]+12));else if(test.rfind("feedback",0)==0)feedbackLogging(atoi(argv[1]+8));else if(test.rfind("minimum",0)==0)minimumDimension(atoi(argv[1]+7));else if(test=="concurrent")closeDuringWait(false);else if(test=="cp-concurrent")closeDuringWait(true);else if(test=="cp-busy")readbackBusy();else if(test=="physical64")physical64();else if(test=="query-busy")queryBusy();else if(test.rfind("dma-failure",0)==0)dmaFailure(atoi(argv[1]+11));else if(test=="query")query();else if(test=="slots")slots();else if(test=="lifetime")lifetime();else if(test=="retired")retired();else if(test=="busy")busy();else if(test=="quota")quota();else if(test=="stale")staleToken();else if(test.rfind("creation",0)==0)creationFailure(atoi(argv[1]+8));else if(test.rfind("readback",0)==0)readbackFailure(atoi(argv[1]+8));else if(test.rfind("destruction",0)==0)destructionFailure(atoi(argv[1]+11));else if(test.rfind("error",0)==0)errors(atoi(argv[1]+5));else if(test.rfind("invalid",0)==0)invalid(atoi(argv[1]+7));else assert(false);return 0;}
+static void reservedStaging(){
+ RadeonNIAccel a;RadeonNIVideoUserClient owner;
+ a.videoReserveStaging();
+ assert(a.fVideoStagingBytes==4239360);
+ const auto reserved=a.fVideoStagingOffset;
+ const auto available=rdn_mem_available(&a.fMem);
+ a.videoReserveStaging();assert(rdn_mem_available(&a.fMem)==available);
+ std::vector<uint64_t> held;
+ uint64_t offset;
+ while(!actual_mem_alloc(&a.fMem,8192,4096,&offset))held.push_back(offset);
+ for(size_t i=0;i<held.size();i+=2)actual_mem_free(&a.fMem,held[i]);
+ assert(rdn_mem_largest(&a.fMem)<a.fVideoStagingBytes);
+ auto c=config();rdn_video_session session{};
+ for(unsigned i=0;i<2;i++){
+  assert(a.videoCreate(&owner,true,&c,&session)==0);
+  assert(a.fVideoSession->stagingReserved&&a.fVideoSession->allocation==reserved);
+  a.videoClose(&owner);
+  assert(!a.fVideoSession&&!a.fVideoBusy);
+  assert(actual_mem_alloc_in_range(&a.fMem,a.fVideoStagingBytes,4096,reserved,
+   reserved+a.fVideoStagingBytes,&offset)!=0);
+ }
+ for(size_t i=1;i<held.size();i+=2)actual_mem_free(&a.fMem,held[i]);
+ assert(rdn_mem_available(&a.fMem)==available);
+}
+
+
+static void multiGpuLeases(){
+ RadeonNIAccel a;RadeonNIVideoUserClient owner[2];rdn_video_session session[2]{};
+ a.fb.gpu=true;auto c=config();c.flags|=RDN_VIDEO_CREATE_GPU_OUTPUT;
+ rdn_video_gpu_output output[2]{};
+ for(unsigned i=0;i<2;++i){
+  assert(a.videoCreate(&owner[i],true,&c,&session[i])==0);
+  memset(a.fVideoSession->upload->getBytesNoCopy(),0x65,1408);
+  auto d=picture(session[i]);assert(a.videoDecodeGpu(&owner[i],&d,&output[i])==0);
+ }
+ rdn_video_gpu_acquire acquire{};acquire.version=1;acquire.bytes=sizeof(acquire);
+ memcpy(acquire.source_token,output[0].source_token,sizeof(acquire.source_token));
+ rdn_video_gpu_source source{};
+ assert(a.videoAcquireGpu(&owner[1],&acquire,&source)==kIOReturnBadArgument);
+ assert(a.videoAcquireGpu(&owner[0],&acquire,&source)==0);
+ rdn_video_gpu_retire retire{};retire.version=1;retire.bytes=sizeof(retire);retire.role=RDN_VIDEO_GPU_PRODUCER;
+ memcpy(retire.source_token,output[1].source_token,sizeof(retire.source_token));
+ assert(a.videoRetireGpu(&owner[0],&retire)==kIOReturnBadArgument);
+ assert(a.videoRetireGpu(&owner[1],&retire)==0);a.videoClose(&owner[1]);
+ assert(a.fVideoSessionCount==1&&!calls.idle&&a.fVideoSessions[0]->gpuImporter);
+ memcpy(retire.source_token,output[0].source_token,sizeof(retire.source_token));
+ assert(a.videoRetireGpu(&owner[0],&retire)==0);retire.role=RDN_VIDEO_GPU_IMPORTER;
+ assert(a.videoRetireGpu(&owner[0],&retire)==0);a.videoClose(&owner[0]);
+ assert(!a.fVideoSessionCount&&!a.fVideoCpuBytes&&calls.idle==1);
+}
+
+static void multiSessions(){
+ RadeonNIAccel a; RadeonNIVideoUserClient owner[11]; rdn_video_session session[11]{};
+ rdn_mem_fini(&a.fHidden);a.fHiddenSize=256*1024*1024;a.hidden.resize(a.fHiddenSize/4);
+ assert(!rdn_mem_init(&a.fHidden,&heapOS,a.fHiddenOffset,a.fHiddenSize));
+ a.videoReserveStaging();
+ for(unsigned i=0;i<10;++i){
+  session[i]=create(a,owner[i]);
+  assert(a.fVideoSession->handle==i+1&&a.fVideoSessionCount==i+1);
+  for(unsigned j=0;j<i;++j){
+   auto *x=a.fVideoSessions[i],*y=a.fVideoSessions[j];
+   assert(x->allocation!=y->allocation&&x->gartOffset!=y->gartOffset);
+   assert(x->gpuAllocation[0]!=y->gpuAllocation[0]&&x->gpuAllocation[1]!=y->gpuAllocation[1]);
+  }
+ }
+ rdn_video_query q{};a.videoQuery(true,&q);assert(q.max_sessions==10&&(q.flags&RDN_VIDEO_CAP_BUSY));
+ auto c=config();assert(a.videoCreate(&owner[10],true,&c,&session[10])==kIOReturnBusy);
+ assert(a.videoCreate(&owner[0],true,&c,&session[10])==kIOReturnBusy);
+ for(unsigned round=1;round<=3;++round)for(int i=9;i>=0;--i){
+  auto request=picture(session[i],round);rdn_video_output out{};
+  assert(a.videoDecode(&owner[(i+1)%10],&request,&out)==kIOReturnBadArgument);
+  assert(a.videoDecode(&owner[i],&request,&out)==0&&out.request_sequence==round);
+  auto rel=release(out);assert(a.videoRelease(&owner[(i+1)%10],&rel)==kIOReturnBadArgument);
+  assert(a.videoRelease(&owner[i],&rel)==0);
+ }
+ auto old=session[4];auto d=destroy(old);assert(a.videoDestroy(&owner[4],&d)==0&&calls.idle==0&&a.fVideoBusy);
+ a.videoQuery(true,&q);assert(!(q.flags&RDN_VIDEO_CAP_BUSY));
+ // A failed allocation must not destroy a different owner's selected session.
+ calls.metadataFail=true;assert(a.videoCreate(&owner[10],true,&c,&session[10])==kIOReturnNoMemory);
+ calls.metadataFail=false;assert(a.fVideoSessionCount==9);
+ session[4]=create(a,owner[4]);assert(a.fVideoSession->handle==5);
+ assert(a.videoDestroy(&owner[4],&d)==kIOReturnBadArgument);
+ for(unsigned i=0;i<10;++i){a.videoClose(&owner[i]);assert(a.fVideoSessionCount==9-i);if(i<9)assert(!calls.idle&&a.fVideoBusy);}
+ assert(calls.idle==1&&!a.fVideoBusy&&!a.fVideoCpuBytes&&calls.firmwareHandles.empty());
+}
+
+int main(int argc,char**argv){assert(argc==2);std::string test=argv[1];if(test=="multi-gpu")multiGpuLeases();else if(test=="multi")multiSessions();else if(test=="reserved-staging")reservedStaging();else if(test.rfind("gpu-lease",0)==0)gpuLease(atoi(argv[1]+9));else if(test.rfind("broker",0)==0)broker(atoi(argv[1]+6));else if(test.rfind("hidden",0)==0)hiddenMemory(atoi(argv[1]+6));else if(test.rfind("feedback-error",0)==0)feedbackFailure(atoi(argv[1]+14));else if(test.rfind("init-failure",0)==0)initializationFailure(atoi(argv[1]+12));else if(test.rfind("feedback",0)==0)feedbackLogging(atoi(argv[1]+8));else if(test.rfind("minimum",0)==0)minimumDimension(atoi(argv[1]+7));else if(test=="concurrent")closeDuringWait(false);else if(test=="cp-concurrent")closeDuringWait(true);else if(test=="cp-busy")readbackBusy();else if(test=="physical64")physical64();else if(test=="query-busy")queryBusy();else if(test.rfind("dma-failure",0)==0)dmaFailure(atoi(argv[1]+11));else if(test=="query")query();else if(test=="slots")slots();else if(test=="lifetime")lifetime();else if(test=="retired")retired();else if(test=="busy")busy();else if(test=="quota")quota();else if(test=="stale")staleToken();else if(test.rfind("creation",0)==0)creationFailure(atoi(argv[1]+8));else if(test.rfind("readback",0)==0)readbackFailure(atoi(argv[1]+8));else if(test.rfind("destruction",0)==0)destructionFailure(atoi(argv[1]+11));else if(test.rfind("error",0)==0)errors(atoi(argv[1]+5));else if(test.rfind("invalid",0)==0)invalid(atoi(argv[1]+7));else assert(false);return 0;}
 """
 class SessionTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):
   cls.tmp=tempfile.TemporaryDirectory();tmp=pathlib.Path(cls.tmp.name)
-  header=(ROOT/'kext/RadeonNI/RadeonNIVideoMemory.h').read_text();header=header[header.index('class RadeonNIVideoMemory'):header.rindex('#endif')]
+  header=(ROOT/'kext/RadeonNI/RadeonNIVideoMemory.h').read_text();header=header[header.index('class RadeonNIVideoMemory'):header.index('\n#else')]
   memory=(ROOT/'kext/RadeonNI/RadeonNIVideoMemory.cpp').read_text();memory=memory[memory.index('bool RadeonNIAccel::videoCharge'):]
   session=(ROOT/'kext/RadeonNI/RadeonNIUvdSession.cpp').read_text();session=session[session.index('enum { kVideoPage'):]
   accel=(ROOT/'kext/RadeonNI/RadeonNIAccel.cpp').read_text()
@@ -618,6 +722,9 @@ class SessionTests(unittest.TestCase):
   for i in range(15):self.run_case('gpu-lease'+str(i))
  def test_shared_raw_typed_engine_admission(self):
   for i in range(11):self.run_case('broker'+str(i))
+ def test_reserved_staging_survives_fragmentation_and_reuse(self):self.run_case("reserved-staging")
+ def test_cross_session_gpu_lease_ownership(self):self.run_case("multi-gpu")
+ def test_ten_independent_sessions(self):self.run_case("multi")
  def test_query(self):self.run_case('query')
  def test_query_does_not_wait_for_decode_lock(self):self.run_case('query-busy')
  def test_slot_ownership_and_backpressure(self):self.run_case('slots')

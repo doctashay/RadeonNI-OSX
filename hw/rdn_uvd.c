@@ -1,5 +1,5 @@
 /*
- * UVD bring-up for Turks. Ported from the MIT-licensed Linux radeon files
+ * UVD bring-up for Northern Islands. Ported from the MIT-licensed Linux radeon files
  * uvd_v1_0.c, uvd_v2_2.c, radeon_uvd.c and evergreen.c; the register
  * sequences are theirs, the structure is ours.
  *
@@ -25,7 +25,7 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  *
- * Authors: Christian KÃ¶nig, Jerome Glisse
+ * Authors: Christian KÃƒÂ¶nig, Jerome Glisse
  */
 
 #include <string.h>
@@ -38,8 +38,15 @@
 #define RDN_UVD_USEC_TIMEOUT	100000
 #define RDN_UVD_RING_ALIGN_MASK 15u
 
-/* VCPU_CHIP_ID for Turks (uvd_v2_2.c). */
-#define RDN_UVD_CHIP_ID_TURKS	0x01000011
+/* Firmware ASIC identifiers from uvd_v2_2_resume(). */
+static uint32_t uvd_chip_id(const struct rdn_card *card)
+{
+ switch (card->family) {
+ case RDN_FAMILY_TURKS: return 0x01000011;
+ case RDN_FAMILY_CAYMAN: return 0x0100000f;
+ default: return 0;
+ }
+}
 
 /* The kernel has no <errno.h>; the values are the usual ones. */
 #ifndef EIO
@@ -58,11 +65,21 @@
 #define ETIMEDOUT 60
 #endif
 
+uint32_t rdn_uvd_rlc_bytes(const struct rdn_card *card)
+{
+ if (!card) return 0;
+ switch (card->family) {
+ case RDN_FAMILY_TURKS: return 3072;
+ case RDN_FAMILY_CAYMAN: return 4096;
+ default: return 0;
+ }
+}
+
 static bool valid_accel(const struct rdn_accel *accel)
 {
 	const struct rdn_os *os = accel && accel->card ? accel->card->os : NULL;
 
-	return os && os->mmio_read32 && os->mmio_write32 && os->delay_us &&
+	return os && uvd_chip_id(accel->card) && os->mmio_read32 && os->mmio_write32 && os->delay_us &&
 	       os->time_ms && os->log;
 }
 
@@ -593,7 +610,7 @@ void rdn_uvd_set_reset_level(unsigned level)
 
 void rdn_uvd_set_rlc_ucode(const void *fw, uint32_t size)
 {
-	rlc_ucode = size == 768 * 4 ? fw : NULL;
+	rlc_ucode = (size == 3072 || size == 4096) ? fw : NULL;
 	rlc_ucode_size = rlc_ucode ? size : 0;
 }
 
@@ -648,7 +665,7 @@ static void program_memory(struct rdn_uvd *uvd)
 	addr = (gpu >> 32) & 0xFF;
 	wr(card, UVD_LMI_EXT40_ADDR, (uint32_t)(addr | (0x9 << 16) | (0x1u << 31)));
 
-	wr(card, UVD_VCPU_CHIP_ID_REG, RDN_UVD_CHIP_ID_TURKS);
+	wr(card, UVD_VCPU_CHIP_ID_REG, uvd_chip_id(card));
 
 		return;
 	}
@@ -661,7 +678,7 @@ static void program_memory(struct rdn_uvd *uvd)
 
 		wr(card, UVD_VCPU_CACHE_OFFSET0, (uint32_t)(at >> 3) & 0x0fffffff);
 		wr(card, UVD_VCPU_CACHE_SIZE0, PAGE_UP(uvd->fw_size + 4) >> 3);
-		wr(card, UVD_VCPU_CHIP_ID_REG, RDN_UVD_CHIP_ID_TURKS);
+		wr(card, UVD_VCPU_CHIP_ID_REG, uvd_chip_id(card));
 		if (uvd->flags & RDN_UVD_F_WINDOWS) {
 			/* the heap, then the stack and the sessions, follow the firmware (radeon: uvd_v2_2_resume()) */
 			uint32_t off = (uint32_t)(at >> 3) & 0x0fffffff, size = PAGE_UP(uvd->fw_size + 4) >> 3;
@@ -719,7 +736,7 @@ static void program_memory(struct rdn_uvd *uvd)
 		wr(card, UVD_FW_START, b[0] | (b[1] << 8) | (b[2] << 16) | ((uint32_t)b[3] << 24));
 	} else {
 		/* tell firmware which hardware it is running on */
-		wr(card, UVD_VCPU_CHIP_ID_REG, RDN_UVD_CHIP_ID_TURKS);
+		wr(card, UVD_VCPU_CHIP_ID_REG, uvd_chip_id(card));
 	}
 }
 
@@ -764,7 +781,7 @@ static int vcpu_start(struct rdn_uvd *uvd)
 		 * again (level 2): it is running from the first start, and stopping and loading it while the window server is busy breaks the decoder.
 		 */
 		if (!(reset_level & RDN_UVD_RESET_NO_RLC)) {
-			if (rlc_ucode)
+			if (rlc_ucode && rlc_ucode_size == rdn_uvd_rlc_bytes(card))
 				rlc_load(card);
 			wr(card, 0x3f00, 1);
 			mdelay(card, 300);
@@ -990,7 +1007,9 @@ int rdn_uvd_wake(struct rdn_uvd *uvd)
 		return 0;
 	if (uvd->flags & RDN_UVD_F_LOW_CLOCKS)
 		return rdn_uvd_set_clocks(uvd->accel->card, uvd->ref_freq, 10000, 10000);
-	r = rdn_uvd_set_clocks(uvd->accel->card, uvd->ref_freq, RDN_UVD_VCLK, RDN_UVD_DCLK);
+	uint32_t vclk=uvd->accel->card->power_video_vclk,dclk=uvd->accel->card->power_video_dclk;
+ if(!vclk || !dclk){vclk=RDN_UVD_VCLK;dclk=RDN_UVD_DCLK;}
+ r = rdn_uvd_set_clocks(uvd->accel->card, uvd->ref_freq, vclk, dclk);
 	if (r && uvd->guarded) { uvd->failed = true; uvd->ready = false; }
 	return r;
 }
@@ -1241,7 +1260,7 @@ static int load_rlc(struct rdn_uvd *uvd, const uint8_t *fw)
 	wr(card, RLC_HB_WPTR_MSB_ADDR, 0);
 	wr(card, RLC_MC_CNTL, 0);
 	wr(card, RLC_UCODE_CNTL, 0);
-	for (i = 0; i < RDN_UVD_RLC_BYTES / 4; i++) {
+	for (i = 0; i < rdn_uvd_rlc_bytes(card) / 4; i++) {
 		const uint8_t *p = fw + i * 4;
 		uint32_t word = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
 			       ((uint32_t)p[2] << 8) | p[3];
@@ -1300,7 +1319,7 @@ static int prepare_mem(struct rdn_uvd *uvd, struct rdn_accel *accel,
 	if (uvd->started || uvd->failed || uvd->stopped || uvd->prepared)
 		return -EBUSY;
 	if (rlc_fw || rlc_size) {
-		if (!rlc_fw || rlc_size != RDN_UVD_RLC_BYTES ||
+		if (!rlc_fw || rlc_size != rdn_uvd_rlc_bytes(accel ? accel->card : NULL) ||
 		    (uintptr_t)rlc_fw > UINTPTR_MAX - rlc_size ||
 		    ((uintptr_t)rlc_fw < (uintptr_t)vcpu_cpu + vcpu_bytes &&
 		     (uintptr_t)vcpu_cpu < (uintptr_t)rlc_fw + rlc_size) ||
@@ -1543,7 +1562,7 @@ int rdn_uvd_prepare_rlc(struct rdn_uvd *uvd, struct rdn_accel *accel,
 		     uint32_t ring_bytes, uint32_t flags,
 		     const uint8_t *rlc_fw, uint32_t rlc_size)
 {
-	if (!rlc_fw || rlc_size != RDN_UVD_RLC_BYTES)
+	if (!rlc_fw || rlc_size != rdn_uvd_rlc_bytes(accel ? accel->card : NULL))
 		return -EINVAL;
 	return prepare_vram(uvd, accel, ref_freq, fw, fw_size, handles,
 		vcpu_offset, ring_offset, ring_bytes, flags, rlc_fw, rlc_size);

@@ -19,7 +19,37 @@
 #define RDN_UC_SERVICE_CLASS		"RadeonNIAccel"
 #define RDN_UC_TYPE			0x72646e31	/* upstream 'rdn1' */
 #define RDN_UC_TYPE_V2			0x72646e32	/* unified 'rdn2' */
+/* RadeonNI framebuffer: fixed read-only sensor and clock queries. */
+#define RDN_UC_TELEMETRY 0x72646e74
+#define RDN_TELEMETRY_SAMPLE 0
+#define RDN_TELEMETRY_CLOCKS 1
+#define RDN_TELEMETRY_BOARD 2
+#define RDN_SENSOR_VALID 0
+#define RDN_SENSOR_NOT_IMPLEMENTED 1
+#define RDN_SENSOR_NOT_PRESENT 2
+#define RDN_SENSOR_INVALID 3
+#define RDN_SENSOR_NO_DESCRIPTION 4
+
+struct rdn_user_board_sensors {
+ uint32_t version, size;
+ uint32_t fan_status, fan_rpm, tach_period, tach_clock_hz;
+ uint32_t fan_pulses, tach_edges, fan_min_rpm, fan_max_rpm;
+ uint32_t rail_status, rail_microvolts, voltage_control_id;
+ uint32_t thermal_controller;
+};
+
+
 #define RDN_UC_MEMORY_APERTURE		0
+
+/* Byte counts use explicit word pairs for the PPC32/PPC64 ABI. */
+struct rdn_user_bytes { uint32_t hi, lo; };
+struct rdn_user_memory_usage {
+ uint32_t version, size;
+ struct rdn_user_bytes total, reserved, allocated, free;
+ struct rdn_user_bytes visible_capacity, visible_free, visible_largest;
+ struct rdn_user_bytes hidden_capacity, hidden_free, hidden_largest;
+ struct rdn_user_bytes command_capacity, command_free;
+};
 
 enum {
 	/* struct out: struct rdn_user_info */
@@ -209,6 +239,18 @@ enum {
 	RDN_UC_SURFACE_GPU_INFO,
 	/* Scalars: ID, owned destination offset/stride, width, height. */
 	RDN_UC_SURFACE_GPU_COPY,
+	/* Mode 0 queries; admin modes 1/2 enable/disable fence IRQs. */
+	/* Output flags: bit 0 IRQ active, bit 1 queued present, bit 2 graphics fault. */
+	RDN_UC_FENCE_CONTROL,
+	/* scalar in: surface ID; struct out: rdn_user_screen */
+	RDN_UC_SURFACE_SCREEN,
+	RDN_UC_MANAGED_INFO,
+	RDN_UC_MANAGED_ALIAS,
+	RDN_UC_MANAGED_EVICT,
+	RDN_UC_MANAGED_PROMOTE,
+	RDN_UC_COMMAND_INFO,
+	RDN_UC_ALLOC_COMMAND,
+	RDN_UC_MEMORY_USAGE,
 	RDN_UC_METHOD_COUNT
 };
 
@@ -262,7 +304,13 @@ struct rdn_user_uvd_diagnostic {
 
 #define RDN_UC_POWER_QUERY		0
 #define RDN_UC_POWER_PERFORMANCE	1	/* the PowerPlay table's fastest */
-#define RDN_UC_POWER_BOOT		2	/* what ASIC_Init leaves */
+#define RDN_UC_POWER_BOOT		2	/* boot clocks, or the SMC low-core cap */
+#define RDN_UC_POWER_THERMAL_LIMIT	3	/* what: 80..100 degrees C; SMC only */
+#define RDN_UC_POWER_START_SMC		4	/* explicit hardware bring-up; Cayman only */
+#define RDN_UC_POWER_TUNE		5	/* what: core MHz << 16 | memory MHz; 30-second lease */
+#define RDN_UC_POWER_UNDERVOLT 7 /* exact BIOS mV, at most -100 mV, never below idle VID; 30-second lease; 0 restores stock */
+#define RDN_UC_POWER_PROFILE 6 /* what: 0 = automatic, 1 = high; preserves the thermal limit */
+#define RDN_UC_REG_PCI_CONFIG		0x80000000u
 #define RDN_UC_TEMPERATURE_BIAS		1000000
 
 /* RDN_UC_UVD_INIT's flags (the same bits as RDN_UVD_F_* in hw/rdn_uvd.h): the decoder in a segment, back in the aperture. */
@@ -276,6 +324,10 @@ struct rdn_user_backing {
 
 struct rdn_user_surface_info {
 	uint32_t id, offset, row_bytes, width, height;
+};
+
+struct rdn_user_screen {
+	uint32_t index, offset, width, height, pitch_pixels, bits_per_pixel, scanout;
 };
 
 struct rdn_user_info {

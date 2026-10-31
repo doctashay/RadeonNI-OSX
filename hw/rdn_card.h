@@ -9,9 +9,10 @@
 #define RDN_CARD_H
 
 #include "rdn_os.h"
+#include "rdn_device_ids.h"
 #include "rdn_atom.h"
 
-/* Turks has six display controllers. */
+/* Array capacity; live register access uses the ASIC's controller count. */
 #define RDN_NUM_CRTC	6
 
 /*
@@ -43,7 +44,11 @@ struct rdn_dp {
 	uint32_t aux_status;	/* AUX_SW_STATUS of the last transaction */
 };
 
+
 struct rdn_card {
+	enum rdn_family family;
+	uint8_t display_crtc, display_pll, display_heads;
+	struct rdn_card **display_peers;
 	struct rdn_os *os;
 	struct rdn_atom atom;
 	/* The output rdn_modeset() drives; NULL is the DVI-I connector. */
@@ -58,21 +63,35 @@ struct rdn_card {
 	char board_name[RDN_MAX_BOARD_OUTPUTS][28];
 	int num_board;
 	struct rdn_dp dp;
-	/* CRTC 0 is scanning out; kept up to date by POST and modeset. */
+	/* Selected controller state, kept up to date by POST and modeset. */
 	bool crtc_on;
 	/*
 	 * Engine and memory clock in units of 10 kHz, as rdn_pm_set() left
 	 * them; zero until someone asks: what the card boots with.
 	 */
 	uint32_t sclk, mclk;
+ uint32_t power_video_vclk, power_video_dclk;
+ bool power_memory_dpm, power_graphics_gating, power_idle_dpm;
 	/*
 	 * What the display watermarks are computed from: the mode on CRTC 0
 	 * (clock in kHz; zero before the first mode set) and, if not zero,
 	 * other clocks for the second watermark set (rdn_watermark.c).
 	 */
-	uint32_t wm_clock, wm_hdisplay, wm_htotal;
+	uint32_t wm_clock, wm_hdisplay, wm_htotal, wm_vdisplay, wm_vtotal;
 	uint32_t wm_low_sclk, wm_low_mclk;
 };
+
+static inline unsigned rdn_crtc_count(const struct rdn_card *card)
+{
+	return card ? rdn_family_crtc_count(card->family) : 0;
+}
+
+/* DCE4/5 controller banks are not uniformly spaced. */
+static inline uint32_t rdn_crtc_offset(unsigned crtc)
+{
+	static const uint32_t offsets[RDN_NUM_CRTC] = {0, 0xc00, 0x9800, 0xa400, 0xb000, 0xbc00};
+	return crtc < RDN_NUM_CRTC ? offsets[crtc] : UINT32_MAX;
+}
 
 /*
  * The register BAR is 128 KB. Registers beyond it (the 3D engine's context
@@ -139,5 +158,7 @@ int rdn_handover_take(struct rdn_card *card);
  * call it.
  */
 void rdn_bandwidth_update(struct rdn_card *card);
+/* Update latency/priority without reallocating the live display FIFO. */
+void rdn_bandwidth_update_clocks(struct rdn_card *card);
 
 #endif /* RDN_CARD_H */

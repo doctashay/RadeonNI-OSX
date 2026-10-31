@@ -33,9 +33,59 @@
 			<key>IOProbeScore</key>
 			<integer>65000</integer>
 			<key>IOPCIMatch</key>
-			<string>0x675d1002 0x67581002 0x67591002 0x675b1002 0x675f1002</string>
+			<string>0x675d1002 0x67581002 0x67591002 0x675b1002 0x675f1002 0x67041002</string>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
+		</dict>
+		<key>RadeonNI-BARTS</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>org.osxgpu.driver.RadeonNI</string>
+			<key>IOClass</key>
+			<string>RadeonNI</string>
+			<key>IOMatchCategory</key>
+			<string>IOFramebuffer</string>
+			<key>IOProbeScore</key>
+			<integer>65000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOPCIMatch</key>
+			<string>0x67221002 0x67231002 0x67261002 0x67271002 0x67281002 0x67291002 0x67381002 0x67391002 0x673e1002</string>
+			<key>FirmwareFamily</key>
+			<string>BARTS</string>
+			<key>Accelerator</key>
+			<false/>
+			<key>HWCursor</key>
+			<false/>
+			<key>MultiHead</key>
+			<false/>
+			<key>ExperimentalFramebuffer</key>
+			<true/>
+		</dict>
+		<key>RadeonNI-CAICOS</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>org.osxgpu.driver.RadeonNI</string>
+			<key>IOClass</key>
+			<string>RadeonNI</string>
+			<key>IOMatchCategory</key>
+			<string>IOFramebuffer</string>
+			<key>IOProbeScore</key>
+			<integer>65000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOPCIMatch</key>
+			<string>0x67621002 0x67631002 0x67661002 0x67671002 0x67681002 0x67701002 0x67711002 0x67721002 0x67781002 0x67791002 0x677b1002</string>
+			<key>FirmwareFamily</key>
+			<string>CAICOS</string>
+			<key>Accelerator</key>
+			<false/>
+			<key>HWCursor</key>
+			<false/>
+			<key>MultiHead</key>
+			<false/>
+			<key>ExperimentalFramebuffer</key>
+			<true/>
 		</dict>
 	</dict>
 	<key>OSBundleLibraries</key>

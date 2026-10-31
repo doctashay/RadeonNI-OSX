@@ -1,0 +1,11 @@
+--- a/src/compiler/glsl/glsl_lexer.ll
++++ b/src/compiler/glsl/glsl_lexer.ll
+@@ -634,7 +634,7 @@
+ [0-9]+[eE][+-]?[0-9]+(hf|HF)		{
+ 			    if (!yyextra->AMD_gpu_shader_half_float_enable)
+ 			        return ERROR_TOK;
+-			    yylval->dreal = _mesa_strtod(yytext, NULL);
++			    yylval->real = _mesa_strtod(yytext, NULL);
+ 			    return FLOAT16CONSTANT;
+ 			}
+ 

@@ -6,13 +6,15 @@
 
 #define RDN_GL_VIDEO_PACK_VERSION_1 1u
 #define RDN_GL_VIDEO_PACK_CAP_NV12_COMPLETED 1u
+#define RDN_GL_VIDEO_PACK_CAP_NV12_ASYNC 2u
 #define RDN_GL_VIDEO_PACK_MAX_TIMEOUT_MS 2000u
 
 enum RDNGLVideoPackResult {
  RDN_GL_VIDEO_PACK_OK = 0,
  RDN_GL_VIDEO_PACK_UNSUPPORTED = 1,
  RDN_GL_VIDEO_PACK_FAILED_RETIRED = 2,
- RDN_GL_VIDEO_PACK_FAILED_PENDING = 3
+ RDN_GL_VIDEO_PACK_FAILED_PENDING = 3,
+ RDN_GL_VIDEO_PACK_IN_PROGRESS = 4
 };
 
 struct RDNGLVideoPackRequestV1 {
@@ -24,5 +26,9 @@ struct RDNGLVideoPackRequestV1 {
 
 int RDNGLQueryVideoPackingV1(uint32_t version, uint32_t *capabilities);
 int RDNGLPackVideoFrameV1(const struct RDNGLVideoPackRequestV1 *request);
+
+int RDNGLBeginVideoFrameV1(const struct RDNGLVideoPackRequestV1 *request);
+int RDNGLPollVideoFrameV1(const struct RDNGLVideoPackRequestV1 *request);
+int RDNGLCancelVideoFrameV1(const struct RDNGLVideoPackRequestV1 *request);
 
 #endif

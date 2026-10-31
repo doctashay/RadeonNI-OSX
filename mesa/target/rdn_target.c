@@ -18,8 +18,19 @@
 
 static struct rdn_device *the_device;
 
+uint32_t rdn_target_device_id(void)
+{
+   return the_device ? the_device->info.pci_device_id : 0;
+}
+
+const char *rdn_target_device_model(void)
+{
+   return the_device && the_device->info.model[0] ? the_device->info.model : NULL;
+}
+
 struct external_store {
    struct external_store *next;
+   struct rdn_device *device;
    uint64_t offset, size;
    unsigned references;
 };
@@ -34,6 +45,7 @@ static bool track_store(uint64_t offset, uint64_t size)
       return false;
    }
    store->offset = offset;
+   store->device = the_device;
    store->size = size;
    store->references = 1;
    pthread_mutex_lock(&external_lock);
@@ -48,7 +60,8 @@ static void *retain_store(struct rdn_device *dev, uint64_t offset)
    struct external_store *store;
    pthread_mutex_lock(&external_lock);
    for (store = external_stores; store; store = store->next) {
-      if (offset >= store->offset && offset - store->offset < store->size) {
+      if (store->device == dev && offset >= store->offset &&
+          offset - store->offset < store->size) {
          ++store->references;
          break;
       }
@@ -61,10 +74,14 @@ static void release_store(struct rdn_device *dev, void *reference)
 {
    struct external_store *store = reference, **link;
    pthread_mutex_lock(&external_lock);
+   if (!store || store->device != dev) {
+      pthread_mutex_unlock(&external_lock);
+      return;
+   }
    if (--store->references == 0) {
       for (link = &external_stores; *link != store; link = &(*link)->next) {}
       *link = store->next;
-      dev->free(dev, store->offset);
+      store->device->free(store->device, store->offset);
       free(store);
    }
    pthread_mutex_unlock(&external_lock);
@@ -75,6 +92,34 @@ static void release_store(struct rdn_device *dev, void *reference)
 /* The screen is the software one, with ordinary memory for video memory. */
 static bool soft;
 #endif
+
+PUBLIC bool
+rdn_target_surface_screen(uint32_t id, volatile uint32_t **pixels,
+   uint32_t *width, uint32_t *height, uint32_t *pitch, uint32_t *offset, uint32_t *scanout)
+{
+   struct rdn_screen screen;
+   if (!the_device) return false;
+   if (!id) {
+      /* CGL fullscreen names the device scanout, not a CGS window surface. */
+      if (the_device->screen_refresh) the_device->screen_refresh(the_device);
+      screen = (struct rdn_screen){0};
+      if (the_device->screen.offset > UINT32_MAX) return false;
+      screen.offset = the_device->screen.offset;
+      screen.width = the_device->screen.width;
+      screen.height = the_device->screen.height;
+      screen.pitch_pixels = the_device->screen.pitch_pixels;
+      if (!screen.width || !screen.height || screen.width > screen.pitch_pixels ||
+          screen.offset > the_device->aperture_size ||
+          (uint64_t)screen.pitch_pixels * 4 * screen.height >
+             the_device->aperture_size - screen.offset) return false;
+      screen.scanout = 1;
+   } else if (!the_device->surface_screen ||
+              !the_device->surface_screen(the_device, id, &screen)) return false;
+   *pixels = (volatile uint32_t *)((uint8_t *)the_device->aperture + screen.offset);
+   *width = screen.width; *height = screen.height; *pitch = screen.pitch_pixels;
+   *offset = screen.offset; *scanout = screen.scanout;
+   return true;
+}
 
 PUBLIC bool
 rdn_target_screen(volatile uint32_t **pixels, uint32_t *width,
@@ -338,4 +383,9 @@ int rdn_target_surface_gpu_copy(uint32_t id, uint32_t offset, uint32_t stride,
 {
    return the_device && the_device->surface_gpu_copy ?
       the_device->surface_gpu_copy(the_device, id, offset, stride, width, height) : 1;
+}
+
+bool rdn_target_queued_surface_present(void)
+{
+   return the_device && the_device->info.queued_surface_present;
 }

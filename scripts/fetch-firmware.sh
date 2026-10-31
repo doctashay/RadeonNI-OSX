@@ -22,6 +22,7 @@ upstream=https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware
 sums="65d98665384252ddd627c365dbfd2f238b0538570d9e1dad6d4382bb93723089  TURKS_pfp.bin
 37fa5fb7cdb13df94c9a64d7ba752b63119f063f64326b67ec54656cd184363b  TURKS_me.bin
 f88017d12951e68b8db2695350108f43b2bbac46fd4de525a1e2612540156a3d  TURKS_mc.bin
+6da39205d5121088d3b0bdea9c8b09adfde3f66eff6c1fe3e377fee174f70fed  CAYMAN_smc.bin
 fc6223d4bfe9f2f9e2eddc44b9fe5721d0caf49f01cb08d602906add686d8c6f  LICENSE.radeon"
 
 good() {
@@ -59,7 +60,7 @@ remote_copy() {
 }
 
 mkdir -p "$dir"
-for name in TURKS_pfp.bin TURKS_me.bin TURKS_mc.bin LICENSE.radeon; do
+for name in TURKS_pfp.bin TURKS_me.bin TURKS_mc.bin CAYMAN_smc.bin LICENSE.radeon; do
     if good "$name"; then
         continue
     fi

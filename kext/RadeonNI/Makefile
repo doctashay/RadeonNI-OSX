@@ -8,6 +8,8 @@ KROOT    = /System/Library/Frameworks/Kernel.framework
 HW       = ../../hw
 # make LEOPARD=1: the same sources, plus leopard.s, for Mac OS X 10.5
 # (see scripts/leopard.sh). Built apart, so that the Tiger kext is not touched.
+CAYMAN_SMC ?= 0
+CPPFLAGS_EXTRA = -DRDN_CAYMAN_SMC=$(CAYMAN_SMC)
 LEOPARD  = 0
 ifeq ($(LEOPARD),1)
 BUILD    = build-leopard
@@ -16,7 +18,7 @@ BUILD    = build
 endif
 BUNDLE   = $(BUILD)/$(KEXT).kext
 
-CPPFLAGS = -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
+CPPFLAGS = $(CPPFLAGS_EXTRA) -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
 	-nostdinc -Icompat -I$(KROOT)/PrivateHeaders -I$(KROOT)/Headers -I$(HW)
 CFLAGS   = -arch ppc -Os -Wall -fno-builtin -fno-common -static \
 	-mlong-branch -force_cpusubtype_ALL
@@ -24,11 +26,12 @@ CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -fapple-kext -fcheck-new
 # Files taken from Linux do not pass -Wall cleanly with this compiler.
 HWCFLAGS = $(CFLAGS) -std=gnu99 -Wno-unused -Wno-sign-compare
 
-HW_SRCS  = rdn_uvd.c rdn_gart.c rdn_mc.c rdn_watermark.c rdn_pm.c rdn_cursor.c rdn_mem.c rdn_gpu.c rdn_cp.c rdn_blit.c rdn_selftest.c rdn_post.c rdn_atom.c rdn_i2c.c rdn_mode.c rdn_dmt.c rdn_modeset.c rdn_dp.c \
+HW_SRCS  = rdn_cayman_gating.c rdn_cayman_memory.c rdn_dma.c rdn_uvd.c rdn_gart.c rdn_mc.c rdn_watermark.c rdn_cayman_dpm.c rdn_smc.c rdn_pm.c rdn_cursor.c rdn_mem.c rdn_gpu.c rdn_cp.c rdn_blit.c rdn_selftest.c rdn_post.c rdn_atom.c rdn_i2c.c rdn_mode.c rdn_dmt.c rdn_modeset.c rdn_dp.c \
 	rdn_pattern.c atom/atom.c
 HW_OBJS  = $(addprefix $(BUILD)/hw/,$(HW_SRCS:.c=.o))
-HW_OBJS += $(BUILD)/hw/rdn_mc_layout.o $(BUILD)/hw/rdn_uvd_h264.o $(BUILD)/hw/rdn_cp_dma_readback.o
+HW_OBJS += $(BUILD)/hw/rdn_cayman.o $(BUILD)/hw/rdn_mc_layout.o $(BUILD)/hw/rdn_uvd_h264.o $(BUILD)/hw/rdn_cp_dma_readback.o
 OBJS     = $(BUILD)/RadeonNI.o $(BUILD)/RadeonNIAccel.o $(BUILD)/RadeonNISurface.o $(BUILD)/kmod_info.o $(HW_OBJS)
+OBJS    += $(BUILD)/RadeonNIFence.o $(BUILD)/RadeonNITelemetry.o $(BUILD)/RadeonNIManaged.o
 OBJS    += $(BUILD)/RadeonNIVideo.o $(BUILD)/RadeonNIVideoMemory.o $(BUILD)/RadeonNIUvdSession.o
 OBJS    += $(BUILD)/RadeonNIUvdFixture.o $(BUILD)/uvd_decode_fixture.o
 ifeq ($(LEOPARD),1)
@@ -64,7 +67,9 @@ $(BUILD)/RadeonNIUvdFixture.o: ../../tests/uvd_decode_fixture.h
 $(BUNDLE): $(OBJS) Info.plist
 	@mkdir -p $(BUNDLE)/Contents/MacOS
 	g++ -arch ppc -static -nostdlib -r $(OBJS) -lkmodc++ -lkmod -lcc_kext \
-		-o $(BUNDLE)/Contents/MacOS/$(KEXT)
+		-o $(BUNDLE)/Contents/MacOS/$(KEXT).new
+	nm -u $(BUNDLE)/Contents/MacOS/$(KEXT).new > /dev/null
+	mv $(BUNDLE)/Contents/MacOS/$(KEXT).new $(BUNDLE)/Contents/MacOS/$(KEXT)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
 ifeq ($(LEOPARD),1)
 	perl -0777 -pi -e 's/com\.apple\.kernel\.(iokit|libkern|mach)/com.apple.kpi.$$1/g; s/<string>6\.0<\/string>/<string>9.0.0<\/string>/g; s{(<key>OSBundleLibraries</key>\s*<dict>)}{$$1\n\t\t<key>com.apple.kpi.bsd</key>\n\t\t<string>9.0.0</string>\n\t\t<key>com.apple.kpi.unsupported</key>\n\t\t<string>9.0.0</string>}' $(BUNDLE)/Contents/Info.plist

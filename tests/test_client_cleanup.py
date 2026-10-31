@@ -23,7 +23,7 @@ void IOLockUnlock(int *p){if(p==&allocationMutex){assert(allocationLocks==1);--a
 class RadeonNIAccel {
 public:
  enum{kMaxGartBindings=4};int lock=0,*fLock=&lock;
- struct Binding{void *memory,*owner;UInt32 offset;}fGartBound[4]{};
+ struct Binding{void *memory,*owner;UInt32 offset;UInt32 vram=0;}fGartBound[4]{};
  struct Shape{bool used;void *owner;UInt32 bufWidth,bufOffset;void *backingClient=nullptr;void *producerTask=nullptr;bool gl=false;UInt32 bufRowBytes=0,bufHeight=0;}fShapes[8]{};
  UInt32 fShapeCapacity=8;struct{UInt32 fence_emitted=19;}fAccel;
  bool fSurfaceGpuStalled=false;
@@ -32,7 +32,7 @@ public:
  void uvdUser(bool add){assert(!add);++rawDrops;}
  bool fenceWait(UInt32 fence,UInt32 ms){assert(!locks&&fence==19&&ms==10000);return gfxSafe;}
  void freeVram(UInt32 offset){assert(!locks);freed.push_back(offset);}
- int gartUnbind(UInt32 offset,void *owner){for(auto &b:fGartBound)if(b.memory&&b.offset==offset&&b.owner==owner){unbound.push_back(offset);b.memory=nullptr;return 0;}assert(false);return 1;}
+ int gartUnbind(UInt32 offset,void *owner){for(auto &b:fGartBound)if((b.memory||b.vram)&&b.offset==offset&&b.owner==owner){unbound.push_back(offset);b.memory=nullptr;b.vram=0;return 0;}assert(false);return 1;}
  void clearSurfaceBufferRecord(Shape *record);
  void gartUnbindAll(void*);
  void retainClientMemory(const UInt32*,UInt32,void*);
@@ -51,6 +51,7 @@ int main(){
  for(unsigned mode=0;mode<5;++mode){
   RadeonNIAccel a;RadeonNIUserClient client;client.fAccel=&a;int memory=1,other=2;
   a.fGartBound[0]={&memory,&client,1000};a.fGartBound[1]={&other,&other,2000};
+  a.fGartBound[3]={nullptr,&client,4000,5000};
   a.fShapes[0]={true,&client,0,0};a.fShapes[1]={true,&other,64,100};a.fShapes[2]={true,&other,64,999};
   if(mode==0)a.uvdSafe=false;if(mode==1)a.gfxSafe=false;
   if(mode==3)client.fSurfaceGpuFailed=true;if(mode==4)a.fSurfaceGpuStalled=true;
@@ -65,7 +66,7 @@ int main(){
    client.freeAll();assert(a.fGartBound[0].memory==&memory&&!a.fGartBound[0].owner);
    assert(a.freed.size()==1&&a.freed[0]==300&&a.unbound.size()==1&&a.unbound[0]==3000&&!a.fShapes[3].used);
   }else if(mode==4){assert(a.freed.empty()&&a.unbound.empty()&&!a.fGartBound[0].owner);}
-  else{assert(a.freed.size()==2&&a.unbound.size()==1&&!a.fGartBound[0].memory);}
+  else{assert(a.freed.size()==2&&a.unbound.size()==2&&!a.fGartBound[0].memory);}
   assert(!locks&&!allocationLocks);
  }
  puts("PASS client teardown preserves unknown-busy allocations across owner address reuse");

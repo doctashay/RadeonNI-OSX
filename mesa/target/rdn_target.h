@@ -11,11 +11,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+uint32_t rdn_target_device_id(void);
+const char *rdn_target_device_model(void);
+
 /*
  * The surface the display shows, once a GL context exists: 32-bit pixels
  * in the CPU's byte order, `pitch` pixels per row. False if the device
  * does not know it.
  */
+bool rdn_target_surface_screen(uint32_t id, volatile uint32_t **pixels,
+   uint32_t *width, uint32_t *height, uint32_t *pitch, uint32_t *offset, uint32_t *scanout);
 bool rdn_target_screen(volatile uint32_t **pixels, uint32_t *width,
                        uint32_t *height, uint32_t *pitch);
 
@@ -59,6 +64,7 @@ void *rdn_target_vram_map(uint32_t offset);
 bool rdn_target_surface_buffer(uint32_t id, uint32_t offset, uint32_t row_bytes,
                                uint32_t width, uint32_t height);
 #define RDN_TARGET_VRAM_HANDLE 0x7571
+#define RDN_TARGET_HOST_HANDLE 0x7572
 /* The surfaces that keep their picture in such a buffer: id, offset, row
  * bytes, width, height each; at most `max`; returns how many. */
 bool rdn_target_surface_gpu_info(uint32_t id, uint32_t *stride, uint32_t *width, uint32_t *height);
@@ -70,6 +76,7 @@ bool rdn_target_surface_backing(uint32_t id, void **address, uint32_t *stride,
 uint32_t rdn_target_surface_list(uint32_t (*list)[5], uint32_t max);
 /* Distinguish an empty registry from a failed query before reclaiming storage. */
 bool rdn_target_surface_snapshot(uint32_t (*list)[5], uint32_t max, uint32_t *count);
+bool rdn_target_queued_surface_present(void);
 bool rdn_target_surface_query(uint32_t id, uint32_t info[5], bool *found);
 /* The surface that is locked for reading at this moment, or 0. */
 uint32_t rdn_target_surface_locked(void);

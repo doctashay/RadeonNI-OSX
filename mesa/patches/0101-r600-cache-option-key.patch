@@ -1,0 +1,11 @@
+--- a/src/gallium/drivers/r600/r600_pipe_common.c
++++ b/src/gallium/drivers/r600/r600_pipe_common.c
+@@ -768,7 +768,7 @@
+ 	/* These flags affect shader compilation. */
+ 	rscreen->disk_shader_cache =
+ 		disk_cache_create(r600_get_family_name(rscreen),
+-				  cache_id, 0);
++				  cache_id, rscreen->debug_flags);
+ }
+ 
+ static struct disk_cache *r600_get_disk_shader_cache(struct pipe_screen *pscreen)

@@ -7,16 +7,26 @@ BUILD    = build
 BUNDLE   = $(BUILD)/$(KEXT).kext
 
 CPPFLAGS = -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
-	-nostdinc -I$(KROOT)/PrivateHeaders -I$(KROOT)/Headers
+	-nostdinc -I../RadeonNI/compat -I../../hw -I$(KROOT)/PrivateHeaders -I$(KROOT)/Headers
 CFLAGS   = -arch ppc -Os -Wall -fno-builtin -fno-common -static \
 	-mlong-branch -force_cpusubtype_ALL
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -fapple-kext -fcheck-new
 
-OBJS     = $(BUILD)/RomProbe.o $(BUILD)/kmod_info.o
+HW = rdn_atom rdn_post rdn_mc rdn_gpu rdn_cayman rdn_cp rdn_blit rdn_gart rdn_modeset rdn_dp rdn_i2c rdn_mode rdn_dmt rdn_pm rdn_watermark
+OBJS = $(BUILD)/RomProbe.o $(BUILD)/CaymanBringup.o $(BUILD)/kmod_info.o
+OBJS += $(addprefix $(BUILD)/hw/,$(addsuffix .o,$(HW))) $(BUILD)/hw/atom.o
 
 all: $(BUNDLE)
 
-$(BUILD)/%.o: %.cpp
+$(BUILD)/hw/%.o: ../../hw/%.c $(wildcard ../../hw/*.h)
+	@mkdir -p $(dir $@)
+	gcc $(CPPFLAGS) $(CFLAGS) -std=gnu99 -Wno-unused -c -o $@ $<
+
+$(BUILD)/hw/atom.o: ../../hw/atom/atom.c
+	@mkdir -p $(dir $@)
+	gcc $(CPPFLAGS) $(CFLAGS) -std=gnu99 -Wno-unused -c -o $@ $<
+
+$(BUILD)/%.o: %.cpp $(wildcard ../../hw/*.h ../../hw/atom/*.h)
 	@mkdir -p $(dir $@)
 	g++ $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
 

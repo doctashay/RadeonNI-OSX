@@ -25,6 +25,7 @@ struct pipe_screen_config;
  * surface whose place the caller can tell others.
  */
 #define RDN_WINSYS_HANDLE_VRAM 0x7571
+#define RDN_WINSYS_HANDLE_HOST 0x7572
 
 /*
  * After the fence of the newest video decoder stream has been reached: did the firmware answer it? A decode message is

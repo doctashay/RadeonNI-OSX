@@ -2,10 +2,11 @@
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
 #include "RadeonNIVideoMemory.h"
+#include "rdn_video.h"
 bool RadeonNIAccel::videoCharge(UInt32 bytes)
 {
  UInt32 old;
- do { old=fVideoCpuBytes; if(old>20u*1024*1024 || bytes>20u*1024*1024-old) return false; }
+ do { old=fVideoCpuBytes; if(old>RDN_VIDEO_CPU_BUDGET || bytes>RDN_VIDEO_CPU_BUDGET-old) return false; }
  while(!OSCompareAndSwap(old,old+bytes,(UInt32 *)&fVideoCpuBytes)); /* Tiger's prototype takes a plain pointer */
  return true;
 }

@@ -13,6 +13,7 @@
 #include <sys/time.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include "rdn_iokit.h"
 
 #include "rdn_device.h"
@@ -44,12 +45,22 @@ struct gart_chunk {
 	struct rdn_mem mem;
 };
 
+struct small_slab {
+	struct small_slab *next;
+	struct rdn_mem mem;
+};
+
 struct darwin_device {
 	struct rdn_device base;
 	io_connect_t conn;
+	io_service_t service;
+	volatile int graphics_failed;
 	struct rdn_os mem_os;
 	struct gart_chunk gart[GART_CHUNKS];
 	uint32_t gart_bytes;
+	struct small_slab *small_slabs;
+	uint64_t screen_refresh_time;
+	mach_timebase_info_data_t timebase;
 };
 
 static bool has_u4_pcie_parent(io_registry_entry_t service)
@@ -87,12 +98,62 @@ static int dev_alloc(struct rdn_device *dev, uint64_t size, uint64_t align,
 	struct darwin_device *d = (struct darwin_device *)dev;
 	int off = 0;
 
-	if (size > 0xffffffffull || align > 0x10000000ull ||
-	    IOConnectMethodScalarIScalarO(d->conn, RDN_UC_ALLOC, 2, 1,
-					  (int)size, (int)align, &off))
-		return -1;
+	if (size > 0xffffffffull || align > 0x10000000ull)
+		return kIOReturnBadArgument;
+	int result = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_ALLOC, 2, 1,
+						 (int)size, (int)align, &off);
+	if (result)
+		return result;
 	*offset = (uint32_t)off;
 	return 0;
+}
+
+/* Entries stay owned until the winsys has retired their last fence. */
+static int dev_alloc_small(struct rdn_device *dev, uint64_t size,
+                           uint64_t align, uint64_t *offset)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	struct small_slab *slab;
+	uint64_t parent;
+	if (!size || size > 4096 || !align || align > 4096) return -1;
+	for (slab = d->small_slabs; slab; slab = slab->next)
+		if (!rdn_mem_alloc(&slab->mem, size, align, offset)) return 0;
+	slab = calloc(1, sizeof(*slab));
+	if (!slab) return -1;
+	if (dev_alloc(dev, 65536, 4096, &parent)) { free(slab); return -1; }
+	if (rdn_mem_init(&slab->mem, &d->mem_os, parent, 65536) ||
+	    rdn_mem_alloc(&slab->mem, size, align, offset)) {
+		rdn_mem_fini(&slab->mem);
+		IOConnectMethodScalarIScalarO(d->conn, RDN_UC_FREE, 1, 0, (int)parent);
+		free(slab);
+		return -1;
+	}
+	slab->next = d->small_slabs;
+	d->small_slabs = slab;
+	if (getenv("RDN_STATS"))
+		fprintf(stderr, "rdn: small slab parent=%llx bytes=65536\n", (unsigned long long)parent);
+	return 0;
+}
+
+static bool dev_is_small(struct rdn_device *dev, uint64_t offset)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	struct small_slab *slab;
+	for (slab = d->small_slabs; slab; slab = slab->next)
+		if (offset >= slab->mem.base && offset - slab->mem.base < slab->mem.size)
+			return true;
+	return false;
+}
+
+static int dev_alloc_command(struct rdn_device *dev, uint64_t size, uint64_t align, uint64_t *offset)
+{
+ struct darwin_device *d = (struct darwin_device *)dev;
+ int off = 0;
+ if (size > 0xffffffffull || align > 0x10000000ull) return kIOReturnBadArgument;
+ int error = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_ALLOC_COMMAND, 2, 1,
+                                          (uint32_t)size, (uint32_t)align, &off);
+ if (!error) *offset = (uint32_t)off;
+ return error;
 }
 
 static int dev_alloc_hidden(struct rdn_device *dev, uint64_t size, uint64_t align,
@@ -101,10 +162,12 @@ static int dev_alloc_hidden(struct rdn_device *dev, uint64_t size, uint64_t alig
 	struct darwin_device *d = (struct darwin_device *)dev;
 	int off = 0;
 
-	if (size > 0xffffffffull || align > 0x10000000ull ||
-	    IOConnectMethodScalarIScalarO(d->conn, RDN_UC_ALLOC_HIDDEN, 2, 1,
-					  (int)size, (int)align, &off))
-		return -1;
+	if (size > 0xffffffffull || align > 0x10000000ull)
+		return kIOReturnBadArgument;
+	int result = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_ALLOC_HIDDEN, 2, 1,
+						 (int)size, (int)align, &off);
+	if (result)
+		return result;
 	*offset = (uint32_t)off;
 	return 0;
 }
@@ -138,14 +201,12 @@ static struct gart_chunk *gart_new_chunk(struct darwin_device *d, uint64_t size,
 					 uint64_t align)
 {
 	vm_address_t addr = 0;
-	/*
-	 * A chunk for one large buffer is a little larger than it: the
-	 * chunk's start in the GART is only page aligned, and the buffer's
-	 * own alignment may move it, which an exact fit cannot take (a
-	 * 256 MB buffer was refused every time and its chunk stayed bound).
-	 */
-	vm_size_t bytes = size > GART_CHUNK_BYTES ?
-		(vm_size_t)((size + align + 4095) & ~4095ull) : GART_CHUNK_BYTES;
+	/* Reserve only the alignment slack beyond the kernel's page alignment. */
+	uint64_t needed = size + (align > 4096 ? align - 4096 : 0);
+	if (needed < size || needed > GART_MOST_BYTES)
+		return NULL;
+	needed = (needed + 4095) & ~4095ull;
+	vm_size_t bytes = (vm_size_t)(needed > GART_CHUNK_BYTES ? needed : GART_CHUNK_BYTES);
 	struct gart_chunk *c = NULL;
 	int i, offset = 0;
 
@@ -171,10 +232,13 @@ static struct gart_chunk *gart_new_chunk(struct darwin_device *d, uint64_t size,
 	{
 		int br = bind_address(d, addr, bytes, &offset);
 
-		if (br || rdn_mem_init(&c->mem, &d->mem_os, (uint32_t)offset, bytes)) {
+		int mr = br ? 0 : rdn_mem_init(&c->mem, &d->mem_os, (uint32_t)offset, bytes);
+		if (br || mr) {
 			if (getenv("RDN_STATS"))
-				fprintf(stderr, "rdn: GART chunk of %lu bytes: bind returned 0x%x\n",
-					(unsigned long)bytes, (unsigned)br);
+				fprintf(stderr, "rdn: GART chunk of %lu bytes: bind=0x%x, allocator=%d\n",
+					(unsigned long)bytes, (unsigned)br, mr);
+			if (!br)
+				IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_UNBIND, 1, 0, offset);
 			vm_deallocate(mach_task_self(), addr, bytes);
 			return NULL;
 		}
@@ -222,18 +286,18 @@ static void dev_screen_refresh(struct rdn_device *dev)
 	struct darwin_device *d = (struct darwin_device *)dev;
 	struct rdn_user_info info;
 	IOByteCount size = sizeof(info);
-	static uint64_t last;
 	uint64_t now = mach_absolute_time();
-	static mach_timebase_info_data_t tb;
 
-	if (!tb.denom)
-		mach_timebase_info(&tb);
-	if (last && (now - last) * tb.numer / tb.denom < 20000000ull)
+	if (!d->timebase.denom && mach_timebase_info(&d->timebase))
 		return;
-	last = now;
+	if (d->screen_refresh_time &&
+	    (now - d->screen_refresh_time) * d->timebase.numer /
+	    d->timebase.denom < 20000000ull)
+		return;
 	if (IOConnectMethodScalarIStructureO(d->conn, RDN_UC_GET_INFO, 0, &size, &info) ||
 	    info.version != RDN_USER_VERSION)
 		return;
+	d->screen_refresh_time = now;
 	if (info.fb_bits_per_pixel == 32) {
 		d->base.screen.offset = info.fb_offset;
 		d->base.screen.width = info.fb_width;
@@ -242,6 +306,21 @@ static void dev_screen_refresh(struct rdn_device *dev)
 	} else {
 		d->base.screen.width = 0;
 	}
+}
+
+static bool dev_surface_screen(struct rdn_device *dev, uint32_t id, struct rdn_screen *screen)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	struct rdn_user_screen info;
+	IOByteCount size = sizeof(info);
+	if (IOConnectMethodScalarIStructureO(d->conn, RDN_UC_SURFACE_SCREEN, 1,
+	    &size, id, &info) || size != sizeof(info) || info.bits_per_pixel != 32)
+		return false;
+	if (!info.width || !info.height || info.width > info.pitch_pixels ||
+	    (uint64_t)info.offset + (uint64_t)info.pitch_pixels * 4 * info.height > dev->aperture_size)
+		return false;
+	memcpy(screen, &info, sizeof(info));
+	return true;
 }
 
 static int dev_gart_alloc(struct rdn_device *dev, uint64_t size, uint64_t align,
@@ -328,12 +407,68 @@ static int dev_gart_bind_user(struct rdn_device *dev, void *address, uint64_t si
 	return 0;
 }
 
-static void dev_gart_unbind_user(struct rdn_device *dev, uint64_t offset, uint64_t size)
+static int dev_gart_unbind_user(struct rdn_device *dev, uint64_t offset, uint64_t size)
 {
-	struct darwin_device *d = (struct darwin_device *)dev;
+ struct darwin_device *d = (struct darwin_device *)dev;
+ int error = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_UNBIND, 1, 0, (uint32_t)offset);
+ if (!error) d->gart_bytes -= (uint32_t)size;
+ return error;
+}
 
-	IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_UNBIND, 1, 0, (int)offset);
-	d->gart_bytes -= (uint32_t)size;
+static int dev_managed_alias(struct rdn_device *dev, uint64_t physical,
+                              uint64_t bytes, unsigned alignment, uint64_t *alias)
+{
+ struct darwin_device *d = (struct darwin_device *)dev;
+ int at = 0;
+ int error = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_MANAGED_ALIAS, 3, 1,
+                                          (uint32_t)physical, (uint32_t)bytes, alignment, &at);
+ if (!error) *alias = (uint32_t)at;
+ return error;
+}
+
+static int dev_managed_evict(struct rdn_device *dev, uint64_t alias,
+                              uint64_t bytes, void **backing)
+{
+ struct darwin_device *d = (struct darwin_device *)dev;
+ vm_address_t address = 0;
+ if (bytes > GART_MOST_BYTES - d->gart_bytes ||
+     vm_allocate(mach_task_self(), &address, bytes, VM_FLAGS_ANYWHERE)) return -ENOMEM;
+ int error = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_MANAGED_EVICT, 3, 0,
+                                          (uint32_t)alias, (uint32_t)address,
+                                          (uint32_t)((uint64_t)address >> 32));
+ if (error) {
+  /* Only a timeout can follow a changed mapping or submitted copy. */
+  if (error != kIOReturnTimeout) vm_deallocate(mach_task_self(), address, bytes);
+  return error == kIOReturnTimeout ? error : -ENOMEM;
+ }
+ d->gart_bytes += (uint32_t)bytes;
+ *backing = (void *)address;
+ return 0;
+}
+
+static int dev_managed_promote(struct rdn_device *dev, uint64_t alias,
+                                uint64_t physical, uint64_t bytes, void *backing)
+{
+ struct darwin_device *d = (struct darwin_device *)dev;
+ int error = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_MANAGED_PROMOTE, 2, 0,
+                                          (uint32_t)alias, (uint32_t)physical);
+ if (!error) {
+  vm_deallocate(mach_task_self(), (vm_address_t)backing, bytes);
+  d->gart_bytes -= (uint32_t)bytes;
+ }
+ return error;
+}
+
+static int dev_managed_release(struct rdn_device *dev, uint64_t alias,
+                                uint64_t bytes, void *backing)
+{
+ struct darwin_device *d = (struct darwin_device *)dev;
+ int error = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_UNBIND, 1, 0, (uint32_t)alias);
+ if (!error && backing) {
+  vm_deallocate(mach_task_self(), (vm_address_t)backing, bytes);
+  d->gart_bytes -= (uint32_t)bytes;
+ }
+ return error;
 }
 
 static void *dev_gart_cpu(struct rdn_device *dev, uint64_t offset)
@@ -347,6 +482,22 @@ static void dev_free(struct rdn_device *dev, uint64_t offset)
 {
 	struct darwin_device *d = (struct darwin_device *)dev;
 
+	struct small_slab **link = &d->small_slabs;
+	while (*link) {
+		struct small_slab *slab = *link;
+		if (offset >= slab->mem.base && offset - slab->mem.base < slab->mem.size) {
+			rdn_mem_free(&slab->mem, offset);
+			if (rdn_mem_available(&slab->mem) == slab->mem.size) {
+				uint64_t parent = slab->mem.base;
+				*link = slab->next;
+				rdn_mem_fini(&slab->mem);
+				free(slab);
+				IOConnectMethodScalarIScalarO(d->conn, RDN_UC_FREE, 1, 0, (int)parent);
+			}
+			return;
+		}
+		link = &slab->next;
+	}
 	IOConnectMethodScalarIScalarO(d->conn, RDN_UC_FREE, 1, 0, (int)offset);
 }
 
@@ -356,11 +507,65 @@ static int dev_submit(struct rdn_device *dev, uint64_t offset, uint32_t words,
 	struct darwin_device *d = (struct darwin_device *)dev;
 	int seq = 0;
 
-	if (IOConnectMethodScalarIScalarO(d->conn, RDN_UC_SUBMIT, 2, 1,
-					  (int)offset, (int)words, &seq))
-		return -1;
+	kern_return_t result = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_SUBMIT, 2, 1,
+					  (int)offset, (int)words, &seq);
+	if (result) {
+		if (result == kIOReturnNotReady)
+			__sync_lock_test_and_set(&d->graphics_failed, 1);
+		fprintf(stderr, "rdn: submit offset=%llx words=%u failed 0x%08x\n",
+		        (unsigned long long)offset, words, result);
+		return result;
+	}
 	*fence = (uint32_t)seq;
 	return 0;
+}
+
+/* Reject a quarantined queue before Mesa wires any GART allocations. */
+static int dev_probe_submission(struct darwin_device *d, void *aperture, uint64_t bytes)
+{
+	int offset = 0, done = 0;
+	uint32_t fence = 0;
+	int version = 0;
+	unsigned method = !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_COMMAND_INFO,
+		0, 1, &version) && version == 1 ? RDN_UC_ALLOC_COMMAND : RDN_UC_ALLOC;
+	kern_return_t result = IOConnectMethodScalarIScalarO(d->conn, method,
+		2, 1, 4096, 4096, &offset);
+	if (result) return result;
+	if (bytes < 64 || (uint32_t)offset > bytes - 64) {
+		IOConnectMethodScalarIScalarO(d->conn, RDN_UC_FREE, 1, 0, offset);
+		return kIOReturnBadArgument;
+	}
+	volatile uint32_t *commands = (volatile uint32_t *)((uint8_t *)aperture + (uint32_t)offset);
+	for (unsigned i = 0; i < 16; ++i) commands[i] = 0x80000000u;
+	__asm__ volatile("sync" ::: "memory");
+	result = dev_submit(&d->base, (uint32_t)offset, 16, &fence);
+	if (!result)
+		result = IOConnectMethodScalarIScalarO(d->conn, RDN_UC_FENCE_WAIT,
+			2, 1, fence, 2000, &done);
+	/* Unknown completion stays owned by the client cleanup path. */
+	if (!result && done)
+		IOConnectMethodScalarIScalarO(d->conn, RDN_UC_FREE, 1, 0, offset);
+	return result ? result : done ? 0 : kIOReturnTimeout;
+}
+
+static int dev_graphics_fault(struct rdn_device *dev)
+{
+	struct darwin_device *d = (struct darwin_device *)dev;
+	if (__sync_fetch_and_or(&d->graphics_failed, 0)) return 1;
+	int flags = 0, events = 0, fallbacks = 0;
+	if (!IOConnectMethodScalarIScalarO(d->conn, RDN_UC_FENCE_CONTROL, 1, 3,
+		0, &flags, &events, &fallbacks) && (flags & 4)) {
+		__sync_lock_test_and_set(&d->graphics_failed, 1);
+		return 1;
+	}
+	if (!d->service) return -1;
+	CFTypeRef value = IORegistryEntryCreateCFProperty(d->service,
+		CFSTR("RadeonNISurfaceGPURebootRequired"), kCFAllocatorDefault, 0);
+	int fault = value && CFGetTypeID(value) == CFBooleanGetTypeID() &&
+		CFBooleanGetValue((CFBooleanRef)value);
+	if (value) CFRelease(value);
+	if (fault) __sync_lock_test_and_set(&d->graphics_failed, 1);
+	return fault;
 }
 
 static bool fence_wait_ms(struct darwin_device *d, uint32_t fence, uint32_t ms)
@@ -623,6 +828,7 @@ static int dev_fence_wait(struct rdn_device *dev, uint32_t fence,
 	bool reached = false;
 	unsigned i;
 
+	if (__sync_fetch_and_or(&d->graphics_failed, 0)) return -1;
 	if (spin_us < 0) {
 		spin_us = env_number("RDN_FENCE_SPIN");
 		stats = env_number("RDN_STATS");
@@ -813,17 +1019,24 @@ static void dev_destroy(struct rdn_device *dev)
 {
 	struct darwin_device *d = (struct darwin_device *)dev;
 
+	while (d->small_slabs) {
+		struct small_slab *slab = d->small_slabs;
+		d->small_slabs = slab->next;
+		rdn_mem_fini(&slab->mem);
+		free(slab);
+	}
 	/* Closing frees what this process allocated and unmaps the aperture. */
 	IOServiceClose(d->conn);
+	IOObjectRelease(d->service);
 	free(d);
 }
 
-struct rdn_device *rdn_device_open(void)
+struct rdn_device *rdn_device_open_service(uint32_t service)
 {
+	static const io_name_t service_class = RDN_UC_SERVICE_CLASS;
 	struct darwin_device *d = calloc(1, sizeof(*d));
 	struct rdn_user_info info;
 	IOByteCount size = sizeof(info);
-	io_service_t service;
 #ifdef __LP64__
 	mach_vm_address_t addr = 0;
 	mach_vm_size_t len = 0;
@@ -835,16 +1048,13 @@ struct rdn_device *rdn_device_open(void)
 
 	if (!d)
 		return NULL;
-	service = IOServiceGetMatchingService(kIOMasterPortDefault,
-			IOServiceMatching(RDN_UC_SERVICE_CLASS));
-	if (!service) {
-		fprintf(stderr, "rdn: no %s service\n", RDN_UC_SERVICE_CLASS);
+	if (!service || !IOObjectConformsTo(service, service_class)) {
+		fprintf(stderr, "rdn: invalid %s service\n", RDN_UC_SERVICE_CLASS);
 		goto fail;
 	}
 	kr = IOServiceOpen(service, mach_task_self(), RDN_UC_TYPE_V2, &d->conn);
 	if (has_u4_pcie_parent(service))
 		d->base.info.cp_dma_gtt_copy_max_bytes = 128;
-	IOObjectRelease(service);
 	if (kr) {
 		fprintf(stderr, "rdn: cannot open the accelerator (0x%x)\n", kr);
 		goto fail;
@@ -863,10 +1073,43 @@ struct rdn_device *rdn_device_open(void)
 		goto fail_close;
 	}
 
+	kr = dev_probe_submission(d, (void *)addr, len);
+	if (kr) {
+		fprintf(stderr, "rdn: GPU %04x rejected startup submission (0x%x)\n",
+		        info.pci_device_id, kr);
+		IOConnectUnmapMemory(d->conn, RDN_UC_MEMORY_APERTURE, mach_task_self(), addr);
+		goto fail_close;
+	}
+
+	{
+		int flags = 0, events = 0, fallback = 0;
+		if (!IOConnectMethodScalarIScalarO(d->conn, RDN_UC_FENCE_CONTROL, 1, 3,
+		                                  0, &flags, &events, &fallback))
+			d->base.info.queued_surface_present = (flags & 2) != 0;
+	}
 	d->base.info.pci_device_id = info.pci_device_id;
+	CFTypeRef model = IORegistryEntrySearchCFProperty(service, kIOServicePlane,
+		CFSTR("model"), kCFAllocatorDefault,
+		kIORegistryIterateRecursively | kIORegistryIterateParents);
+	if (model) {
+		if (CFGetTypeID(model) == CFStringGetTypeID())
+			CFStringGetCString(model, d->base.info.model,
+				sizeof(d->base.info.model), kCFStringEncodingUTF8);
+		else if (CFGetTypeID(model) == CFDataGetTypeID()) {
+			size_t length = CFDataGetLength(model);
+			if (length >= sizeof(d->base.info.model)) length = sizeof(d->base.info.model) - 1;
+			memcpy(d->base.info.model, CFDataGetBytePtr(model), length);
+			d->base.info.model[length] = 0;
+		}
+		CFRelease(model);
+	}
 	d->base.info.vram_gpu_base = ((uint64_t)info.vram_gpu_base_hi << 32) |
 				     info.vram_gpu_base_lo;
 	d->base.info.vram_size = info.heap_size;
+	if (getenv("RDN_SMALL_BO_SLABS") && atoi(getenv("RDN_SMALL_BO_SLABS"))) {
+		d->base.alloc_small = dev_alloc_small;
+		d->base.is_small = dev_is_small;
+	}
 	/* The GART, if the kext has it on (boot argument rdn_gart=1). */
 	{
 		int on = 0, gpu_start = 0, pages = 0;
@@ -877,6 +1120,8 @@ struct rdn_device *rdn_device_open(void)
 		    !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_GART_INFO, 0, 3,
 						   &on, &gpu_start, &pages) && on) {
 			d->base.info.gart_gpu_base = (uint32_t)gpu_start;
+			uint64_t gart_bytes = (uint64_t)(uint32_t)pages * 4096;
+			d->base.info.gart_size = gart_bytes < GART_MOST_BYTES ? gart_bytes : GART_MOST_BYTES;
 			d->base.gart_alloc = dev_gart_alloc;
 			d->base.gart_free = dev_gart_free;
 			d->base.gart_cpu = dev_gart_cpu;
@@ -884,6 +1129,17 @@ struct rdn_device *rdn_device_open(void)
 				d->base.gart_bind_user = dev_gart_bind_user;
 				d->base.gart_unbind_user = dev_gart_unbind_user;
 			}
+		}
+	}
+	{
+		int version = 0;
+		const char *managed = getenv("RDN_LIVE_EVICTION");
+		if (d->base.gart_alloc && (!managed || strcmp(managed, "0")) &&
+		    !IOConnectMethodScalarIScalarO(d->conn, RDN_UC_MANAGED_INFO, 0, 1, &version) && version == 1) {
+			d->base.managed_alias = dev_managed_alias;
+			d->base.managed_evict = dev_managed_evict;
+			d->base.managed_promote = dev_managed_promote;
+			d->base.managed_release = dev_managed_release;
 		}
 	}
 	/* An older kext has no such method: then there is no hidden memory. */
@@ -912,10 +1168,16 @@ struct rdn_device *rdn_device_open(void)
 		d->base.screen.height = info.fb_height;
 		d->base.screen.pitch_pixels = info.fb_pitch_pixels;
 	}
+	{
+	 int version = 0;
+	 if (!IOConnectMethodScalarIScalarO(d->conn, RDN_UC_COMMAND_INFO, 0, 1, &version) && version == 1)
+	  d->base.alloc_command = dev_alloc_command;
+	}
 	d->base.alloc = dev_alloc;
 	d->base.free = dev_free;
 	d->base.submit = dev_submit;
 	d->base.fence_done = dev_fence_done;
+	d->base.graphics_fault = dev_graphics_fault;
 	d->base.fence_wait = dev_fence_wait;
 	d->base.sync_for_cpu = dev_sync_for_cpu;
 	d->base.destroy = dev_destroy;
@@ -949,10 +1211,13 @@ struct rdn_device *rdn_device_open(void)
     d->base.surface_gpu_info = dev_surface_gpu_info;
     d->base.surface_gpu_copy = dev_surface_gpu_copy;
 	d->base.screen_refresh = dev_screen_refresh;
+	d->base.surface_screen = dev_surface_screen;
 	d->base.surface_buffer = dev_surface_buffer;
 	d->base.surface_list = dev_surface_list;
 	d->base.surface_query = dev_surface_query;
 	d->base.surface_locked = dev_surface_locked;
+	IOObjectRetain(service);
+	d->service = service;
 	return &d->base;
 
 fail_close:
@@ -960,4 +1225,36 @@ fail_close:
 fail:
 	free(d);
 	return NULL;
+}
+
+struct rdn_device *rdn_device_open(void)
+{
+	CFMutableDictionaryRef match = IOServiceMatching(RDN_UC_SERVICE_CLASS);
+	io_service_t service;
+	if (!match) return NULL;
+#ifdef RDN_GPU_INDEX
+	int index = RDN_GPU_INDEX;
+	CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &index);
+	CFMutableDictionaryRef properties = CFDictionaryCreateMutable(NULL, 0,
+		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	if (!number || !properties) {
+		if (number) CFRelease(number);
+		if (properties) CFRelease(properties);
+		CFRelease(match);
+		return NULL;
+	}
+	CFDictionarySetValue(properties, CFSTR("GLDDeviceIndex"), number);
+	CFDictionarySetValue(match, CFSTR("IOPropertyMatch"), properties);
+	CFRelease(properties);
+	CFRelease(number);
+#endif
+	service = IOServiceGetMatchingService(kIOMasterPortDefault, match);
+	struct rdn_device *dev;
+	if (!service) {
+		fprintf(stderr, "rdn: no %s service\n", RDN_UC_SERVICE_CLASS);
+		return NULL;
+	}
+	dev = rdn_device_open_service(service);
+	IOObjectRelease(service);
+	return dev;
 }

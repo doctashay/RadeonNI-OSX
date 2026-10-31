@@ -56,9 +56,9 @@ enum rdn_place { RDN_VISIBLE,RDN_HIDDEN,RDN_GART,RDN_USER,RDN_SEGMENT };
 struct list_head { int dummy; };
 struct rdn_busy { uint32_t number; bool used,uvd,unknown; };
 struct pb_buffer_lean { uint64_t size; };
-struct rdn_bo { struct pb_buffer_lean base; uint64_t offset; unsigned flags;
+struct rdn_bo { struct pb_buffer_lean base; uint64_t offset; unsigned flags,diagnostic_id;
    struct rdn_busy last_use,last_write,last_uvd; void *external_store,*user;
-   bool foreign; enum rdn_place region; uint8_t *shadow; };
+   bool foreign; enum rdn_place region; uint8_t *shadow; uint64_t managed_alias,managed_size; void *evicted_storage,*host_lease; void (*host_release)(void *); struct list_head managed_link; };
 struct radeon_winsys { int unused; };
 struct rdn_device {
    void *aperture; struct { uint64_t vram_gpu_base; } info;
@@ -68,11 +68,13 @@ struct rdn_device {
    void (*sync_for_cpu)(struct rdn_device *);
    void *(*gart_cpu)(struct rdn_device *,uint64_t);
    void (*release_external)(struct rdn_device *,void *);
+   int (*gart_unbind_user)(struct rdn_device *,uint64_t,uint64_t);
+   int (*managed_release)(struct rdn_device *,uint64_t,uint64_t,void *);
 };
 struct radeon_drm_winsys { struct radeon_winsys base; int lock; struct rdn_device *dev;
    bool uvd_seg,uvd_split,uvd_used,uvd_check; uint64_t uvd_msg_at,uvd_fb_at;
    uint32_t uvd_msg_type,uvd_msg_num; uint64_t num_flushes,allocated_bytes;
-   struct list_head pending_ibs; };
+   struct list_head pending_ibs,managed_buffers; uint64_t managed_resident; };
 struct rdn_fence { unsigned refs; uint32_t number; bool uvd,reached,submitted,failed; };
 struct pipe_fence_handle { int unused; };
 struct rdn_cs_buffer { struct rdn_bo *bo; unsigned usage,slot; };
@@ -85,6 +87,11 @@ struct radeon_cmdbuf { void *priv; struct { unsigned cdw; uint32_t *buf; } curre
 struct rdn_pending_ib { struct list_head list; uint64_t offset,size; struct rdn_busy busy; };
 struct rdn_uvd_dbg { unsigned n,cmd[8],offset[8]; struct rdn_bo *bo[8]; };
 static struct { uint64_t flushes,bytes; unsigned most_buffers; } rdn_cs_stats;
+static bool rdn_promote_buffer(struct radeon_drm_winsys *w,struct rdn_bo *b) { return true; }
+static void list_del(struct list_head *p) {}
+static unsigned host_releases,host_unbinds;static int host_error;
+static int unbind_host(struct rdn_device *d,uint64_t o,uint64_t s){host_unbinds++;return host_error;}
+static void release_host(void *p){assert(p==(void*)0x1234);host_releases++;}
 static struct radeon_drm_winsys ws;
 static struct rdn_cs cs;
 static struct rdn_bo bo[2];
@@ -164,8 +171,9 @@ static bool rdn_cs_is_buffer_referenced(struct radeon_cmdbuf *r,struct pb_buffer
       if(&c->buffers[i].bo->base==b && (c->buffers[i].usage & usage))return true;
    return false;
 }
-static size_t rdn_trace_words(const uint32_t *p,unsigned n,bool complete) { return 0; }
-static bool rdn_trace_encode(const uint32_t *p,unsigned n,uint32_t *d,unsigned count,uint64_t addr,bool complete) { return false; }
+enum rdn_trace_mode { RDN_TRACE_CP, RDN_TRACE_COMPLETE, RDN_TRACE_RETIRE };
+static size_t rdn_trace_words(const uint32_t *p,unsigned n,enum rdn_trace_mode mode) { return 0; }
+static bool rdn_trace_encode(const uint32_t *p,unsigned n,uint32_t *d,unsigned count,uint64_t addr,enum rdn_trace_mode mode) { return false; }
 static FILE *rdn_capture_submission(struct radeon_cmdbuf *r,uint64_t o,const uint32_t *p,unsigned n,uint64_t m) { return NULL; }
 static void rdn_capture_result(FILE *f,int r,uint32_t n) {}
 static unsigned rdn_complete_packet_words(const uint32_t *p,unsigned n) { return n; }
@@ -280,6 +288,13 @@ int main(void) {
    b->foreign=true;b->external_store=aperture;fail_number=10;
    rdn_buffer_destroy(NULL,&b->base);CHECK(!external_releases && !cached);
    fail_number=0;rdn_buffer_destroy(NULL,&b->base);CHECK(external_releases==1);
+   reset(false);b=calloc(1,sizeof(*b));*b=bo[0];
+   b->host_lease=(void*)0x1234;b->host_release=release_host;b->user=aperture;
+   dev.gart_unbind_user=unbind_host;fail_number=10;
+   rdn_buffer_destroy(NULL,&b->base);CHECK(!host_unbinds&&!host_releases);
+   fail_number=0;host_error=-EIO;rdn_buffer_destroy(NULL,&b->base);
+   CHECK(host_unbinds==1&&!host_releases);
+   host_error=0;rdn_buffer_destroy(NULL,&b->base);CHECK(host_unbinds==2&&host_releases==1&&!cached);
    printf("PASS %u checks: actual GFX/UVD flush, map, fence publication and failed-completion retirement\n",checks);
    return 0;
 }
@@ -289,7 +304,7 @@ int main(void) {
 class WinsysSyncTest(unittest.TestCase):
     def test_actual_submission_and_retirement(self):
         source = (ROOT / "mesa/winsys/rdn_winsys.c").read_text()
-        names = ["rdn_busy_wait", "rdn_fence_wait", "rdn_buffer_wait", "rdn_cs_flush_for_map", "rdn_buffer_map",
+        names = ["rdn_busy_wait", "rdn_fence_wait", "rdn_buffer_wait", "rdn_cs_flush_for_map", "rdn_map_failed", "rdn_buffer_map",
                  "rdn_cs_mark_busy", "rdn_cs_fail_fence", "rdn_cs_wait_dependencies", "rdn_cs_release_buffers",
                  "rdn_uvd_cs_flush", "rdn_cs_flush", "rdn_buffer_destroy"]
         body = HARNESS + "\n".join(extract(source, name) for name in names) + CASES

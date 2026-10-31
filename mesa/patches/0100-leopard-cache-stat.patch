@@ -1,0 +1,21 @@
+--- a/src/util/disk_cache_os.c
++++ b/src/util/disk_cache_os.c
+@@ -282,7 +282,17 @@
+          break;
+ 
+       struct stat sb;
+-      if (fstatat(dir_fd, dir_ent->d_name, &sb, 0) == 0) {
++#if defined(__APPLE__) && defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ < 101000
++      char *entry_path = NULL;
++      int stat_result = -1;
++      if (asprintf(&entry_path, "%s/%s", dir_path, dir_ent->d_name) >= 0) {
++         stat_result = lstat(entry_path, &sb);
++         free(entry_path);
++      }
++#else
++      int stat_result = fstatat(dir_fd, dir_ent->d_name, &sb, 0);
++#endif
++      if (stat_result == 0) {
+          struct lru_file *entry = NULL;
+          if (!list_is_empty(lru_file_list))
+             entry = list_first_entry(lru_file_list, struct lru_file, node);

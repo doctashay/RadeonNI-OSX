@@ -6,8 +6,8 @@
  * evergreen_ring_ib_execute() in evergreen.c, r700_cp_stop() in rv770.c,
  * r600_ring_test() and r600_fence_ring_emit() in r600.c, and the ring
  * helpers in radeon_ring.c. Differences: the ring is in video memory
- * instead of GART memory, write-back is off (the read pointer and fences
- * are read from registers), and no interrupt is raised.
+ * instead of GART memory. The read pointer is read from registers; fences
+ * use registers or VRAM, with optional completion interrupts.
  *
  * Copyright 2008 Advanced Micro Devices, Inc.
  * Copyright 2008 Red Hat Inc.
@@ -44,6 +44,7 @@
 #define u32 uint32_t
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #include "linux/evergreen_blit_shaders.h"
+#include "linux/cayman_blit_shaders.h"
 #undef u32
 
 #define RDN_CP_PACKET2		0x80000000
@@ -96,10 +97,14 @@ static int rdn_cp_load_microcode(struct rdn_accel *accel,
 	struct rdn_card *card = accel->card;
 	const uint8_t *fw_data;
 	int i;
+	const struct rdn_family_caps *caps = rdn_family_caps(card->family);
+	const uint32_t pfp_words = caps->pfp_words;
+	const uint32_t me_words = caps->me_words;
 
-	if (!fw || !fw->me || !fw->pfp ||
-	    fw->pfp_size != EVERGREEN_PFP_UCODE_SIZE * 4 ||
-	    fw->me_size != EVERGREEN_PM4_UCODE_SIZE * 4)
+	if (!rdn_family_has_acceleration(card->family) || !pfp_words || !me_words ||
+	    !fw || !fw->me || !fw->pfp ||
+	    fw->pfp_size != pfp_words * 4 ||
+	    fw->me_size != me_words * 4)
 		return -EINVAL;
 
 	rdn_cp_stop(accel);
@@ -109,13 +114,13 @@ static int rdn_cp_load_microcode(struct rdn_accel *accel,
 
 	fw_data = fw->pfp;
 	rdn_wreg(card, CP_PFP_UCODE_ADDR, 0);
-	for (i = 0; i < EVERGREEN_PFP_UCODE_SIZE; i++, fw_data += 4)
+	for (i = 0; i < (int)pfp_words; i++, fw_data += 4)
 		rdn_wreg(card, CP_PFP_UCODE_DATA, rdn_get_be32(fw_data));
 	rdn_wreg(card, CP_PFP_UCODE_ADDR, 0);
 
 	fw_data = fw->me;
 	rdn_wreg(card, CP_ME_RAM_WADDR, 0);
-	for (i = 0; i < EVERGREEN_PM4_UCODE_SIZE; i++, fw_data += 4)
+	for (i = 0; i < (int)me_words; i++, fw_data += 4)
 		rdn_wreg(card, CP_ME_RAM_DATA, rdn_get_be32(fw_data));
 
 	rdn_wreg(card, CP_PFP_UCODE_ADDR, 0);
@@ -145,6 +150,11 @@ int rdn_ring_begin(struct rdn_accel *accel, uint32_t words)
 
 	if (need >= accel->ring_words)
 		return -ENOMEM;
+	if (accel->before_submit) {
+		int r = accel->before_submit(accel->submit_cookie);
+		if (r)
+			return r;
+	}
 	for (i = 0; rdn_ring_free(accel) < need; i++) {
 		if (i >= RDN_USEC_TIMEOUT)
 			return -EBUSY;
@@ -219,7 +229,11 @@ static int rdn_cp_start(struct rdn_accel *accel)
 	struct rdn_card *card = accel->card;
 	int r, i;
 	uint32_t cp_me;
+	const uint32_t *state = rdn_family_engine(card->family) == RDN_ENGINE_CAYMAN ? cayman_default_state : evergreen_default_state;
+	const uint32_t state_size = rdn_family_engine(card->family) == RDN_ENGINE_CAYMAN ? cayman_default_size : evergreen_default_size;
 
+	if (!rdn_family_has_acceleration(card->family))
+		return -EINVAL;
 	r = rdn_ring_begin(accel, 7);
 	if (r) {
 		rdn_log(card->os, RDN_LOG_ERROR, "cp failed to lock ring (%d)", r);
@@ -234,10 +248,10 @@ static int rdn_cp_start(struct rdn_accel *accel)
 	rdn_ring_emit(accel, 0);
 	rdn_ring_commit(accel);
 
-	cp_me = 0xff;
+	cp_me = rdn_family_engine(card->family) == RDN_ENGINE_CAYMAN ? 0 : 0xff;
 	rdn_wreg(card, CP_ME_CNTL, cp_me);
 
-	r = rdn_ring_begin(accel, evergreen_default_size + 19);
+	r = rdn_ring_begin(accel, state_size + 19);
 	if (r) {
 		rdn_log(card->os, RDN_LOG_ERROR, "cp failed to lock ring (%d)", r);
 		return r;
@@ -247,8 +261,8 @@ static int rdn_cp_start(struct rdn_accel *accel)
 	rdn_ring_emit(accel, PACKET3(PACKET3_PREAMBLE_CNTL, 0));
 	rdn_ring_emit(accel, PACKET3_PREAMBLE_BEGIN_CLEAR_STATE);
 
-	for (i = 0; i < (int)evergreen_default_size; i++)
-		rdn_ring_emit(accel, evergreen_default_state[i]);
+	for (i = 0; i < (int)state_size; i++)
+		rdn_ring_emit(accel, state[i]);
 
 	rdn_ring_emit(accel, PACKET3(PACKET3_PREAMBLE_CNTL, 0));
 	rdn_ring_emit(accel, PACKET3_PREAMBLE_END_CLEAR_STATE);
@@ -288,6 +302,9 @@ static int rdn_cp_resume(struct rdn_accel *accel)
 	uint32_t rb_bufsz;
 	int r;
 
+	if (rdn_family_engine(card->family) == RDN_ENGINE_CAYMAN) {
+		rdn_cayman_ring_setup(accel);
+	} else {
 	/* Reset cp; if cp is reset, then PA, SH, VGT also need to be reset */
 	rdn_wreg(card, GRBM_SOFT_RESET, (SOFT_RESET_CP |
 					 SOFT_RESET_PA |
@@ -334,6 +351,8 @@ static int rdn_cp_resume(struct rdn_accel *accel)
 	rdn_wreg(card, CP_RB_BASE, (uint32_t)(ring_addr >> 8));
 	rdn_wreg(card, CP_DEBUG, (1 << 27) | (1 << 28));
 
+	}
+
 	r = rdn_cp_start(accel);
 	if (r)
 		return r;
@@ -355,6 +374,27 @@ static void rdn_fence_emit_reserved(struct rdn_accel *accel, uint32_t *seq)
 	uint32_t cp_coher_cntl = PACKET3_TC_ACTION_ENA | PACKET3_VC_ACTION_ENA |
 		PACKET3_SH_ACTION_ENA | PACKET3_FULL_CACHE_ENA;
 	accel->fence_emitted++;
+	if (accel->fence_memory) {
+		uint64_t addr = rdn_vram_addr(accel, accel->fence_offset);
+		rdn_ring_emit(accel, PACKET3(PACKET3_SURFACE_SYNC, 3));
+		rdn_ring_emit(accel, rdn_family_engine(accel->card->family) == RDN_ENGINE_CAYMAN ?
+			(1u << 31) | PACKET3_FULL_CACHE_ENA | PACKET3_TC_ACTION_ENA |
+			PACKET3_SH_ACTION_ENA : cp_coher_cntl);
+		rdn_ring_emit(accel, 0xffffffff);
+		rdn_ring_emit(accel, 0);
+		rdn_ring_emit(accel, 10);
+		rdn_ring_emit(accel, PACKET3(PACKET3_EVENT_WRITE_EOP, 4));
+		rdn_ring_emit(accel, EVENT_TYPE(0x14) | EVENT_INDEX(5));
+		rdn_ring_emit(accel, (uint32_t)addr);
+		rdn_ring_emit(accel, (uint32_t)(addr >> 32) | (1u << 29) |
+			(accel->fence_interrupt ? 2u << 24 : 0));
+		rdn_ring_emit(accel, accel->fence_emitted);
+		rdn_ring_emit(accel, 0);
+		rdn_ring_commit(accel);
+		if (seq)
+			*seq = accel->fence_emitted;
+		return;
+	}
 	/* flush read cache */
 	rdn_ring_emit(accel, PACKET3(PACKET3_SURFACE_SYNC, 3));
 	rdn_ring_emit(accel, cp_coher_cntl);
@@ -371,6 +411,10 @@ static void rdn_fence_emit_reserved(struct rdn_accel *accel, uint32_t *seq)
 	rdn_ring_emit(accel, PACKET3(PACKET3_SET_CONFIG_REG, 1));
 	rdn_ring_emit(accel, ((FENCE_REG - PACKET3_SET_CONFIG_REG_START) >> 2));
 	rdn_ring_emit(accel, accel->fence_emitted);
+	if (accel->fence_interrupt) {
+		rdn_ring_emit(accel, PACKET0(CP_INT_STATUS, 0));
+		rdn_ring_emit(accel, RB_INT_STAT);
+	}
 	rdn_ring_commit(accel);
 	if (seq)
 		*seq = accel->fence_emitted;
@@ -378,7 +422,7 @@ static void rdn_fence_emit_reserved(struct rdn_accel *accel, uint32_t *seq)
 
 int rdn_fence_emit(struct rdn_accel *accel, uint32_t *seq)
 {
-	int r = rdn_ring_begin(accel, 13);
+	int r = rdn_ring_begin(accel, 16);
 
 	if (r)
 		return r;
@@ -423,6 +467,8 @@ int rdn_cp_dma(struct rdn_accel *accel, uint64_t src, uint64_t dst, uint32_t byt
 
 bool rdn_fence_done(struct rdn_accel *accel, uint32_t seq)
 {
+	if (accel->fence_memory)
+		return (int32_t)(rdn_vram_read32(accel, accel->fence_offset) - seq) >= 0;
 	/* Sequence numbers wrap; "reached" is within half the range. */
 	return (int32_t)(rdn_rreg(accel->card, FENCE_REG) - seq) >= 0;
 }
@@ -437,7 +483,9 @@ int rdn_fence_wait(struct rdn_accel *accel, uint32_t seq, uint32_t timeout_ms)
 			rdn_log(os, RDN_LOG_ERROR,
 				"fence %u not reached (at %u), GRBM_STATUS 0x%08X",
 				(unsigned)seq,
-				(unsigned)rdn_rreg(accel->card, FENCE_REG),
+				(unsigned)(accel->fence_memory ?
+					rdn_vram_read32(accel, accel->fence_offset) :
+					rdn_rreg(accel->card, FENCE_REG)),
 				(unsigned)rdn_rreg(accel->card, GRBM_STATUS));
 			return -ETIMEDOUT;
 		}
@@ -457,7 +505,8 @@ static void rdn_ib_emit_reserved(struct rdn_accel *accel, uint64_t addr,
 	rdn_ring_emit(accel, PACKET3(PACKET3_MODE_CONTROL, 0));
 	rdn_ring_emit(accel, 1);
 
-	next_rptr = accel->wptr + 3 + 4;
+	next_rptr = accel->wptr + 3 + 4 +
+		(rdn_family_engine(accel->card->family) == RDN_ENGINE_CAYMAN ? 5 : 0);
 	rdn_ring_emit(accel, PACKET3(PACKET3_SET_CONFIG_REG, 1));
 	rdn_ring_emit(accel, ((RPTR_SAVE_REG - PACKET3_SET_CONFIG_REG_START) >> 2));
 	rdn_ring_emit(accel, next_rptr);
@@ -471,25 +520,38 @@ static void rdn_ib_emit_reserved(struct rdn_accel *accel, uint64_t addr,
 			     ((uint32_t)addr & 0xFFFFFFFC));
 	rdn_ring_emit(accel, (uint32_t)(addr >> 32) & 0xFF);
 	rdn_ring_emit(accel, words);
+	if (rdn_family_engine(accel->card->family) == RDN_ENGINE_CAYMAN) {
+		rdn_ring_emit(accel, PACKET3(PACKET3_SURFACE_SYNC, 3));
+		rdn_ring_emit(accel, (1u << 31) | PACKET3_FULL_CACHE_ENA |
+			PACKET3_TC_ACTION_ENA | PACKET3_SH_ACTION_ENA);
+		rdn_ring_emit(accel, 0xffffffff);
+		rdn_ring_emit(accel, 0);
+		rdn_ring_emit(accel, 10);
+	}
 	rdn_ring_commit(accel);
 }
 
 int rdn_ib_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
 		  uint32_t *seq)
 {
-	int r = rdn_ring_begin(accel, 9);
+	uint32_t ib_words = rdn_family_engine(accel->card->family) == RDN_ENGINE_CAYMAN ? 14 : 9;
+	uint32_t need = ((ib_words + RDN_RING_ALIGN_MASK) & ~RDN_RING_ALIGN_MASK) +
+		((16u + RDN_RING_ALIGN_MASK) & ~RDN_RING_ALIGN_MASK);
+	int r = rdn_ring_begin(accel, need);
 
 	if (r)
 		return r;
+	/* A failed reservation must not leave an IB running without a fence. */
 	rdn_ib_emit_reserved(accel, addr, words);
-	return rdn_fence_emit(accel, seq);
+	rdn_fence_emit_reserved(accel, seq);
+	return 0;
 }
 
 int rdn_ib_try_submit(struct rdn_accel *accel, uint64_t addr, uint32_t words,
 		     uint32_t *seq)
 {
 	const uint32_t need = ((9u + RDN_RING_ALIGN_MASK) & ~RDN_RING_ALIGN_MASK) +
-		((13u + RDN_RING_ALIGN_MASK) & ~RDN_RING_ALIGN_MASK);
+		((16u + RDN_RING_ALIGN_MASK) & ~RDN_RING_ALIGN_MASK);
 	uint32_t rptr, free_words;
 
 	if (!accel || !accel->ready || !accel->card || !accel->card->os ||
@@ -540,6 +602,8 @@ int rdn_accel_init_hook(struct rdn_accel *accel, struct rdn_card *card,
 	int r;
 
 	memset(accel, 0, sizeof(*accel));
+	if (!card || !rdn_family_has_acceleration(card->family))
+		return -EINVAL;
 	accel->card = card;
 	accel->aperture = (volatile uint32_t *)aperture;
 	accel->aperture_size = aperture_size;
@@ -549,6 +613,14 @@ int rdn_accel_init_hook(struct rdn_accel *accel, struct rdn_card *card,
 	if (!aperture || (ring_bytes & (ring_bytes - 1)) || ring_bytes < 4096 ||
 	    ring_offset + ring_bytes > aperture_size)
 		return -EINVAL;
+
+	if (rdn_family_engine(card->family) == RDN_ENGINE_CAYMAN) {
+		// Keep the EOP completion word in the caller's ring reservation.
+		accel->ring_words /= 2;
+		accel->fence_offset = ring_offset + accel->ring_words * 4;
+		accel->fence_memory = true;
+		rdn_vram_write32(accel, accel->fence_offset, 0);
+	}
 
 	/*
 	 * Video memory stays where ASIC_Init put it in the GPU's address
@@ -613,4 +685,27 @@ int rdn_ib_selftest(struct rdn_accel *accel, uint64_t gpu_addr, uint32_t *cpu)
 		"command buffer at 0x%X%08X did not run (fence %d, scratch 0x%08X)",
 		(unsigned)(gpu_addr >> 32), (unsigned)gpu_addr, r, (unsigned)tmp);
 	return -EINVAL;
+}
+
+/* Discrete Evergreen/Cayman interrupt handling needs the RLC firmware. */
+int rdn_rlc_start(struct rdn_accel *accel, const uint8_t *firmware, size_t size)
+{
+	static const uint32_t clear[] = {0x3f0c,0x3f10,0x3f20,0x3f1c,0x3f14,0x3f18,0x3f44,0x3f48};
+	struct rdn_card *card = accel->card;
+	uint32_t words, i;
+	if (!rdn_family_has_acceleration(card->family))
+		return -EINVAL;
+	words = rdn_family_caps(card->family)->rlc_words;
+	if (!words) return -EINVAL;
+	if (rdn_rreg(card, 0x3f00) & 1) return 0;
+	if (!firmware || size != words * 4) return -EINVAL;
+	rdn_wreg(card, 0x3f00, 0);
+	for (i = 0; i < sizeof(clear)/sizeof(clear[0]); ++i) rdn_wreg(card, clear[i], 0);
+	for (i = 0; i < words; ++i) {
+		rdn_wreg(card, 0x3f2c, i);
+		rdn_wreg(card, 0x3f30, rdn_get_be32(firmware + i * 4));
+	}
+	rdn_wreg(card, 0x3f2c, 0);
+	rdn_wreg(card, 0x3f00, 1);
+	return (rdn_rreg(card, 0x3f00) & 1) ? 0 : -5;
 }

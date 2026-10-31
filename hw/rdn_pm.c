@@ -197,7 +197,7 @@ int rdn_pm_performance_state(struct rdn_card *card, struct rdn_pm_state *state)
 		return r;
 	if (!state->sclk || !state->mclk)
 		return -EINVAL;
-	if (!is_voltage(state->vddc))
+	if (!is_voltage(state->vddc) && card->family != RDN_FAMILY_CAYMAN)
 		state->vddc = 0;
 	if (!is_voltage(state->vddci))
 		state->vddci = 0;
@@ -227,6 +227,76 @@ void rdn_pm_log_states(struct rdn_card *card)
 		rdn_log(card->os, RDN_LOG_ERROR, "PowerPlay table not understood");
 }
 
+int rdn_pm_bios_state(struct rdn_card *card, enum rdn_pm_bios_kind kind,
+                      struct rdn_pm_bios_state *out)
+{
+ uint16_t size=0;
+ const uint8_t *p=data_table(card,GetIndexIntoMasterTable(DATA,PowerPlayInfo),&size);
+ struct rdn_pm_bios_state selected;
+ if(!out || !p || size<33 || p[2]<4 || p[2]>5)return -EINVAL;
+ unsigned entry=p[6],clockSize=p[7],nonSize=p[8];
+ unsigned states=get_le16(p+9),clocks=get_le16(p+11),non=get_le16(p+13);
+ if(entry<2 || entry-1>RDN_PM_BIOS_LEVELS || clockSize<PP_EVERGREEN_CLOCK_SIZE || nonSize<11 ||
+    states+(uint32_t)p[5]*entry>size)return -EINVAL;
+ for(unsigned i=0;i<p[5];i++) {
+  const uint8_t *s=p+states+i*entry;
+  unsigned offset=non+s[0]*nonSize;
+  if(offset+nonSize>size)return -EINVAL;
+  const uint8_t *n=p+offset;unsigned cls=get_le16(n),cls2=get_le16(n+9);
+  bool match=kind==RDN_PM_BIOS_PERFORMANCE?((cls&7)==5 && !(cls&0x418)):
+             kind==RDN_PM_BIOS_VIDEO?((cls&0x400)!=0):((cls2&2)!=0);
+  if(!match)continue;
+  memset(&selected,0,sizeof(selected));
+  selected.classification=cls;selected.classification2=cls2;selected.caps=get_le32(n+4);
+  if(nonSize>=19){selected.vclk=get_le32(n+11);selected.dclk=get_le32(n+15);}
+  for(unsigned j=1;j<entry;j++) {
+   offset=clocks+s[j]*clockSize;
+   if(offset+PP_EVERGREEN_CLOCK_SIZE>size)return -EINVAL;
+   const uint8_t *q=p+offset;struct rdn_pm_state *l=&selected.level[selected.count++];
+   l->sclk=get_le24(q);l->mclk=get_le24(q+3);l->vddc=get_le16(q+6);l->vddci=get_le16(q+8);
+   if(!l->sclk || !l->mclk || rdn_pm_resolve_state(card,l))return -EINVAL;
+   if(j>1 && (l->sclk<selected.level[j-2].sclk || l->mclk<selected.level[j-2].mclk))return -EINVAL;
+  }
+  *out=selected;return 0;
+ }
+ return -EINVAL;
+}
+
+struct idle_selection {
+	struct rdn_pm_state *state;
+	uint32_t mclk;
+};
+
+static void visit_idle(void *arg, unsigned state, unsigned mode,
+		       unsigned classification, const struct rdn_pm_state *c)
+{
+	struct idle_selection *selection = arg;
+	struct rdn_pm_state *idle = selection->state;
+	if (!(classification & 1) || !c->sclk || !c->mclk || !is_voltage(c->vddc) ||
+	    (selection->mclk && c->mclk != selection->mclk))
+		return;
+	if (!idle->sclk || c->sclk < idle->sclk ||
+	    (c->sclk == idle->sclk && c->mclk < idle->mclk))
+		*idle = *c;
+}
+
+int rdn_pm_display_idle_state(struct rdn_card *card, uint32_t mclk,
+			      struct rdn_pm_state *state)
+{
+	struct idle_selection selection;
+	int r;
+	memset(state, 0, sizeof(*state));
+	selection.state = state;
+	selection.mclk = mclk;
+	r = pp_walk(card, visit_idle, &selection);
+	return r ? r : (!state->sclk || !state->mclk ? -EINVAL : 0);
+}
+
+int rdn_pm_idle_state(struct rdn_card *card, struct rdn_pm_state *state)
+{
+	return rdn_pm_display_idle_state(card, 0, state);
+}
+
 /*
  * One 32-bit parameter, little-endian in the interpreter's word, and the
  * same word back.
@@ -244,6 +314,52 @@ static int exec32(struct rdn_card *card, int index, uint32_t *value)
 		rdn_log(card->os, RDN_LOG_ERROR,
 			"AtomBIOS command table %d failed (%d)", index, r);
 	return r;
+}
+
+int rdn_pm_resolve_state(struct rdn_card *card, struct rdn_pm_state *state)
+{
+	struct rdn_pm_state resolved = *state;
+	uint8_t frev, crev;
+	uint32_t ps;
+	int r, index = GetIndexIntoMasterTable(COMMAND, SetVoltage);
+	if ((resolved.vddci & 0xff00) == 0xff00)
+		return -EINVAL;
+	if ((resolved.vddc & 0xff00) != 0xff00)
+		return 0;
+	if (resolved.vddc != ATOM_VIRTUAL_VOLTAGE_ID0 ||
+	    !atom_parse_cmd_header(card->atom.ctx, index, &frev, &crev))
+		return -EINVAL;
+	if (frev != 1 || (crev != 2 && crev != 3))
+		return -EINVAL;
+	/* NI uses the ASIC maximum for virtual voltage ID0, as rv770_get_max_vddc(). */
+	ps = crev == 2 ? SET_VOLTAGE_GET_MAX_VOLTAGE :
+		VOLTAGE_TYPE_VDDC | (ATOM_GET_VOLTAGE_LEVEL << 8);
+	r = exec32(card, index, &ps);
+	if (r)
+		return r;
+	resolved.vddc = ps >> 16;
+	if (!is_voltage(resolved.vddc) || resolved.vddc < 500 || resolved.vddc > 1500)
+		return -EINVAL;
+	*state = resolved;
+	return 0;
+}
+
+bool rdn_pm_memory_clock_ready(struct rdn_card *card)
+{
+ uint32_t type=(rdn_rreg(card,MC_SEQ_MISC0)&MC_SEQ_MISC0_GDDR5_MASK)>>MC_SEQ_MISC0_GDDR5_SHIFT;
+ return type!=MC_SEQ_MISC0_GDDR5_VALUE || (rdn_rreg(card,0x28c8)&1);
+}
+
+int rdn_pm_tuning_state(struct rdn_card *card,unsigned core,unsigned memory,struct rdn_pm_state *out)
+{
+ struct rdn_pm_state stock;int err;
+ if(!out || card->family!=RDN_FAMILY_TURKS ||
+    (rdn_rreg(card,MC_SEQ_MISC0)&MC_SEQ_MISC0_GDDR5_MASK)==(MC_SEQ_MISC0_GDDR5_VALUE<<MC_SEQ_MISC0_GDDR5_SHIFT))return -EINVAL;
+ err=rdn_pm_performance_state(card,&stock);if(err)return err;
+ err=rdn_pm_resolve_state(card,&stock);if(err)return err;
+ if(core>10000||memory>10000 || core*100<stock.sclk || memory*100<stock.mclk ||
+    core*100>stock.sclk*105/100 || memory*100>stock.mclk*105/100 || !is_voltage(stock.vddc))return -EINVAL;
+ stock.sclk=core*100;stock.mclk=memory*100;*out=stock;return 0;
 }
 
 int rdn_pm_get_clocks(struct rdn_card *card, uint32_t *sclk, uint32_t *mclk)
@@ -316,14 +432,33 @@ int rdn_pm_set(struct rdn_card *card, const struct rdn_pm_state *from,
 	       const struct rdn_pm_state *to, unsigned what)
 {
 	/* upvolt before raising clocks, downvolt after lowering clocks */
-	bool voltage_after = to->sclk < from->sclk;
+	struct rdn_pm_state resolved = *to;
+	bool voltage_after, memory_change;
+	uint32_t crtc_control = 0;
 	uint32_t v, sclk, mclk;
-	int r = 0;
+	int r;
+	if (!rdn_family_has_acceleration(card->family))
+		return -EINVAL;
+	r = rdn_pm_resolve_state(card, &resolved);
+	if (r)
+		return r;
+	to = &resolved;
+	voltage_after = to->sclk < from->sclk;
 
 	if (rdn_rreg(card, GRBM_STATUS) & GUI_ACTIVE)
 		return -EBUSY;
 
-	crtc_read_requests(card, false);
+	memory_change = (what & RDN_PM_MCLK) && to->mclk != from->mclk;
+	if (memory_change && card->crtc_on) {
+		crtc_control = rdn_rreg(card, EVERGREEN_CRTC_CONTROL);
+		crtc_read_requests(card, false);
+	}
+	/* Lower-clock latency must be covered before the clock drops. */
+	if ((what & RDN_PM_SCLK) && to->sclk < from->sclk) {
+		card->sclk = to->sclk;
+		card->mclk = from->mclk;
+		rdn_bandwidth_update_clocks(card);
+	}
 
 	if ((what & RDN_PM_VOLTAGE) && !voltage_after)
 		r = set_voltages(card, from, to);
@@ -338,16 +473,45 @@ int rdn_pm_set(struct rdn_card *card, const struct rdn_pm_state *from,
 	if (!r && (what & RDN_PM_VOLTAGE) && voltage_after)
 		r = set_voltages(card, from, to);
 
-	crtc_read_requests(card, true);
+	if (memory_change && card->crtc_on)
+		rdn_wreg(card, EVERGREEN_CRTC_CONTROL, crtc_control);
 
 	/* The display's watermarks depend on both clocks: read them back. */
 	if (!rdn_pm_get_clocks(card, &sclk, &mclk) && sclk && mclk) {
 		/* The VBIOS reads 649.96 MHz for 650: round to the MHz. */
 		card->sclk = (sclk + 50) / 100 * 100;
 		card->mclk = (mclk + 50) / 100 * 100;
-		rdn_bandwidth_update(card);
+		rdn_bandwidth_update_clocks(card);
 	}
 	return r;
+}
+
+int rdn_pm_fan_percent(struct rdn_card *card, unsigned percent)
+{
+	uint32_t control0, control2, duty100, value0, value2;
+	if (card->family != RDN_FAMILY_CAYMAN || percent < 60 || percent > 100)
+		return -EINVAL;
+	control0 = rdn_rreg(card, 0x76c);
+	control2 = rdn_rreg(card, 0x774);
+	duty100 = rdn_rreg(card, 0x770) & 0xff;
+	if (!duty100 || control0 == 0xffffffff || control2 == 0xffffffff)
+		return -EINVAL;
+	/* Cayman SpeedFanControl register bank; static PWM uses the BIOS duty scale. */
+	value0 = (control0 & ~0xffu) | ((duty100 * percent + 99) / 100);
+	value2 = (control2 & ~(0xffu | (7u << 11))) | (1u << 11);
+	rdn_wreg(card, 0x76c, value0);
+	rdn_wreg(card, 0x774, value2);
+	if (rdn_rreg(card, 0x76c) != value0 || rdn_rreg(card, 0x774) != value2) {
+		rdn_wreg(card, 0x774, control2);
+		rdn_wreg(card, 0x76c, control0);
+		return -5;
+	}
+	return 0;
+}
+
+int rdn_pm_fan_full(struct rdn_card *card)
+{
+ return rdn_pm_fan_percent(card,100);
 }
 
 /* evergreen_get_temp(), the branch for everything but Juniper */
@@ -366,4 +530,61 @@ int rdn_pm_temperature(struct rdn_card *card)
 	else
 		actual = temp & 0xff;
 	return actual * 1000 / 2;
+}
+
+void rdn_pm_board_sensors(struct rdn_card *card, struct rdn_user_board_sensors *out)
+{
+ uint16_t size = 0;
+ const uint8_t *p;
+ memset(out, 0, sizeof(*out));
+ out->version = 1;
+ out->size = sizeof(*out);
+ out->fan_status = RDN_SENSOR_NO_DESCRIPTION;
+ out->rail_status = RDN_SENSOR_NO_DESCRIPTION;
+ out->voltage_control_id = 0xffffffff;
+ p = data_table(card, GetIndexIntoMasterTable(DATA, VoltageObjectInfo), &size);
+ if (p && size >= 4 && p[2] == 1 && p[3] == 2) {
+  unsigned off = 4;
+  while (off + 18 <= size) {
+   unsigned bytes = p[off + 1];
+   if (bytes < 18 || bytes > size - off) break;
+   if (p[off] == SET_VOLTAGE_TYPE_ASIC_VDDC) {
+    out->voltage_control_id = p[off + 2];
+    /* A voltage programming interface does not establish an ADC channel. */
+    out->rail_status = RDN_SENSOR_NOT_IMPLEMENTED;
+    break;
+   }
+   off += bytes;
+  }
+ }
+ p = data_table(card, GetIndexIntoMasterTable(DATA, PowerPlayInfo), &size);
+ if (!p || size < 33 || p[2] < 4 || p[2] > 5) return;
+ out->thermal_controller = p[25];
+ out->fan_pulses = p[28] & 15;
+ out->fan_min_rpm = p[29] * 100;
+ out->fan_max_rpm = p[30] * 100;
+ if ((p[28] & 0x80) || !out->fan_pulses) {
+  out->fan_status = RDN_SENSOR_NOT_PRESENT;
+  return;
+ }
+ out->fan_status = RDN_SENSOR_NOT_IMPLEMENTED;
+ if (card->family != RDN_FAMILY_CAYMAN || p[25] != 15) return;
+ out->fan_status = RDN_SENSOR_INVALID;
+ p = data_table(card, GetIndexIntoMasterTable(DATA, FirmwareInfo), &size);
+ if (!p || p[2] != 2 || p[3] != 2 || size < sizeof(ATOM_FIRMWARE_INFO_V2_2)) return;
+ uint32_t ref = get_le16(p + offsetof(ATOM_FIRMWARE_INFO_V2_2, usCoreReferenceClock));
+ uint32_t pin = rdn_rreg(card, 0x660);
+ if (ref < 1000 || ref > 10000 || (pin & (1u << 8))) return;
+ out->tach_clock_hz = ref * 10000;
+ if (pin & (1u << 9)) out->tach_clock_hz /= 4;
+ /* Cayman SpeedFanControl programs 0x788; 0x78c is its period counter. */
+ uint32_t control = rdn_rreg(card, 0x788);
+ out->tach_edges = (control & 7) + 1;
+ out->tach_period = rdn_rreg(card, 0x78c);
+ if (control == 0xffffffff || !out->tach_period || out->tach_period == 0xffffffff ||
+     out->tach_edges != out->fan_pulses) return;
+ uint64_t rpm = ((uint64_t)out->tach_clock_hz * 60 + out->tach_period / 2) / out->tach_period;
+ if (!rpm || rpm > 30000) return;
+ out->fan_rpm = (uint32_t)rpm;
+ out->fan_status = RDN_SENSOR_VALID;
 }

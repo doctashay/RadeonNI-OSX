@@ -26,6 +26,8 @@
 		<dict>
 			<key>CFBundleIdentifier</key>
 			<string>org.osxgpu.driver.RadeonNIRomProbe</string>
+			<key>TargetDeviceID</key>
+			<integer>26372</integer>
 			<key>IOClass</key>
 			<string>RadeonNIRomProbe</string>
 			<key>IOMatchCategory</key>

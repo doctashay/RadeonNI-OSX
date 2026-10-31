@@ -38,6 +38,297 @@
 
 #include "rdn_glue.h"
 
+struct hook_api {
+    int (*function_lookup)(void *(*)(const char *), void *(*)(const char *, void *));
+    void (*set_current)(void (*)(void *));
+    void (*set_parameter)(int (*)(void *, int, int *, int *));
+    void (*tex_image_pbuffer)(int (*)(void *, void *, int, int *));
+    void (*prepare_pbuffer)(void (*)(void *, void *));
+    void (*cgl_log)(void);
+    void (*cgls_tex_image)(int (*)(void *, void *, int, int *));
+    int (*cgls_set_integer)(int (*)(void *, int, int *, int *));
+    void (*destroy_pbuffer)(void (*)(void *));
+    void (*mach_msg)(unsigned (*)(void), void (*)(void));
+    void (*modern_register)(int (*)(void), int (*)(void *), void *(*)(const char *));
+    int (*modern_request)(void);
+    int (*modern_enabled)(void);
+    int (*modern_current)(void *);
+    void *(*modern_lookup)(const char *);
+};
+static const struct hook_api local_api = {
+    rdn_hook_function_lookup,
+    rdn_hook_set_current,
+    rdn_hook_set_parameter,
+    rdn_hook_tex_image_pbuffer,
+    rdn_hook_prepare_pbuffer,
+    rdn_hook_cgl_log,
+    rdn_hook_cgls_tex_image,
+    rdn_hook_cgls_set_integer,
+    rdn_hook_destroy_pbuffer,
+    rdn_hook_mach_msg,
+    rdn_hook_modern_register, rdn_hook_modern_request, rdn_hook_modern_enabled,
+    rdn_hook_modern_current, rdn_hook_modern_lookup,
+};
+
+__attribute__((visibility("default")))
+const struct hook_api *RDNGLHookAPI(void);
+__attribute__((visibility("default")))
+const struct hook_api *RDNGLHookAPI(void) { return &local_api; }
+
+static const struct hook_api *shared_api;
+static pthread_once_t api_once = PTHREAD_ONCE_INIT;
+static void find_hook_api(void)
+{
+    uint32_t i;
+    Dl_info self;
+    /* Registered callbacks remain callable until process exit. */
+    if (dladdr(&local_api, &self) && self.dli_fname)
+        dlopen(self.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    shared_api = &local_api;
+    for (i = 0; i < _dyld_image_count(); ++i) {
+        const char *path = _dyld_get_image_name(i);
+        const struct hook_api *(*get_api)(void);
+        void *handle;
+        if (!path || !strstr(path, "/RadeonNIGLDriver")) continue;
+        handle = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+        if (!handle) continue;
+        get_api = (const struct hook_api *(*)(void))dlsym(handle, "RDNGLHookAPI");
+        if (get_api) {
+            shared_api = get_api();
+            return; /* Keep the hook owner loaded for the process lifetime. */
+        }
+        dlclose(handle);
+    }
+}
+static const struct hook_api *hook_api(void)
+{
+    pthread_once(&api_once, find_hook_api);
+    return shared_api;
+}
+
+#define HOOK_CLIENTS 16
+static pthread_mutex_t clients_lock = PTHREAD_MUTEX_INITIALIZER;
+#define CALLBACKS(name, type) static type name##_clients[HOOK_CLIENTS]
+#define ADD_CALLBACK(name, callback) do { \
+    unsigned ci; \
+    pthread_mutex_lock(&clients_lock); \
+    for (ci = 0; ci < HOOK_CLIENTS; ++ci) { \
+        if (name##_clients[ci] == (callback)) break; \
+        if (!name##_clients[ci]) { name##_clients[ci] = (callback); break; } \
+    } \
+    pthread_mutex_unlock(&clients_lock); \
+} while (0)
+#define COPY_CALLBACKS(name, type) \
+    type callbacks[HOOK_CLIENTS]; unsigned ci; \
+    pthread_mutex_lock(&clients_lock); \
+    memcpy(callbacks, name##_clients, sizeof(callbacks)); \
+    pthread_mutex_unlock(&clients_lock)
+
+struct modern_client {
+    int (*ready)(void);
+    int (*current)(void *);
+    void *(*lookup)(const char *);
+};
+static struct modern_client modern_clients[HOOK_CLIENTS];
+static int modern_enabled;
+
+void rdn_hook_modern_register(int (*ready)(void), int (*current)(void *), void *(*lookup)(const char *))
+{
+    const struct hook_api *api = hook_api();
+    if (api->modern_register != rdn_hook_modern_register) {
+        api->modern_register(ready, current, lookup);
+        return;
+    }
+    pthread_mutex_lock(&clients_lock);
+    for (unsigned i = 0; i < HOOK_CLIENTS; ++i) {
+        if (modern_clients[i].ready == ready) break;
+        if (!modern_clients[i].ready) {
+            modern_clients[i] = (struct modern_client){ready, current, lookup};
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_lock);
+}
+
+static void copy_modern(struct modern_client *clients)
+{
+    pthread_mutex_lock(&clients_lock);
+    memcpy(clients, modern_clients, sizeof(modern_clients));
+    pthread_mutex_unlock(&clients_lock);
+}
+
+int rdn_hook_modern_enabled(void)
+{
+    const struct hook_api *api = hook_api();
+    if (api->modern_enabled != rdn_hook_modern_enabled) return api->modern_enabled();
+    return modern_enabled;
+}
+
+int rdn_hook_modern_request(void)
+{
+    const struct hook_api *api = hook_api();
+    struct modern_client clients[HOOK_CLIENTS];
+    if (api->modern_request != rdn_hook_modern_request) return api->modern_request();
+    copy_modern(clients);
+    if (!clients[0].ready) return 0;
+    for (unsigned i = 0; i < HOOK_CLIENTS && clients[i].ready; ++i)
+        if (!clients[i].ready()) return 0;
+    modern_enabled = 1;
+    return 1;
+}
+
+int rdn_hook_modern_current(void *ctx)
+{
+    const struct hook_api *api = hook_api();
+    struct modern_client clients[HOOK_CLIENTS];
+    int result = 0;
+    if (api->modern_current != rdn_hook_modern_current) return api->modern_current(ctx);
+    copy_modern(clients);
+    for (unsigned i = 0; i < HOOK_CLIENTS && clients[i].ready; ++i) {
+        int handled = clients[i].current(ctx);
+        if (ctx && handled) return handled;
+        result |= handled;
+    }
+    return result;
+}
+
+void *rdn_hook_modern_lookup(const char *name)
+{
+    const struct hook_api *api = hook_api();
+    struct modern_client clients[HOOK_CLIENTS];
+    if (api->modern_lookup != rdn_hook_modern_lookup) return api->modern_lookup(name);
+    copy_modern(clients);
+    for (unsigned i = 0; i < HOOK_CLIENTS && clients[i].ready; ++i) {
+        void *fn = clients[i].lookup(name);
+        if (fn) return fn;
+    }
+    return NULL;
+}
+
+typedef void (*current_cb)(void *);
+typedef void *(*lookup_cb)(const char *);
+typedef void *(*missing_cb)(const char *, void *);
+typedef int (*texture_cb)(void *, void *, int, int *);
+typedef int (*parameter_cb)(void *, int, int *, int *);
+typedef void (*prepare_cb)(void *, void *);
+typedef unsigned (*idle_cb)(void);
+typedef void (*timeout_cb)(void);
+
+CALLBACKS(current, current_cb);
+static void dispatch_current(void *ctx)
+{
+    COPY_CALLBACKS(current, current_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        callbacks[ci](ctx);
+    }
+}
+
+CALLBACKS(lookup, lookup_cb);
+static void * dispatch_lookup(const char *name)
+{
+    COPY_CALLBACKS(lookup, lookup_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        void *handled = callbacks[ci](name);
+        if (handled) return handled;
+    }
+    return 0;
+}
+
+CALLBACKS(missing, missing_cb);
+static void * dispatch_missing(const char *name, void *ctx)
+{
+    COPY_CALLBACKS(missing, missing_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        void *handled = callbacks[ci](name, ctx);
+        if (handled) return handled;
+    }
+    return 0;
+}
+
+CALLBACKS(texture, texture_cb);
+static int dispatch_texture(void *ctx, void *pb, int source, int *result)
+{
+    COPY_CALLBACKS(texture, texture_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        int handled = callbacks[ci](ctx, pb, source, result);
+        if (handled) return handled;
+    }
+    return 0;
+}
+
+CALLBACKS(parameter, parameter_cb);
+static int dispatch_parameter(void *ctx, int pname, int *values, int *result)
+{
+    COPY_CALLBACKS(parameter, parameter_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        int handled = callbacks[ci](ctx, pname, values, result);
+        if (handled) return handled;
+    }
+    return 0;
+}
+
+CALLBACKS(prepare, prepare_cb);
+static void dispatch_prepare(void *ctx, void *pb)
+{
+    COPY_CALLBACKS(prepare, prepare_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        callbacks[ci](ctx, pb);
+    }
+}
+
+CALLBACKS(cgls_texture, texture_cb);
+static int dispatch_cgls_texture(void *ctx, void *pb, int source, int *result)
+{
+    COPY_CALLBACKS(cgls_texture, texture_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        int handled = callbacks[ci](ctx, pb, source, result);
+        if (handled) return handled;
+    }
+    return 0;
+}
+
+CALLBACKS(cgls_parameter, parameter_cb);
+static int dispatch_cgls_parameter(void *ctx, int pname, int *values, int *result)
+{
+    COPY_CALLBACKS(cgls_parameter, parameter_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        int handled = callbacks[ci](ctx, pname, values, result);
+        if (handled) return handled;
+    }
+    return 0;
+}
+
+CALLBACKS(destroy, current_cb);
+static void dispatch_destroy(void *pb)
+{
+    COPY_CALLBACKS(destroy, current_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        callbacks[ci](pb);
+    }
+}
+
+CALLBACKS(idle, idle_cb);
+static unsigned dispatch_idle(void)
+{
+    COPY_CALLBACKS(idle, idle_cb);
+    unsigned result = 0;
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        unsigned ms = callbacks[ci]();
+        if (ms && (!result || ms < result)) result = ms;
+    }
+    return result;
+}
+
+CALLBACKS(timeout, timeout_cb);
+static void dispatch_timeout(void)
+{
+    COPY_CALLBACKS(timeout, timeout_cb);
+    for (ci = 0; ci < HOOK_CLIENTS && callbacks[ci]; ++ci) {
+        callbacks[ci]();
+    }
+}
+
+
 static void branch_absolute(uint32_t *code, const void *target)
 {
 	uintptr_t address = (uintptr_t)target;
@@ -120,7 +411,7 @@ static void *(*get_current_context)(void);
 
 static void *missing_function(const char *name)
 {
-	return get_current_context ? rdn_mesa_lookup_missing(name, get_current_context()) : NULL;
+	return get_current_context ? dispatch_missing(name, get_current_context()) : NULL;
 }
 
 static void *hooked_dlsym(void *handle, const char *name)
@@ -170,14 +461,14 @@ static int hooked_tex_image(void *ctx, void *pbuffer, int source)
 	return real_tex_image(ctx, pbuffer, source);
 }
 
-/* CoreAnimation imports a surface ID through CGLSetParameter(999). */
+/* Quartz and CoreAnimation import surface textures through private parameters. */
 static int (*real_set_parameter)(void *, int, const int *);
 static int (*set_parameter_handler)(void *, int, int *, int *);
 
 static int hooked_set_parameter(void *ctx, int pname, const int *values)
 {
 	int result;
-	if (pname == 999 && values &&
+	if ((pname == 997 || pname == 998 || pname == 999) && values &&
 	    set_parameter_handler(ctx, pname, (int *)values, &result))
 		return result;
 	return real_set_parameter(ctx, pname, values);
@@ -202,7 +493,7 @@ static int hooked_cgls_create_pbuffer(void **out, int w, int h,
 {
 	long err = real_cgls_create_pbuffer(out, w, h, target, format, levels);
 	if (!err && out && *out)
-		rdn_mesa_prepare_pbuffer(NULL, *out);
+		dispatch_prepare(NULL, *out);
 	return err;
 }
 
@@ -483,13 +774,21 @@ static void watch_images(void)
 	}
 }
 
-int rdn_hook_function_lookup(void *(*own)(const char *name))
+int rdn_hook_function_lookup(void *(*own)(const char *name),
+                             void *(*missing)(const char *, void *))
 {
+    const struct hook_api *api = hook_api();
+    if (api->function_lookup != rdn_hook_function_lookup) {
+        return api->function_lookup(own, missing);
+    }
+    ADD_CALLBACK(lookup, own);
+    ADD_CALLBACK(missing, missing);
+
 	if (real_lookup)
 		return 1;
 	string_to_c = (unsigned char (*)(void *, char *, long, unsigned))
 		dlsym(RTLD_DEFAULT, "CFStringGetCString");
-	own_function = own;
+	own_function = dispatch_lookup;
 	if (string_to_c)
 		real_lookup = (void *(*)(void *, void *))
 			dlsym(RTLD_DEFAULT, "CFBundleGetFunctionPointerForName");
@@ -504,6 +803,13 @@ int rdn_hook_function_lookup(void *(*own)(const char *name))
 
 void rdn_hook_set_current(void (*after)(void *cgl_ctx))
 {
+    const struct hook_api *api = hook_api();
+    if (api->set_current != rdn_hook_set_current) {
+        api->set_current(after);
+        return;
+    }
+    ADD_CALLBACK(current, after);
+
 	if (real_set_current)
 		return;
 	real_set_current = (int (*)(void *))dlsym(RTLD_DEFAULT, "CGLSetCurrentContext");
@@ -511,25 +817,39 @@ void rdn_hook_set_current(void (*after)(void *cgl_ctx))
 		rdn_log("no CGLSetCurrentContext to hook");
 		return;
 	}
-	after_set_current = after;
+	after_set_current = dispatch_current;
 	watch_images();
 }
 
 void rdn_hook_set_parameter(int (*handler)(void *, int, int *, int *))
 {
+    const struct hook_api *api = hook_api();
+    if (api->set_parameter != rdn_hook_set_parameter) {
+        api->set_parameter(handler);
+        return;
+    }
+    ADD_CALLBACK(parameter, handler);
+
 	if (real_set_parameter)
 		return;
 	real_set_parameter = (int (*)(void *, int, const int *))
 		dlsym(RTLD_DEFAULT, "CGLSetParameter");
 	if (!real_set_parameter)
 		return;
-	set_parameter_handler = handler;
+	set_parameter_handler = dispatch_parameter;
 	watch_images();
 }
 
 void rdn_hook_tex_image_pbuffer(int (*handler)(void *cgl_ctx, void *pbuffer,
 					       int source, int *result))
 {
+    const struct hook_api *api = hook_api();
+    if (api->tex_image_pbuffer != rdn_hook_tex_image_pbuffer) {
+        api->tex_image_pbuffer(handler);
+        return;
+    }
+    ADD_CALLBACK(texture, handler);
+
 	if (real_tex_image)
 		return;
 	real_tex_image = (int (*)(void *, void *, int))
@@ -538,13 +858,20 @@ void rdn_hook_tex_image_pbuffer(int (*handler)(void *cgl_ctx, void *pbuffer,
 		rdn_log("no CGLTexImagePBuffer to hook");
 		return;
 	}
-	tex_image_handler = handler;
+	tex_image_handler = dispatch_texture;
 	watch_images();
 }
 
 void rdn_hook_prepare_pbuffer(void (*prepare)(void *ctx, void *pbuffer))
 {
-	prepare_pbuffer = prepare;
+    const struct hook_api *api = hook_api();
+    if (api->prepare_pbuffer != rdn_hook_prepare_pbuffer) {
+        api->prepare_pbuffer(prepare);
+        return;
+    }
+    ADD_CALLBACK(prepare, prepare);
+
+	prepare_pbuffer = dispatch_prepare;
 	real_set_pbuffer = (int (*)(void *, void *, int, int, int))
 		dlsym(RTLD_DEFAULT, "CGLSetPBuffer");
 	watch_images();
@@ -553,6 +880,13 @@ void rdn_hook_prepare_pbuffer(void (*prepare)(void *ctx, void *pbuffer))
 /* The CGL calls above go to the log. */
 void rdn_hook_cgl_log(void)
 {
+    const struct hook_api *api = hook_api();
+    if (api->cgl_log != rdn_hook_cgl_log) {
+        api->cgl_log();
+        return;
+    }
+
+
 	if (real_create_pbuffer)
 		return;
 	real_create_pbuffer = (int (*)(int, int, int, int, int, void **))
@@ -571,6 +905,13 @@ void rdn_hook_cgl_log(void)
 void rdn_hook_cgls_tex_image(int (*handler)(void *ctx, void *pbuffer, int source,
 					    int *result))
 {
+    const struct hook_api *api = hook_api();
+    if (api->cgls_tex_image != rdn_hook_cgls_tex_image) {
+        api->cgls_tex_image(handler);
+        return;
+    }
+    ADD_CALLBACK(cgls_texture, handler);
+
 	if (real_cgls_tex_image)
 		return;
 	real_cgls_tex_image = (int (*)(void *, void *, int))
@@ -579,7 +920,7 @@ void rdn_hook_cgls_tex_image(int (*handler)(void *ctx, void *pbuffer, int source
 		rdn_log("no cglsTexImagePBuffer to hook");
 		return;
 	}
-	cgls_tex_image_handler = handler;
+	cgls_tex_image_handler = dispatch_cgls_texture;
 	real_cgls_create_pbuffer = (int (*)(void **, int, int, int, int, int))
 		dlsym(RTLD_DEFAULT, "cglsCreatePBuffer");
 	{
@@ -638,6 +979,12 @@ static int hooked_cgls_set_integer(void *ctx, int pname, int *vals)
 
 int rdn_hook_cgls_set_integer(int (*handler)(void *ctx, int pname, int *vals, int *result))
 {
+    const struct hook_api *api = hook_api();
+    if (api->cgls_set_integer != rdn_hook_cgls_set_integer) {
+        return api->cgls_set_integer(handler);
+    }
+    ADD_CALLBACK(cgls_parameter, handler);
+
 	static const uint32_t original[12] = {
 		0x7c0802a6, 0x429f0005, 0x7d4802a6, 0x7c0803a6,
 		0x3c4a0ff0, 0x8042d2d8, 0x7c431214, 0x80630000,
@@ -692,7 +1039,7 @@ int rdn_hook_cgls_set_integer(int (*handler)(void *ctx, int pname, int *vals, in
 			(int)kr, (unsigned long)page);
 		return 0;
 	}
-	cgls_set_handler = handler;
+	cgls_set_handler = dispatch_cgls_parameter;
 	cgls_set_fn = (const void *)code;
 	high_word = is_leopard ? 9 : 4;
 	low_word = is_leopard ? 10 : 5;
@@ -717,6 +1064,13 @@ int rdn_hook_cgls_set_integer(int (*handler)(void *ctx, int pname, int *vals, in
 
 void rdn_hook_destroy_pbuffer(void (*handler)(void *pbuffer))
 {
+    const struct hook_api *api = hook_api();
+    if (api->destroy_pbuffer != rdn_hook_destroy_pbuffer) {
+        api->destroy_pbuffer(handler);
+        return;
+    }
+    ADD_CALLBACK(destroy, handler);
+
 	if (destroy_pbuffer_handler)
 		return;
 	real_destroy_pbuffer = (int (*)(void *))dlsym(RTLD_DEFAULT, "CGLDestroyPBuffer");
@@ -732,12 +1086,20 @@ void rdn_hook_destroy_pbuffer(void (*handler)(void *pbuffer))
 	}
 	if (!real_destroy_pbuffer && !real_cgls_destroy_pbuffer)
 		return;
-	destroy_pbuffer_handler = handler;
+	destroy_pbuffer_handler = dispatch_destroy;
 	watch_images();
 }
 
 void rdn_hook_mach_msg(unsigned (*idle)(void), void (*timeout)(void))
 {
+    const struct hook_api *api = hook_api();
+    if (api->mach_msg != rdn_hook_mach_msg) {
+        api->mach_msg(idle, timeout);
+        return;
+    }
+    ADD_CALLBACK(idle, idle);
+    ADD_CALLBACK(timeout, timeout);
+
 	if (real_mach_msg)
 		return;
 	real_mach_msg = (mach_msg_return_t (*)(mach_msg_header_t *, mach_msg_option_t, mach_msg_size_t,
@@ -745,8 +1107,8 @@ void rdn_hook_mach_msg(unsigned (*idle)(void), void (*timeout)(void))
 					       mach_port_t))dlsym(RTLD_DEFAULT, "mach_msg");
 	if (!real_mach_msg)
 		return;
-	idle_handler = idle;
-	idle_timeout = timeout;
+	idle_handler = dispatch_idle;
+	idle_timeout = dispatch_timeout;
 	mach_thread = pthread_self();
 	watch_images();
 }

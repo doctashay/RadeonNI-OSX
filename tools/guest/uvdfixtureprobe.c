@@ -14,6 +14,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CommonCrypto/CommonDigest.h>
 #include "rdn_user.h"
+#include "rdn_probe_device.h"
 #include "uvd_decode_fixture.h"
 
 static void sha256(const void *bytes, size_t size, char output[65])
@@ -63,12 +64,11 @@ int main(int argc, char **argv)
 	uint8_t block[RDN_UVD_FIXTURE_CHUNK_BYTES], *snapshot = 0, *nv12 = 0;
 	char rawHash[65], imageHash[65], feedbackHash[65];
 	int matched = 0, code = 1;
-	if (argc != 3 || strcmp(argv[1], "run") || geteuid() != 0) {
-		fprintf(stderr, "usage (root): %s run NEW_OUTPUT_PREFIX\n", argv[0]);
+	if ((argc != 3 && argc != 4) || strcmp(argv[1], "run") || geteuid() != 0) {
+		fprintf(stderr, "usage (root): %s run NEW_OUTPUT_PREFIX [PCI_DEVICE_HEX]\n", argv[0]);
 		return 2;
 	}
-	service = IOServiceGetMatchingService(kIOMasterPortDefault,
-		IOServiceMatching(RDN_UC_SERVICE_CLASS));
+	service = rdn_probe_device(argc == 4 ? argv[3] : 0);
 	if (!service)
 		return 3;
 	property = IORegistryEntryCreateCFProperty(service,

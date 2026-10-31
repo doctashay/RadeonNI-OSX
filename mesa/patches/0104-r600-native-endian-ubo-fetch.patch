@@ -1,0 +1,56 @@
+--- a/src/gallium/drivers/r600/sfn/sfn_shader.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_shader.cpp
+@@ -27,6 +27,7 @@
+ #include "sfn_shader_tess.h"
+ #include "sfn_shader_vs.h"
+ #include "util/u_math.h"
++#include "util/u_endian.h"
+ 
+ #include <numeric>
+ #include <sstream>
+@@ -1636,12 +1637,18 @@
+    auto buf_offset = nir_src_as_const_value(instr->src[1]);
+    auto base_id = nir_intrinsic_base(instr);
+ 
+-   if (!buf_offset) {
++   /* KCACHE cannot byte-swap application UBOs. Slot 0 and driver constants
++    * are already uploaded little-endian by r600_set_constant_buffer. */
++   bool native_ubo = UTIL_ARCH_BIG_ENDIAN &&
++      (bufid ? bufid->u32 > 0 && bufid->u32 < R600_MAX_USER_CONST_BUFFERS
++             : base_id > 0 && base_id < R600_MAX_USER_CONST_BUFFERS);
++
++   if (!buf_offset || native_ubo) {
+       /* TODO: if bufid is constant then this can also be solved by using the
+        * CF index on the ALU block, and this would probably make sense when
+        * there are more then one loads with the same buffer ID. */
+ 
+-      auto addr = value_factory().src(instr->src[1], 0)->as_register();
++      auto addr = emit_load_to_register(value_factory().src(instr->src[1], 0));
+       RegisterVec4::Swizzle dest_swz{7, 7, 7, 7};
+       auto dest = value_factory().dest_vec4(instr->def, pin_group);
+ 
+@@ -1658,6 +1665,8 @@
+          ir = new LoadFromBuffer(
+             dest, dest_swz, addr, 0, base_id, buffer_id, fmt_32_32_32_32_float);
+       }
++      if (native_ubo)
++         ir->set_endian_swap(vtx_es_8in32);
+       emit_instruction(ir);
+       return true;
+    }
+--- a/src/gallium/drivers/r600/sfn/sfn_nir.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_nir.cpp
+@@ -822,6 +822,13 @@
+ #if UTIL_ARCH_BIG_ENDIAN
+    unsigned bits;
+    switch (intr->intrinsic) {
++   case nir_intrinsic_load_ubo: {
++      auto id = nir_src_as_const_value(intr->src[0]);
++      if (id && (!id->u32 || id->u32 >= R600_MAX_USER_CONST_BUFFERS))
++         return false;
++      bits = intr->def.bit_size;
++      break;
++   }
+    case nir_intrinsic_load_ssbo:
+    case nir_intrinsic_load_shared:
+    case nir_intrinsic_load_scratch:

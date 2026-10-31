@@ -66,20 +66,21 @@ IOReturn RadeonNISurfaceClient::lockForRead(IOAccelSurfaceInformation *info,
 	UInt32 offset, rowBytes, width, height, start, length;
 	uint64_t end;
 	IOReturn ret;
+	RadeonNIAccel *source = fReadAccel ? fReadAccel : fAccel;
 	IOMemoryDescriptor *aperture;
 
 	if (!info || !size || *size < sizeof(*info))
 		return kIOReturnBadArgument;
-	if (!fAccel->getSurfaceBuffer(fWid, &offset, &rowBytes, &width, &height))
+	if (!source->getSurfaceBuffer(fWid, &offset, &rowBytes, &width, &height))
 		return kIOReturnUnsupported;
-	aperture = fAccel->apertureMemory();
+	aperture = source->apertureMemory();
 	if (!aperture)
 		return kIOReturnNotReady;
 	end = (uint64_t)offset + (uint64_t)rowBytes * height;
 	if (!width || !height || (uint64_t)width * 4 > rowBytes ||
 	    end > aperture->getLength() || end > 0xffffffffULL - PAGE_SIZE + 1)
 		return kIOReturnBadArgument;
-	ret = fAccel->waitForCPU();
+	ret = source->waitForCPU();
 	if (ret != kIOReturnSuccess)
 		return ret;
 	unlockRead();
@@ -102,15 +103,16 @@ IOReturn RadeonNISurfaceClient::lockForRead(IOAccelSurfaceInformation *info,
 	 * makes it give the surface up and draw white.
 	 */
 	info->pixelFormat = kIOAccelSurfaceModeColorDepth8888;
-	fAccel->setReadLocked(fWid);
+	source->setReadLocked(fWid);
 	*size = sizeof(*info);
 	return kIOReturnSuccess;
 }
 
 void RadeonNISurfaceClient::unlockRead(void)
 {
-	if (fAccel && fAccel->readLocked() == fWid)
-		fAccel->setReadLocked(0);
+	RadeonNIAccel *source = fReadAccel ? fReadAccel : fAccel;
+	if (source && source->readLocked() == fWid)
+		source->setReadLocked(0);
 	if (fReadMap) {
 		fReadMap->release();
 		fReadMap = 0;
@@ -448,6 +450,24 @@ IOReturn RadeonNISurfaceClient::setShapeBacking(UInt32 options, UInt32 fbIndex,
 
 IOReturn RadeonNISurfaceClient::setIDMode(UInt32 wid, UInt32 mode)
 {
+	unlockRead();
+	if (fReadAccel) { fReadAccel->release(); fReadAccel = 0; }
+	fBackingMode = false;
+	fRefused = false;
+	if (!fAccel->isGLSurface(wid) && wid != 1) {
+		OSDictionary *match = serviceMatching("RadeonNIAccel");
+		OSIterator *iter = match ? getMatchingServices(match) : 0;
+		if (match) match->release();
+		OSObject *object;
+		while (iter && !fReadAccel && (object = iter->getNextObject())) {
+			RadeonNIAccel *peer = OSDynamicCast(RadeonNIAccel, object);
+			if (peer && peer != fAccel && peer->isGLSurface(wid)) {
+				peer->retain();
+				fReadAccel = peer;
+			}
+		}
+		if (iter) iter->release();
+	}
 	bool backing = fAccel->getProperty("BackingSurfaces") == kOSBooleanTrue &&
         fAccel->surfaceGpuReady();
 
@@ -458,7 +478,7 @@ IOReturn RadeonNISurfaceClient::setIDMode(UInt32 wid, UInt32 mode)
 	 * it through alone made the window server composite GL windows (QuickTime Player's video)
 	 * from the wrong data on 10.5, bisected on the G5 (2026-10-22).
 	 */
-	if (fAccel->surfaceGate() && (wid != 1 || !backing) && !fAccel->isGLSurface(wid)) {
+	if (!fReadAccel && fAccel->surfaceGate() && (wid != 1 || !backing) && !fAccel->isGLSurface(wid)) {
 		if (mode != (kIOAccelSurfaceModeWindowedBit | kIOAccelSurfaceModeColorDepth8888) || !backing) {
 			fRefused = true;
 			note(kIOAccelSurfaceSetIDMode, wid, mode, 1, 0);
@@ -490,15 +510,18 @@ IOReturn RadeonNISurfaceClient::setShape(UInt32 options, UInt32 fbIndex,
 	if (!rgn || size < header ||
 	    rgn->num_rects > (size - header) / sizeof(IOAccelBounds))
 		return kIOReturnBadArgument;
-	if (!fAccel->setSurfaceRegion(fWid, rgn, rgn->num_rects))
+	if (!fAccel->setSurfaceRegion(fWid, rgn, rgn->num_rects, fbIndex, !fBackingMap))
 		return kIOReturnNoResources;
+	struct rdn_user_screen screen;
+	if (!fBackingMap && fAccel->getSurfaceScreen(fWid, &screen) && screen.scanout)
+		fBackingMode = false;
 	fSetShape = true;
 	return kIOReturnSuccess;
 }
 
 /*
  * The window server's way of showing a surface's new picture when it need
- * not draw the window again itself. There is one screen: bit 0 of the mask.
+ * not draw the window again itself. The mask selects framebuffer indices.
  */
 IOReturn RadeonNISurfaceClient::flush(UInt32 fbMask, UInt32 options)
 {
@@ -508,8 +531,11 @@ IOReturn RadeonNISurfaceClient::flush(UInt32 fbMask, UInt32 options)
 		IOLockLock(fBackingLock);
 		ret = syncBacking(true);
 		IOLockUnlock(fBackingLock);
-	} else if (fAccel && fWid && (fbMask & 1))
-		ret = fAccel->flushSurface(fWid);
+	} else if (fAccel && fWid) {
+		struct rdn_user_screen screen;
+		if (fAccel->getSurfaceScreen(fWid, &screen) && (fbMask & (1u << screen.index)))
+			ret = fAccel->flushSurface(fWid);
+	}
 	countFlush(fbMask, options);
 	note(kIOAccelSurfaceFlush, fbMask, options, ret, 0);
 	return ret;
@@ -596,6 +622,8 @@ void RadeonNISurfaceClient::releaseBacking(void)
 
 void RadeonNISurfaceClient::free(void)
 {
+	unlockRead();
+	if (fReadAccel) { fReadAccel->release(); fReadAccel = 0; }
     if (fAccel) fAccel->clearSurfaceBackingOwner(fWid, this);
 	releaseBacking();
 	if (fBackingLock) IOLockFree(fBackingLock);
@@ -609,7 +637,7 @@ IOReturn RadeonNISurfaceClient::configureBacking(UInt32 options, UInt32 fbIndex,
 	if (fRefused || !fWid || fWid == 1 ||
 	    fMode != (kIOAccelSurfaceModeWindowedBit | kIOAccelSurfaceModeColorDepth8888))
 		return kIOReturnUnsupported;
-	if (fbIndex) return kIOReturnBadArgument;
+	if (fbIndex >= RDN_NUM_CRTC) return kIOReturnBadArgument;
 	const UInt32 header = offsetof(IOAccelDeviceRegion, rect);
 	if (!region || size < header ||
 	    region->num_rects > (size - header) / sizeof(IOAccelBounds) ||
@@ -627,7 +655,7 @@ IOReturn RadeonNISurfaceClient::configureBacking(UInt32 options, UInt32 fbIndex,
 		fBackingHeight == (UInt32)region->bounds.h;
 	if (unchanged) {
 		IOReturn ret = kIOReturnNoResources;
-		if (fAccel->setSurfaceRegion(fWid, region, region->num_rects))
+		if (fAccel->setSurfaceRegion(fWid, region, region->num_rects, fbIndex, false))
 			ret = (options & kIOAccelSurfaceShapeStaleBackingBit)
 				? kIOReturnSuccess : syncBacking(false);
 		IOLockUnlock(fBackingLock);
@@ -669,7 +697,7 @@ IOReturn RadeonNISurfaceClient::configureBacking(UInt32 options, UInt32 fbIndex,
         fBackingPageOffset = pageOffset;
         fBackingGpuBound = true;
         fAccel->setSurfaceBackingOwner(fWid, this);
-		fSetShape = fAccel->setSurfaceRegion(fWid, region, region->num_rects);
+		fSetShape = fAccel->setSurfaceRegion(fWid, region, region->num_rects, fbIndex, false);
 		ret = fSetShape ? syncBacking(false) : kIOReturnNoResources;
 	}
 	IOLockUnlock(fBackingLock);
@@ -683,7 +711,7 @@ IOReturn RadeonNISurfaceClient::configureBacking(UInt32 options, UInt32 fbIndex,
 IOReturn RadeonNISurfaceClient::syncBacking(bool toCPU)
 {
     if (!fBackingMap || !fBackingGpuBound || fBackingDmaFailed) return kIOReturnNotReady;
-    UInt64 ram = rdn_gart_addr(fBackingGart / PAGE_SIZE) + fBackingPageOffset;
+    UInt64 ram = fAccel->gartAddress(fBackingGart) + fBackingPageOffset;
     IOReturn result = fAccel->syncSurfaceGpu(fWid, ram, fBackingStride,
         fBackingWidth, fBackingHeight, toCPU);
     if (result == kIOReturnTimeout) fBackingDmaFailed = true;
@@ -718,7 +746,7 @@ IOReturn RadeonNISurfaceClient::gpuCopy(UInt32 offset, UInt32 stride,
     IOLockLock(fBackingLock);
     IOReturn result = kIOReturnNotReady;
     if (fBackingGpuBound && !fBackingDmaFailed && width == fBackingWidth && height == fBackingHeight) {
-        UInt64 source = rdn_gart_addr(fBackingGart / PAGE_SIZE) + fBackingPageOffset;
+        UInt64 source = fAccel->gartAddress(fBackingGart) + fBackingPageOffset;
         result = fAccel->surfaceGpuTransfer(source, fBackingStride,
             fAccel->surfaceVramAddress(offset), stride, width, height, fWid);
         if (result == kIOReturnTimeout) fBackingDmaFailed = true;

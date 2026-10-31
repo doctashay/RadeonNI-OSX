@@ -35,8 +35,16 @@ void rdn_dispatch_kept_report(const char *when);
 /* Per thread: Mesa's current context is too. */
 extern __thread void *rdn_current_rend;
 extern int rdn_modern_contexts;
+void rdn_hook_modern_register(int (*ready)(void), int (*current)(void *), void *(*lookup)(const char *));
+int rdn_hook_modern_request(void);
+int rdn_hook_modern_enabled(void);
+int rdn_hook_modern_current(void *ctx);
+void *rdn_hook_modern_lookup(const char *name);
 int RDNGLRequestCompatibilityContext(int major, int minor);
 int RDNGLMakeCurrent(void *cgl_context);
+uint32_t RDNGLGetDeviceID(void);
+const char *rdn_mesa_device_model(void);
+const char *rdn_context_renderer_name(void);
 void *RDNGLGetProcAddress(const char *name);
 void rdn_make_current(void *rend);
 
@@ -61,7 +69,10 @@ void rdn_hook_set_current(void (*after)(void *cgl_ctx));
  * in a bundle (a function, or NULL for a name that is not ours). Returns 0
  * when the program cannot be hooked.
  */
-int rdn_hook_function_lookup(void *(*own)(const char *name));
+int rdn_hook_function_lookup(void *(*own)(const char *name),
+                             void *(*missing)(const char *, void *));
+int rdn_mesa_owns_current(void);
+int rdn_dispatch_owns(const void *table);
 void *rdn_mesa_lookup_missing(const char *name, void *cgl_ctx);
 /*
  * rdn_hook.c: let `handler` answer CGLTexImagePBuffer (it returns 1 and
@@ -106,6 +117,7 @@ void rdn_flush_surface(void *rend);
 /* The pbuffer records are the window server's (size in words 8 and 9). */
 void rdn_mesa_pbuffer_layout(int window_server);
 int rdn_mesa_is_pbuffer(void *gld_ctx);
+int rdn_mesa_is_compositor(void *gld_ctx);
 int rdn_mesa_tex_image_pbuffer_ws(void *cgls_ctx, void *pbuffer, int source, int *result);
 /* CGLTexImagePBuffer for a context of ours (rdn_mesa.c). */
 int rdn_mesa_tex_image_pbuffer(void *cgl_ctx, void *pbuffer, int source, int *result);
@@ -217,6 +229,20 @@ void rdn_watch_enable(unsigned cap);
 void rdn_watch_disable(unsigned cap);
 void rdn_watch_active_texture(unsigned unit);
 void rdn_watch_bind_texture(unsigned target, unsigned texture);
+int rdn_surface_texture_upload(unsigned target, int level, int internalformat,
+                               int width, int height, int border, unsigned format,
+                               unsigned type, const void *pixels);
+int rdn_gpu_migration_enabled(void);
+void rdn_lists_deleted(unsigned first, int count);
+int rdn_list_recording(void);
+void rdn_list_bitmap(int width, int height, float xorig, float yorig, float xmove, float ymove, const unsigned char *bitmap);
+void rdn_list_begin(unsigned name, unsigned mode);
+void rdn_list_end(void);
+void rdn_list_record(int (*replay)(void *(*)(const char *), const void *), const void *arguments, unsigned size);
+void rdn_texture_bound(unsigned target, unsigned name);
+void rdn_texture_generated(int count, unsigned *names);
+void rdn_texture_changed(unsigned target);
+void rdn_texture_deleted(int count, const unsigned *names);
 void rdn_watch_tex_image2D(unsigned target, int level, int internalformat,
 			   int width, int height, int border, unsigned format,
 			   unsigned type, const void *pixels);

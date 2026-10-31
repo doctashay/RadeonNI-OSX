@@ -1,5 +1,5 @@
 /*
- * The display controller's hardware cursor (DCE4/5), for CRTC 0: a 64x64
+ * The display controller's hardware cursor (DCE4/5), for the selected CRTC: a 64x64
  * image of 32-bit ARGB, colours already multiplied by alpha, that the
  * controller lays over the picture by itself.
  *
@@ -52,19 +52,21 @@
 
 static void cursor_lock(struct rdn_card *card, bool lock)
 {
-	uint32_t v = rdn_rreg(card, EVERGREEN_CUR_UPDATE);
+	uint32_t v = rdn_rreg(card, EVERGREEN_CUR_UPDATE + rdn_crtc_offset(card->display_crtc));
 
 	if (lock)
 		v |= EVERGREEN_CURSOR_UPDATE_LOCK;
 	else
 		v &= ~EVERGREEN_CURSOR_UPDATE_LOCK;
-	rdn_wreg(card, EVERGREEN_CUR_UPDATE, v);
+	rdn_wreg(card, EVERGREEN_CUR_UPDATE + rdn_crtc_offset(card->display_crtc), v);
 }
 
 void rdn_cursor_set(struct rdn_card *card, uint32_t aperture_offset, int x,
 		    int y, bool visible)
 {
-	uint64_t addr = ((uint64_t)(rdn_rreg(card, MC_VM_FB_LOCATION) & 0xffff) << 24) +
+	uint64_t addr;
+	if (!card || card->display_crtc >= rdn_crtc_count(card)) return;
+	addr = ((uint64_t)(rdn_rreg(card, MC_VM_FB_LOCATION) & 0xffff) << 24) +
 			aperture_offset;
 	int xorigin = 0, yorigin = 0;
 
@@ -80,19 +82,19 @@ void rdn_cursor_set(struct rdn_card *card, uint32_t aperture_offset, int x,
 
 	cursor_lock(card, true);
 	if (visible) {
-		rdn_wreg(card, EVERGREEN_CUR_POSITION,
+		rdn_wreg(card, EVERGREEN_CUR_POSITION + rdn_crtc_offset(card->display_crtc),
 			 ((uint32_t)x << 16) | (uint32_t)y);
-		rdn_wreg(card, EVERGREEN_CUR_HOT_SPOT,
+		rdn_wreg(card, EVERGREEN_CUR_HOT_SPOT + rdn_crtc_offset(card->display_crtc),
 			 ((uint32_t)xorigin << 16) | (uint32_t)yorigin);
-		rdn_wreg(card, EVERGREEN_CUR_SIZE,
+		rdn_wreg(card, EVERGREEN_CUR_SIZE + rdn_crtc_offset(card->display_crtc),
 			 ((RDN_CURSOR_SIZE - 1) << 16) | (RDN_CURSOR_SIZE - 1));
-		rdn_wreg(card, EVERGREEN_CUR_SURFACE_ADDRESS_HIGH,
+		rdn_wreg(card, EVERGREEN_CUR_SURFACE_ADDRESS_HIGH + rdn_crtc_offset(card->display_crtc),
 			 (uint32_t)(addr >> 32));
-		rdn_wreg(card, EVERGREEN_CUR_SURFACE_ADDRESS, (uint32_t)addr);
-		rdn_wreg(card, EVERGREEN_CUR_CONTROL,
+		rdn_wreg(card, EVERGREEN_CUR_SURFACE_ADDRESS + rdn_crtc_offset(card->display_crtc), (uint32_t)addr);
+		rdn_wreg(card, EVERGREEN_CUR_CONTROL + rdn_crtc_offset(card->display_crtc),
 			 EVERGREEN_CURSOR_EN | CURSOR_FORMAT);
 	} else {
-		rdn_wreg(card, EVERGREEN_CUR_CONTROL, CURSOR_FORMAT);
+		rdn_wreg(card, EVERGREEN_CUR_CONTROL + rdn_crtc_offset(card->display_crtc), CURSOR_FORMAT);
 	}
 	cursor_lock(card, false);
 }

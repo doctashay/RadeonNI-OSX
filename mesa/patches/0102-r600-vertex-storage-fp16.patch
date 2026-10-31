@@ -1,0 +1,768 @@
+--- a/src/gallium/drivers/r600/evergreen_compute.c
++++ b/src/gallium/drivers/r600/evergreen_compute.c
+@@ -224,7 +224,7 @@
+ 	unsigned num_pipes = rctx->screen->b.info.r600_max_quad_pipes;
+ 	unsigned wave_divisor = (16 * num_pipes);
+ 	int group_size = 1;
+-	unsigned lds_size = (shader->local_size + info->variable_shared_mem) / 4;
++	unsigned lds_size = DIV_ROUND_UP(shader->local_size + info->variable_shared_mem, 4);
+ 
+ 	/* Calculate group_size */
+ 	for (i = 0; i < 3; i++) {
+--- a/src/gallium/drivers/r600/evergreen_state.c
++++ b/src/gallium/drivers/r600/evergreen_state.c
+@@ -1968,6 +1968,39 @@
+ 	evergreen_emit_image_state(rctx, atom,
+ 				   R600_IMAGE_IMMED_RESOURCE_OFFSET,
+ 				   R600_IMAGE_REAL_RESOURCE_OFFSET, offset, 0);
++}
++
++static void evergreen_emit_vertex_buffer_state(struct r600_context *rctx, struct r600_atom *atom)
++{
++	struct radeon_cmdbuf *cs = &rctx->b.gfx.cs;
++	unsigned base = rctx->vs_shader->current->shader.vs_as_ls ?
++		EG_FETCH_CONSTANTS_OFFSET_LS : EG_FETCH_CONSTANTS_OFFSET_VS;
++	for (unsigned kind = 0; kind < 2; ++kind) {
++		struct r600_image_state *state = kind ? &rctx->vertex_buffers : &rctx->vertex_images;
++		unsigned offset = kind * 8;
++		unsigned mask = state->enabled_mask;
++		while (mask) {
++			unsigned i = u_bit_scan(&mask);
++			struct r600_image_view *view = &state->views[i];
++			struct r600_resource *bo = r600_as_resource(view->base.resource);
++			uint64_t va = bo->gpu_address + view->va_offset;
++
++			unsigned reloc = radeon_add_to_buffer_list(&rctx->b, &rctx->b.gfx, bo,
++				RADEON_USAGE_READ | RADEON_PRIO_SHADER_RW_BUFFER);
++			radeon_emit(cs, PKT3(PKT3_SET_RESOURCE, 8, 0));
++			radeon_emit(cs, (base + R600_VERTEX_STORAGE_RESOURCE_OFFSET + offset + i) * 8);
++			if (bo->b.b.target == PIPE_BUFFER) {
++				radeon_emit(cs, va);
++				radeon_emit(cs, view->resource_words[1]);
++				radeon_emit(cs, (view->resource_words[2] & C_030008_BASE_ADDRESS_HI) |
++					S_030008_BASE_ADDRESS_HI(va >> 32));
++			} else {
++				radeon_emit_array(cs, view->resource_words, 3);
++			}
++			radeon_emit_array(cs, &view->resource_words[3], 5);
++			r600_emit_reloc_packets(cs, reloc, rctx->b.screen->info.r600_has_virtual_memory, 0);
++		}
++	}
+ }
+ 
+ static void evergreen_emit_compute_buffer_state(struct r600_context *rctx, struct r600_atom *atom)
+@@ -4511,13 +4544,15 @@
+ 	bool has_vm = rctx->b.screen->info.r600_has_virtual_memory;
+ 
+ 	if ((shader != MESA_SHADER_FRAGMENT &&
+-        shader != MESA_SHADER_COMPUTE) || count == 0)
++        shader != MESA_SHADER_COMPUTE && shader != MESA_SHADER_VERTEX) || count == 0)
+ 		return;
+ 
+ 	if (shader == MESA_SHADER_FRAGMENT)
+ 		istate = &rctx->fragment_buffers;
+ 	else if (shader == MESA_SHADER_COMPUTE)
+ 		istate = &rctx->compute_buffers;
++	else if (shader == MESA_SHADER_VERTEX)
++		istate = &rctx->vertex_buffers;
+ 
+ 	old_mask = istate->enabled_mask;
+ 	istate->atom.num_dw = 0;
+@@ -4538,6 +4573,7 @@
+ 
+ 		resource = r600_as_resource(rview->base.resource);
+ 
++		if (shader != MESA_SHADER_VERTEX) {
+ 		evergreen_setup_immed_buffer(rctx, rview, PIPE_FORMAT_R32_UINT);
+ 
+ 		color.offset = 0;
+@@ -4562,6 +4598,7 @@
+ 		rview->cb_color_attrib = color.attrib;
+ 		rview->cb_color_fmask = color.fmask;
+ 		rview->cb_color_fmask_slice = color.fmask_slice;
++		}
+ 		rview->va_offset = buf->buffer_offset;
+ 
+ 		memset(&buf_params, 0, sizeof(buf_params));
+@@ -4580,6 +4617,10 @@
+ 						     &rview->skip_mip_address_reloc,
+ 						     false, rview->resource_words);
+ 
++		/* Half loads fetch a full dword; resinfo keeps the logical byte size. */
++		if (debug_get_bool_option("R600_FP16_EMULATION", false))
++			rview->resource_words[1] |= 3;
++
+ 		if (!has_vm && !rview->skip_mip_address_reloc)
+ 			istate->atom.num_dw += 2;
+ 
+@@ -4587,6 +4628,13 @@
+ 		istate->incomplete_mask &= ~(1 << i);
+ 	}
+ 
++	if (shader == MESA_SHADER_VERTEX) {
++		istate->atom.num_dw = (util_bitcount(istate->enabled_mask) +
++			util_bitcount(rctx->vertex_images.enabled_mask)) * (has_vm ? 10 : 14);
++		istate->dirty_buffer_constants = true;
++		r600_mark_atom_dirty(rctx, &istate->atom);
++		return;
++	}
+ 	istate->atom.num_dw += util_bitcount(istate->enabled_mask) * (has_vm ? 38 : 52);
+ 	istate->dirty_buffer_constants = true;
+ 
+@@ -4620,7 +4668,8 @@
+ 	struct r600_image_state *istate = NULL;
+ 	bool has_vm = rctx->b.screen->info.r600_has_virtual_memory;
+ 	int idx;
+-	if (shader != MESA_SHADER_FRAGMENT && shader != MESA_SHADER_COMPUTE)
++	if (shader != MESA_SHADER_FRAGMENT && shader != MESA_SHADER_COMPUTE &&
++	    shader != MESA_SHADER_VERTEX)
+ 		return;
+ 	if (!count && !unbind_num_trailing_slots)
+ 		return;
+@@ -4629,8 +4678,8 @@
+ 		istate = &rctx->fragment_images;
+ 	else if (shader == MESA_SHADER_COMPUTE)
+ 		istate = &rctx->compute_images;
+-
+-	assert (shader == MESA_SHADER_FRAGMENT || shader == MESA_SHADER_COMPUTE);
++	else
++		istate = &rctx->vertex_images;
+ 
+ 	old_mask = istate->enabled_mask;
+ 	istate->atom.num_dw = 0;
+@@ -4650,13 +4699,15 @@
+ 
+ 				istate->incomplete_mask |= (1 << i);
+ 
+-				if (rctx->cb_misc_state.image_rat_enabled_mask != istate->enabled_mask) {
++				if (shader != MESA_SHADER_VERTEX &&
++				    rctx->cb_misc_state.image_rat_enabled_mask != istate->enabled_mask) {
+ 					rctx->cb_misc_state.image_rat_enabled_mask = istate->enabled_mask;
+ 					r600_mark_atom_dirty(rctx, &rctx->cb_misc_state.atom);
+ 				}
+ 
+ 				if (old_incomplete != istate->incomplete_mask)
+-					r600_mark_atom_dirty(rctx, &istate->atom);
++					r600_mark_atom_dirty(rctx, shader == MESA_SHADER_VERTEX ?
++						&rctx->vertex_buffers.atom : &istate->atom);
+ 			} else {
+ 				istate->incomplete_mask &= ~(1 << i);
+ 			}
+@@ -4674,7 +4725,8 @@
+ 		rview->base.resource = pipe_saved;
+ 		pipe_resource_reference((struct pipe_resource **)&rview->base.resource, image);
+ 
+-		evergreen_setup_immed_buffer(rctx, rview, iview->format);
++		if (shader != MESA_SHADER_VERTEX)
++			evergreen_setup_immed_buffer(rctx, rview, iview->format);
+ 
+ 		bool is_buffer = image->target == PIPE_BUFFER;
+ 		struct r600_texture *rtex = r600_as_texture(image);
+@@ -4779,6 +4831,7 @@
+ 			buf_params.pipe_format = iview->format;
+ 			buf_params.size = buffer_size;
+ 			buf_params.offset = iview->u.buf.offset;
++			if (shader == MESA_SHADER_VERTEX) rview->va_offset = iview->u.buf.offset;
+ 			buf_params.swizzle[0] = PIPE_SWIZZLE_X;
+ 			buf_params.swizzle[1] = PIPE_SWIZZLE_Y;
+ 			buf_params.swizzle[2] = PIPE_SWIZZLE_Z;
+@@ -4805,6 +4858,14 @@
+ 		istate->compressed_depthtex_mask &= ~(1 << i);
+ 	}
+ 
++	if (shader == MESA_SHADER_VERTEX) {
++		rctx->vertex_buffers.atom.num_dw = (util_bitcount(istate->enabled_mask) +
++			util_bitcount(rctx->vertex_buffers.enabled_mask)) * (has_vm ? 10 : 14);
++		istate->dirty_buffer_constants = true;
++		r600_mark_atom_dirty(rctx, &rctx->vertex_buffers.atom);
++		rctx->b.flags |= R600_CONTEXT_INV_TEX_CACHE;
++		return;
++	}
+ 	istate->atom.num_dw += util_bitcount(istate->enabled_mask) * (has_vm ? 38 : 52);
+ 	istate->dirty_buffer_constants = true;
+ 	rctx->b.flags |= R600_CONTEXT_WAIT_3D_IDLE | R600_CONTEXT_FLUSH_AND_INV;
+@@ -4814,7 +4875,8 @@
+ 	if (old_mask != istate->enabled_mask)
+ 		r600_mark_atom_dirty(rctx, &rctx->cb_state.atom);
+ 
+-	if (rctx->cb_misc_state.image_rat_enabled_mask != istate->enabled_mask) {
++	if (shader != MESA_SHADER_VERTEX &&
++				    rctx->cb_misc_state.image_rat_enabled_mask != istate->enabled_mask) {
+ 		rctx->cb_misc_state.image_rat_enabled_mask = istate->enabled_mask;
+ 		r600_mark_atom_dirty(rctx, &rctx->cb_misc_state.atom);
+ 	}
+@@ -4903,6 +4965,7 @@
+ 	r600_init_atom(rctx, &rctx->fragment_images.atom, id++, evergreen_emit_fragment_image_state, 0);
+ 	r600_init_atom(rctx, &rctx->compute_images.atom, id++, evergreen_emit_compute_image_state, 0);
+ 	r600_init_atom(rctx, &rctx->fragment_buffers.atom, id++, evergreen_emit_fragment_buffer_state, 0);
++	r600_init_atom(rctx, &rctx->vertex_buffers.atom, id++, evergreen_emit_vertex_buffer_state, 0);
+ 	r600_init_atom(rctx, &rctx->compute_buffers.atom, id++, evergreen_emit_compute_buffer_state, 0);
+ 	/* shader const */
+ 	r600_init_atom(rctx, &rctx->constbuf_state[MESA_SHADER_VERTEX].atom, id++, evergreen_emit_vs_constant_buffers, 0);
+--- a/src/gallium/drivers/r600/r600_blit.c
++++ b/src/gallium/drivers/r600/r600_blit.c
+@@ -695,6 +695,12 @@
+ 			     struct pipe_resource *src, const struct pipe_box *src_box)
+ {
+ 	struct r600_context *rctx = (struct r600_context*)ctx;
++
++	/* CP DMA must leave the compute command stream just like async DMA. */
++	if (rctx->cmd_buf_is_compute) {
++		rctx->b.gfx.flush(rctx, PIPE_FLUSH_ASYNC, NULL);
++		rctx->cmd_buf_is_compute = false;
++	}
+ 
+ 	if (rctx->screen->b.has_cp_dma)
+ 		r600_cp_dma_copy_buffer(rctx, dst, dstx, src, src_box->x, src_box->width);
+--- a/src/gallium/drivers/r600/r600_hw_context.c
++++ b/src/gallium/drivers/r600/r600_hw_context.c
+@@ -349,6 +349,7 @@
+ 	if (ctx->b.gfx_level >= EVERGREEN) {
+ 		r600_mark_atom_dirty(ctx, &ctx->fragment_images.atom);
+ 		r600_mark_atom_dirty(ctx, &ctx->fragment_buffers.atom);
++		r600_mark_atom_dirty(ctx, &ctx->vertex_buffers.atom);
+ 		r600_mark_atom_dirty(ctx, &ctx->compute_images.atom);
+ 		r600_mark_atom_dirty(ctx, &ctx->compute_buffers.atom);
+ 	}
+--- a/src/gallium/drivers/r600/r600_pipe.c
++++ b/src/gallium/drivers/r600/r600_pipe.c
+@@ -41,6 +41,10 @@
+ 	struct r600_context *rctx = (struct r600_context *)context;
+ 	unsigned sh, i;
+ 
++	for (i = 0; i < R600_MAX_IMAGES; ++i) {
++		pipe_resource_reference(&rctx->vertex_buffers.views[i].base.resource, NULL);
++		pipe_resource_reference(&rctx->vertex_images.views[i].base.resource, NULL);
++	}
+ 	r600_isa_destroy(rctx->isa);
+ 
+ 	for (sh = 0; sh < (rctx->b.gfx_level < EVERGREEN ? R600_NUM_HW_STAGES : EG_NUM_HW_STAGES); sh++) {
+@@ -318,6 +322,10 @@
+ 			rscreen->b.family >= CHIP_CEDAR &&
+ 			(i == MESA_SHADER_FRAGMENT || i == MESA_SHADER_COMPUTE) ? 8 : 0;
+ 
++		if (i == MESA_SHADER_VERTEX && rscreen->b.family >= CHIP_CEDAR &&
++		    debug_get_bool_option("R600_VERTEX_SSBO_READONLY", false))
++			caps->max_shader_buffers = caps->max_shader_images = 8;
++
+ 		if (rscreen->b.family >= CHIP_CEDAR &&
+ 		    rscreen->has_atomics) {
+ 			caps->max_hw_atomic_counters =
+@@ -415,6 +423,8 @@
+ 	caps->texture_mirror_clamp_to_edge = true;
+ 	caps->blend_equation_separate = true;
+ 	caps->texture_swizzle = true;
++	caps->fp16 = family >= CHIP_CEDAR &&
++		debug_get_bool_option("R600_FP16_EMULATION", false);
+ 	caps->depth_clip_disable = true;
+ 	caps->depth_clip_disable_separate = true;
+ 	caps->shader_stencil_export = true;
+--- a/src/gallium/drivers/r600/r600_pipe.h
++++ b/src/gallium/drivers/r600/r600_pipe.h
+@@ -22,7 +22,7 @@
+ 
+ #include "tgsi/tgsi_scan.h"
+ 
+-#define R600_NUM_ATOMS 57
++#define R600_NUM_ATOMS 58
+ 
+ #define R600_MAX_IMAGES 8
+ /*
+@@ -32,6 +32,8 @@
+  */
+ #define R600_IMAGE_IMMED_RESOURCE_OFFSET 160
+ #define R600_IMAGE_REAL_RESOURCE_OFFSET 168
++/* Vertex resource banks have 160 entries, unlike the 176-entry pixel bank. */
++#define R600_VERTEX_STORAGE_RESOURCE_OFFSET 144
+ 
+ /* read caches */
+ #define R600_CONTEXT_INV_VERTEX_CACHE		(R600_CONTEXT_PRIVATE_FLAG << 0)
+@@ -559,6 +561,8 @@
+ 	struct r600_image_state         fragment_images;
+ 	struct r600_image_state         compute_images;
+ 	struct r600_image_state         fragment_buffers;
++	struct r600_image_state         vertex_buffers;
++	struct r600_image_state         vertex_images;
+ 	struct r600_image_state         compute_buffers;
+ 	/* Shaders and shader resources. */
+ 	struct r600_cso_state		vertex_fetch_shader;
+--- a/src/gallium/drivers/r600/r600_pipe_common.c
++++ b/src/gallium/drivers/r600/r600_pipe_common.c
+@@ -762,6 +762,11 @@
+ 						&ctx))
+ 		return;
+ 
++	const uint8_t storage_options[] = {
++		debug_get_bool_option("R600_VERTEX_SSBO_READONLY", false),
++		debug_get_bool_option("R600_FP16_EMULATION", false),
++	};
++	_mesa_blake3_update(&ctx, storage_options, sizeof(storage_options));
+ 	_mesa_blake3_final(&ctx, blake3);
+ 	mesa_bytes_to_hex(cache_id, blake3, BLAKE3_KEY_LEN);
+ 
+@@ -1086,6 +1091,8 @@
+ 	const bool fp64_emulation = rscreen->info.gfx_level < CAYMAN;
+ 
+ 	const struct nir_shader_compiler_options nir_options = {
++		.lower_pack_32_2x16_split = true,
++		.lower_unpack_32_2x16_split = true,
+ 		.float_mul_add16 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
+ 		.float_mul_add32 = nir_float_muladd_support_has_fmad | nir_float_muladd_support_fuse,
+ 		.float_mul_add64 = fp64_emulation ? 0 : nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
+--- a/src/gallium/drivers/r600/r600_state_common.c
++++ b/src/gallium/drivers/r600/r600_state_common.c
+@@ -96,12 +96,15 @@
+ 		     PIPE_BARRIER_IMAGE))
+ 		rctx->b.flags |= R600_CONTEXT_FLUSH_AND_INV;
+ 
+-	if (flags & (PIPE_BARRIER_INDEX_BUFFER |
++	if (flags & (PIPE_BARRIER_SHADER_BUFFER |
++		     PIPE_BARRIER_INDEX_BUFFER |
+ 		     PIPE_BARRIER_UPDATE_BUFFER |
+ 		     PIPE_BARRIER_CONSTANT_BUFFER |
+ 		     PIPE_BARRIER_TEXTURE))
+ 		rctx->b.flags |= R600_CONTEXT_FLUSH_AND_INV_CB;
+ 
++	if (rctx->cmd_buf_is_compute)
++		rctx->b.flags |= R600_CONTEXT_CS_PARTIAL_FLUSH;
+ 	rctx->b.flags |= R600_CONTEXT_WAIT_3D_IDLE;
+ }
+ 
+@@ -1464,6 +1467,8 @@
+ 		images = &rctx->fragment_images;
+ 	} else if (shader_type == MESA_SHADER_COMPUTE) {
+ 		images = &rctx->compute_images;
++	} else if (shader_type == MESA_SHADER_VERTEX) {
++		images = &rctx->vertex_images;
+ 	}
+ 
+ 	if (!samplers->views.dirty_buffer_constants &&
+@@ -1519,6 +1524,9 @@
+ 	} else if (shader_type == MESA_SHADER_COMPUTE) {
+ 		images = &rctx->compute_images;
+ 		buffers = &rctx->compute_buffers;
++	} else if (shader_type == MESA_SHADER_VERTEX) {
++		images = &rctx->vertex_images;
++		buffers = &rctx->vertex_buffers;
+ 	}
+ 
+ 	if (!samplers->views.dirty_buffer_constants &&
+@@ -1535,7 +1543,8 @@
+ 	const unsigned sview_bits = util_last_bit(samplers->views.enabled_mask);
+ 	unsigned bits = sview_bits;
+ 	if (images)
+-		bits += util_last_bit(images->enabled_mask);
++		bits += shader_type == MESA_SHADER_VERTEX ? 8 :
++			util_last_bit(images->enabled_mask);
+ 	const unsigned img_bits = bits;
+ 	if (buffers)
+ 		bits += util_last_bit(buffers->enabled_mask);
+@@ -1716,8 +1725,10 @@
+ 				r600_update_compressed_colortex_mask(&rctx->samplers[i].views);
+ 			}
+ 		}
+-		if (!compute_only)
++		if (!compute_only) {
+ 			r600_update_compressed_colortex_mask_images(&rctx->fragment_images);
++			r600_update_compressed_colortex_mask_images(&rctx->vertex_images);
++		}
+ 		r600_update_compressed_colortex_mask_images(&rctx->compute_images);
+ 	}
+ 
+@@ -1740,6 +1751,11 @@
+ 		struct r600_image_state *istate;
+ 
+ 		if (!compute_only) {
++			istate = &rctx->vertex_images;
++			if (istate->compressed_depthtex_mask)
++				r600_decompress_depth_images(rctx, istate);
++			if (istate->compressed_colortex_mask)
++				r600_decompress_color_images(rctx, istate);
+ 			istate = &rctx->fragment_images;
+ 			if (istate->compressed_depthtex_mask)
+ 				r600_decompress_depth_images(rctx, istate);
+@@ -1886,6 +1902,8 @@
+ 
+ static bool r600_update_derived_state(struct r600_context *rctx)
+ {
++	if (rctx->vertex_buffers.enabled_mask || rctx->vertex_images.enabled_mask)
++		r600_mark_atom_dirty(rctx, &rctx->vertex_buffers.atom);
+ 	struct pipe_context * ctx = (struct pipe_context*)rctx;
+ 	bool ps_dirty = false, vs_dirty = false, gs_dirty = false;
+ 	bool tcs_dirty = false, tes_dirty = false, fixed_func_tcs_dirty = false;
+--- a/src/gallium/drivers/r600/sfn/sfn_instr_alu.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_instr_alu.cpp
+@@ -1779,6 +1779,14 @@
+       return emit_alu_b2x(*alu, ALU_SRC_1, shader);
+    case nir_op_b2i32:
+       return emit_alu_b2x(*alu, ALU_SRC_1_INT, shader);
++   case nir_op_u2u32: {
++      assert(alu->src[0].src.ssa->bit_size == 16);
++      auto& vf = shader.value_factory();
++      shader.emit_instruction(new AluInstr(op2_and_int, vf.dest(alu->def, 0, pin_free),
++                                           vf.src(alu->src[0], 0), vf.literal(0xffff),
++                                           AluInstr::write));
++      return true;
++   }
+    case nir_op_u2u16:
+       assert(alu->src[0].src.ssa->bit_size == 32);
+       return emit_alu_op1(*alu, op1_mov, shader);
+--- a/src/gallium/drivers/r600/sfn/sfn_instr_mem.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_instr_mem.cpp
+@@ -655,7 +655,7 @@
+ 
+    auto [offset, res_offset] = shader.evaluate_resource_offset(intr, 0);
+ 
+-   auto res_id = R600_IMAGE_REAL_RESOURCE_OFFSET + offset + shader.ssbo_image_offset();
++   auto res_id = shader.image_resource_base() + offset + shader.ssbo_image_offset();
+ 
+    auto ir = new LoadFromBuffer(
+       dest, dest_swz[comp_idx], addr_temp, 0, res_id, res_offset, formats[comp_idx]);
+@@ -836,7 +836,7 @@
+    auto dest = vf.dest_vec4(intr->def, pin_group);
+ 
+    auto const_offset = nir_src_as_const_value(intr->src[0]);
+-   int res_id = R600_IMAGE_REAL_RESOURCE_OFFSET;
++   int res_id = shader.image_resource_base() + shader.ssbo_image_offset();
+    if (const_offset)
+       res_id += const_offset[0].u32;
+    else
+@@ -845,7 +845,7 @@
+    if (shader.chip_family() >= CHIP_PALM) {
+       shader.emit_instruction(new QueryBufferSizeInstr(dest, {0, 1, 2, 3}, res_id));
+    } else {
+-      const unsigned index = res_id - R600_IMAGE_REAL_RESOURCE_OFFSET;
++      const unsigned index = res_id - shader.image_resource_base();
+       shader.set_flag(Shader::sh_resinfo_via_uniform);
+       shader.emit_instruction(new AluInstr(op1_mov,
+                                            dest[0],
+@@ -905,7 +905,44 @@
+ {
+    auto& vf = shader.value_factory();
+    auto [imageid, image_offset] = shader.evaluate_resource_offset(intrin, 0);
+-   {
++   if (shader.has_flag(Shader::sh_vertex_stage) &&
++       intrin->intrinsic == nir_intrinsic_image_load) {
++      auto dest = vf.dest_vec4(intrin->def, pin_group);
++      const auto dim = nir_intrinsic_image_dim(intrin);
++      const unsigned resource = shader.image_resource_base() + imageid;
++      if (dim == GLSL_SAMPLER_DIM_MS) return false;
++      if (dim == GLSL_SAMPLER_DIM_BUF) {
++         unsigned fmt = 0, num_format = 0, format_comp = 0, endian = 0;
++         r600_vertex_data_type(nir_intrinsic_format(intrin), &fmt, &num_format,
++                              &format_comp, &endian);
++         auto coord = shader.emit_load_to_register(vf.src(intrin->src[1], 0));
++         auto fetch = new FetchInstr(vc_fetch, dest, {0,1,2,3}, coord, 0,
++                                    no_index_offset, (EVTXDataFormat)fmt,
++                                    (EVFetchNumFormat)num_format,
++                                    (EVFetchEndianSwap)endian, resource, image_offset);
++         fetch->set_fetch_flag(FetchInstr::use_tc);
++         if (format_comp) fetch->set_fetch_flag(FetchInstr::format_comp_signed);
++         shader.emit_instruction(fetch);
++      } else {
++         auto coord = vf.temp_vec4(pin_chgr);
++         unsigned count = intrin->src[1].ssa->num_components;
++         for (unsigned i = 0; i < 4; ++i) {
++            PVirtualValue value = i < count ? vf.src(intrin->src[1], i) : vf.zero();
++            if (i == 3) value = vf.zero();
++            if (dim == GLSL_SAMPLER_DIM_1D && nir_intrinsic_image_array(intrin))
++               value = i == 0 ? vf.src(intrin->src[1],0) :
++                       i == 2 ? vf.src(intrin->src[1],1) : vf.zero();
++            shader.emit_instruction(new AluInstr(op1_mov, coord[i], value, AluInstr::write));
++         }
++         auto fetch = new TexInstr(TexInstr::ld, dest, {0,1,2,3}, coord,
++                                   resource, image_offset);
++         fetch->set_tex_flag(TexInstr::x_unnormalized);
++         fetch->set_tex_flag(TexInstr::y_unnormalized);
++         fetch->set_tex_flag(TexInstr::z_unnormalized);
++         fetch->set_tex_flag(TexInstr::w_unnormalized);
++         shader.emit_instruction(fetch);
++      }
++      return true;
+    }
+ 
+    bool read_result = !list_is_empty(&intrin->def.uses);
+@@ -1006,7 +1043,7 @@
+    auto const_offset = nir_src_as_const_value(intrin->src[0]);
+    PRegister dyn_offset = nullptr;
+ 
+-   int res_id = R600_IMAGE_REAL_RESOURCE_OFFSET + nir_intrinsic_range_base(intrin);
++   int res_id = shader.image_resource_base() + nir_intrinsic_range_base(intrin);
+    if (const_offset)
+       res_id += const_offset[0].u32;
+    else
+@@ -1019,7 +1056,7 @@
+       } else {
+          if (const_offset) {
+             shader.set_flag(Shader::sh_resinfo_via_uniform);
+-            unsigned lookup_resid = (res_id - R600_IMAGE_REAL_RESOURCE_OFFSET) +
++            unsigned lookup_resid = (res_id - shader.image_resource_base()) +
+                                     shader.image_size_const_offset();
+             shader.emit_instruction(
+                new AluInstr(op1_mov,
+@@ -1051,7 +1088,7 @@
+          shader.set_flag(Shader::sh_resinfo_via_uniform);
+ 
+          if (const_offset) {
+-            unsigned lookup_resid = (res_id - R600_IMAGE_REAL_RESOURCE_OFFSET) +
++            unsigned lookup_resid = (res_id - shader.image_resource_base()) +
+                                     shader.image_size_const_offset();
+             shader.emit_instruction(
+                new AluInstr(op1_mov,
+@@ -1137,7 +1174,7 @@
+    auto const_offset = nir_src_as_const_value(intrin->src[0]);
+    PRegister dyn_offset = nullptr;
+ 
+-   int res_id = R600_IMAGE_REAL_RESOURCE_OFFSET + nir_intrinsic_range_base(intrin);
++   int res_id = shader.image_resource_base() + nir_intrinsic_range_base(intrin);
+    if (const_offset)
+       res_id += const_offset[0].u32;
+    else
+--- a/src/gallium/drivers/r600/sfn/sfn_instrfactory.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_instrfactory.cpp
+@@ -134,7 +134,8 @@
+       Pin pin = literal->def.num_components == 1 ? pin_free : pin_none;
+       for (int i = 0; i < literal->def.num_components; ++i) {
+          auto dest = m_value_factory.dest(literal->def, i, pin);
+-         uint32_t v = literal->value[i].i32;
++         uint32_t v = literal->def.bit_size == 16 ?
++                         literal->value[i].u16 : literal->value[i].u32;
+          PVirtualValue src = nullptr;
+          switch (v) {
+          case 0:
+--- a/src/gallium/drivers/r600/sfn/sfn_nir.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_nir.cpp
+@@ -690,9 +690,14 @@
+    }
+ }
+ 
++static void r600_lower_half(nir_shader *sh);
++
+ void
+ r600_finalize_nir_common(nir_shader *nir, enum amd_gfx_level gfx_level)
+ {
++   if (debug_get_bool_option("R600_FP16_EMULATION", false))
++      r600_lower_half(nir);
++
+    const int nir_lower_flrp_mask = 16 | 32 | 64;
+ 
+    NIR_PASS(_, nir, nir_lower_flrp, nir_lower_flrp_mask, false);
+@@ -780,6 +785,104 @@
+                                      r600_lower_primitive_id_pass,
+                                      nir_metadata_control_flow,
+                                      nullptr);
++}
++
++/* Keep half values packed in registers; execute arithmetic at full precision. */
++static unsigned
++r600_lower_half_alu(const nir_instr *instr, void *)
++{
++   if (instr->type != nir_instr_type_alu)
++      return 0;
++   const nir_alu_instr *alu = nir_instr_as_alu(instr);
++   const nir_op_info *info = &nir_op_infos[alu->op];
++   for (unsigned i = 0; i < info->num_inputs; ++i) {
++      if (info->input_types[i] == nir_type_float &&
++          alu->src[i].src.ssa->bit_size == 16)
++         return 32;
++   }
++   return 0;
++}
++
++static nir_mem_access_size_align
++r600_half_access(nir_intrinsic_op, uint8_t bytes, uint8_t bits,
++                 uint32_t align_mul, uint32_t align_offset, bool,
++                 enum gl_access_qualifier, const void *scalarize)
++{
++   nir_mem_access_size_align result = {};
++   result.bit_size = bits == 16 && !scalarize ? 32 : bits;
++   result.num_components = bits == 16 ? 1 : bytes / (bits / 8);
++   result.align = bits == 16 ? (scalarize ? 2 : 4) :
++                              nir_combined_align(align_mul, align_offset);
++   return result;
++}
++
++static bool
++r600_half_memory_endian(nir_builder *b, nir_intrinsic_instr *intr, void *)
++{
++#if UTIL_ARCH_BIG_ENDIAN
++   unsigned bits;
++   switch (intr->intrinsic) {
++   case nir_intrinsic_load_ssbo:
++   case nir_intrinsic_load_shared:
++   case nir_intrinsic_load_scratch:
++      bits = intr->def.bit_size;
++      break;
++   case nir_intrinsic_store_ssbo:
++   case nir_intrinsic_store_shared:
++   case nir_intrinsic_store_scratch:
++      bits = intr->src[0].ssa->bit_size;
++      break;
++   default:
++      return false;
++   }
++   if (bits != 16)
++      return false;
++   nir_src *offset = nir_get_io_offset_src(intr);
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_src_rewrite(offset, nir_ixor(b, offset->ssa, nir_imm_intN_t(b, 2, offset->ssa->bit_size)));
++   nir_intrinsic_set_align(intr, 2, 0);
++   return true;
++#else
++   return false;
++#endif
++}
++
++static bool
++r600_half_from_integer(nir_builder *b, nir_alu_instr *alu, void *)
++{
++   nir_op wide;
++   switch (alu->op) {
++   case nir_op_i2f16: wide = nir_op_i2f32; break;
++   case nir_op_u2f16: wide = nir_op_u2f32; break;
++   case nir_op_b2f16: wide = nir_op_b2f32; break;
++   default: return false;
++   }
++   b->cursor = nir_before_instr(&alu->instr);
++   b->fp_math_ctrl = alu->fp_math_ctrl;
++   nir_def *value = nir_build_alu(b, wide, nir_ssa_for_alu_src(b, alu, 0), nullptr, nullptr, nullptr);
++   nir_def_replace(&alu->def, nir_f2f16(b, value));
++   return true;
++}
++
++static void
++r600_lower_half(nir_shader *sh)
++{
++   nir_lower_mem_access_bit_sizes_options mem = {};
++   mem.callback = r600_half_access;
++   mem.modes = nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_mem_shared |
++               nir_var_function_temp;
++   mem.may_lower_unaligned_stores_to_atomics = true;
++   mem.cb_data = &mem;
++   NIR_PASS(_, sh, nir_lower_mem_access_bit_sizes, &mem);
++   NIR_PASS(_, sh, nir_shader_intrinsics_pass, r600_half_memory_endian,
++            nir_metadata_control_flow, nullptr);
++   mem.cb_data = nullptr;
++   NIR_PASS(_, sh, nir_lower_mem_access_bit_sizes, &mem);
++   NIR_PASS(_, sh, nir_shader_alu_pass, r600_half_from_integer,
++            nir_metadata_control_flow, nullptr);
++   NIR_PASS(_, sh, nir_lower_bit_size, r600_lower_half_alu, nullptr);
++   NIR_PASS(_, sh, nir_lower_fp16_casts, nir_lower_fp16_all);
++   NIR_PASS(_, sh, nir_lower_pack);
+ }
+ 
+ DEBUG_GET_ONCE_NUM_OPTION(skip_opt_start, "R600_SFN_SKIP_OPT_START", -1);
+--- a/src/gallium/drivers/r600/sfn/sfn_scheduler.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_scheduler.cpp
+@@ -34,6 +34,11 @@
+ 
+    void visit(AluInstr *instr) override
+    {
++      if (!instr->has_alu_flag(alu_is_lds) && instr->opcode() == op0_group_barrier) {
++         if (m_last_lds_instr)
++            instr->add_required_instr(m_last_lds_instr);
++         m_last_lds_instr = instr;
++      }
+       if (instr->has_alu_flag(alu_is_trans))
+          alu_trans.push_back(instr);
+       else {
+--- a/src/gallium/drivers/r600/sfn/sfn_shader.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_shader.cpp
+@@ -494,6 +494,7 @@
+ Shader::set_info(nir_shader *nir)
+ {
+    m_scratch_size = nir->scratch_size;
++   if (nir->info.stage == MESA_SHADER_VERTEX) set_flag(sh_vertex_stage);
+ }
+ 
+ ValueFactory&
+@@ -519,6 +520,10 @@
+    if (!scan_shader(func))
+       return false;
+ 
++   if (nir->info.stage == MESA_SHADER_VERTEX && has_flag(sh_writes_memory)) {
++      fprintf(stderr, "r600: vertex storage writes and atomics are not implemented\n");
++      return false;
++   }
+    allocate_reserved_registers();
+ 
+    value_factory().allocate_registers(m_register_allocations);
+@@ -626,9 +631,14 @@
+ 
+    // handle unhandled instructions
+    switch (intr->intrinsic) {
++   case nir_intrinsic_image_load:
++      if (has_flag(sh_vertex_stage)) {
++         set_flag(sh_uses_images);
++         break;
++      }
++      FALLTHROUGH;
+    case nir_intrinsic_ssbo_atomic:
+    case nir_intrinsic_ssbo_atomic_swap:
+-   case nir_intrinsic_image_load:
+    case nir_intrinsic_image_atomic:
+    case nir_intrinsic_image_atomic_swap:
+       m_flags.set(sh_needs_sbo_ret_address);
+@@ -1438,7 +1448,7 @@
+        instr->opcode() == op0_group_barrier) {
+       last_group_barrier = instr;
+       if (last_lds_access)
+-         instr->add_required_instr(last_group_barrier);
++         instr->add_required_instr(last_lds_access);
+       if (last_ssbo_instr)
+          instr->add_required_instr(last_ssbo_instr);
+    }
+--- a/src/gallium/drivers/r600/sfn/sfn_shader.h
++++ b/src/gallium/drivers/r600/sfn/sfn_shader.h
+@@ -217,6 +217,7 @@
+       sh_needs_sbo_ret_address,
+       sh_uses_atomics,
+       sh_uses_images,
++      sh_vertex_stage,
+       sh_uses_tex_buffer,
+       sh_writes_memory,
+       sh_resinfo_via_uniform,
+@@ -229,6 +230,9 @@
+ 
+    void set_flag(Flags f) { m_flags.set(f); }
+    bool has_flag(Flags f) const { return m_flags.test(f); }
++   unsigned image_resource_base() const {
++      return has_flag(sh_vertex_stage) ? R600_VERTEX_STORAGE_RESOURCE_OFFSET : R600_IMAGE_REAL_RESOURCE_OFFSET;
++   }
+ 
+    int atomic_file_count() const { return m_atomic_file_count; }
+ 
+@@ -236,7 +240,7 @@
+    int remap_atomic_base(int base);
+    auto evaluate_resource_offset(nir_intrinsic_instr *instr, int src_id)
+       -> std::pair<int, PRegister>;
+-   int ssbo_image_offset() const { return m_ssbo_image_offset; }
++   int ssbo_image_offset() const { return has_flag(sh_vertex_stage) ? 8 : m_ssbo_image_offset; }
+    PRegister rat_return_address()
+    {
+       assert(m_rat_return_address);
+--- a/src/gallium/drivers/r600/sfn/sfn_valuefactory.cpp
++++ b/src/gallium/drivers/r600/sfn/sfn_valuefactory.cpp
+@@ -61,7 +61,7 @@
+          array_entry ae = {
+             intr->def.index,
+             num_elms ? num_elms : 1,
+-            bit_size / 32 * num_comp};
++            DIV_ROUND_UP(bit_size, 32) * num_comp};
+          arrays.push(ae);
+       } else {
+          non_array.push_back(intr->def.index);
+@@ -201,10 +201,11 @@
+ void
+ ValueFactory::allocate_const(nir_load_const_instr *load_const)
+ {
+-   assert(load_const->def.bit_size == 32);
++   assert(load_const->def.bit_size == 32 || load_const->def.bit_size == 16);
+    for (int i = 0; i < load_const->def.num_components; ++i) {
+       RegisterKey key(load_const->def.index, i, vp_ssa);
+-      m_values[key] = literal(load_const->value[i].i32);
++      m_values[key] = literal(load_const->def.bit_size == 16 ?
++                              load_const->value[i].u16 : load_const->value[i].u32);
+       sfn_log << SfnLog::reg << "Add const with key " << key << " as " << m_values[key]
+               << "\n";
+    }

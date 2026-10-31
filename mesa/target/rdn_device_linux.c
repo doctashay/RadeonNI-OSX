@@ -235,6 +235,29 @@ struct rdn_device *rdn_device_open(void)
 	if (!addr)
 		addr = "0000:10:00.0";
 	d->trace = getenv("RDN_TRACE") != NULL;
+	{
+		char path[256];
+		uint8_t bytes[4];
+		uint32_t pci;
+		int n = snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/config", addr);
+		if (n < 0 || (size_t)n >= sizeof(path))
+			goto fail;
+		FILE *config = fopen(path, "rb");
+		if (!config)
+			goto fail;
+		size_t size = fread(bytes, 1, sizeof(bytes), config);
+		fclose(config);
+		if (size != sizeof(bytes))
+			goto fail;
+		pci = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+		      ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+		d->card.family = rdn_family_from_pci(pci);
+		if (!rdn_family_has_acceleration(d->card.family)) {
+			fprintf(stderr, "rdn: no accelerated profile for PCI identity 0x%08x\n", pci);
+			goto fail;
+		}
+		d->base.info.pci_device_id = pci >> 16;
+	}
 
 	d->mmio = map_resource(addr, "resource2", &mmio_size);
 	/* Not the write-combining mapping: Mesa reads its buffers back. */
@@ -253,8 +276,13 @@ struct rdn_device *rdn_device_open(void)
 	/* Only register access is used; the card is already posted. */
 	d->card.os = &d->os;
 
-	fw.pfp = read_fw("TURKS_pfp.bin", &fw.pfp_size);
-	fw.me = read_fw("TURKS_me.bin", &fw.me_size);
+	{
+		char name[32];
+		snprintf(name, sizeof(name), "%s_pfp.bin", rdn_family_name(d->card.family));
+		fw.pfp = read_fw(name, &fw.pfp_size);
+		snprintf(name, sizeof(name), "%s_me.bin", rdn_family_name(d->card.family));
+		fw.me = read_fw(name, &fw.me_size);
+	}
 	if (!fw.pfp || !fw.me)
 		goto fail;
 	if (rdn_accel_init(&d->accel, &d->card, aperture, (uint32_t)aperture_size,
@@ -267,7 +295,6 @@ struct rdn_device *rdn_device_open(void)
 	if (rdn_mem_init(&d->mem, &d->os, HEAP_OFFSET, aperture_size - HEAP_OFFSET))
 		goto fail;
 
-	d->base.info.pci_device_id = 0x675d;
 	d->base.info.vram_gpu_base = d->accel.vram_base;
 	d->base.info.vram_size = aperture_size - HEAP_OFFSET;
 	d->base.info.tile_config = d->accel.cfg.tile_config;

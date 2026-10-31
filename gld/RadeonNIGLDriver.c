@@ -36,13 +36,37 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <mach/mach.h>
+#include <IOKit/IOKitLib.h>
 #include <ApplicationServices/ApplicationServices.h>
 #include <OpenGL/gl.h>
 #include <OpenGL/gliContext.h>
 #include <OpenGL/gliDispatch.h>
 
 /* The next free number after Apple's ATI renderers in CGLRenderers.h. */
-#define RDN_RENDERER_ID		0x00021a00
+#ifndef RDN_GPU_INDEX
+#define RDN_GPU_INDEX 0
+#endif
+#define RDN_RENDERER_ID		(0x00021a00 + RDN_GPU_INDEX * 0x100)
+static uint32_t renderer_display_mask = 0xffffffffu;
+int rdn_gpu_migration_enabled(void);
+int rdn_gpu_migration_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled >= 0) return enabled;
+    const char *env = getenv("RDN_GPU_SWITCH");
+    if (!env) env = getenv("RDN_GPU_SWITCH_TEST");
+    if (env) return enabled = strcmp(env, "0") != 0;
+    FILE *file = fopen("/Library/Application Support/RadeonNI/gpu-switch", "r");
+    char line[256];
+    int selected = 0;
+    while (file && fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!strcmp(line, getprogname())) selected = 1;
+    }
+    if (file) fclose(file);
+    return enabled = selected;
+}
+
 #define SOFTWARE_RENDERER_ID	0x00020400	/* kCGLRendererGenericFloatID */
 #define RDN_RENDERER_STRING	"RadeonNI pass-through to Apple Software Renderer"
 
@@ -64,8 +88,44 @@
 #define RDN_CLAIMS_ACCELERATED	0
 #endif
 
-/* What the card's aperture holds; the kext hands out most of it. */
-#define RDN_REPORTED_MEMORY	(256ul << 20)
+/* Leopard's byte-valued CGL properties are signed 32-bit integers. */
+static uint32_t renderer_memory(void)
+{
+    CFMutableDictionaryRef match = IOServiceMatching("RadeonNIAccel");
+    int index = RDN_GPU_INDEX;
+    CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &index);
+    CFMutableDictionaryRef properties = CFDictionaryCreateMutable(NULL, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!match || !number || !properties) {
+        if (match) CFRelease(match);
+        if (number) CFRelease(number);
+        if (properties) CFRelease(properties);
+        return 0;
+    }
+    CFDictionarySetValue(properties, CFSTR("GLDDeviceIndex"), number);
+    CFDictionarySetValue(match, CFSTR("IOPropertyMatch"), properties);
+    CFRelease(properties);
+    CFRelease(number);
+    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, match);
+    if (!service) return 0;
+    CFTypeRef value = IORegistryEntrySearchCFProperty(service, kIOServicePlane,
+        CFSTR("VRAM,totalsize"), kCFAllocatorDefault,
+        kIORegistryIterateRecursively | kIORegistryIterateParents);
+    IOObjectRelease(service);
+    uint64_t bytes = 0;
+    if (value) {
+        if (CFGetTypeID(value) == CFDataGetTypeID() && CFDataGetLength(value) == 4) {
+            uint32_t size;
+            memcpy(&size, CFDataGetBytePtr(value), sizeof(size));
+            bytes = size;
+        } else if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+            int64_t size = 0;
+            if (CFNumberGetValue(value, kCFNumberSInt64Type, &size) && size > 0) bytes = size;
+        }
+        CFRelease(value);
+    }
+    return bytes > 0x7fffffffu ? 0x7fffffffu : (uint32_t)bytes;
+}
 
 /* The entry of the driver's own table the engine calls to present. */
 
@@ -292,6 +352,7 @@ static void setup(void)
 	if (log_file)
 		fflush(log_file);
 #ifdef RDN_MESA
+	rdn_surface_texture_hook = rdn_hook_cgls_set_integer(rdn_mesa_cgls_set_integer);
 	/* See rdn_hook.c. The window server's context always has a drawable. */
 	if (strcmp(getprogname(), "WindowServer") != 0) {
 		rdn_hook_set_current(rdn_mesa_early_all);
@@ -304,8 +365,8 @@ static void setup(void)
 		if (log_file)
 			rdn_hook_cgl_log();
 	} else {
-		rdn_surface_texture_hook = rdn_hook_cgls_set_integer(rdn_mesa_cgls_set_integer);
 		if (rdn_ws_core_image()) {
+			rdn_hook_prepare_pbuffer(rdn_mesa_prepare_pbuffer);
 			rdn_hook_cgls_tex_image(rdn_mesa_tex_image_pbuffer_ws);
 			rdn_hook_destroy_pbuffer(rdn_mesa_pbuffer_destroyed);
 		}
@@ -844,8 +905,20 @@ static void table_fill(long table)
 			t[i] = stubs[i];
 }
 
+static pthread_once_t surface_symbols_once = PTHREAD_ONCE_INIT;
+static int (*surface_flush_fn)(unsigned long, unsigned long, unsigned long, void *);
+static int (*surface_bounds_fn)(uint32_t, uint32_t, uint32_t, CGRect *);
+
+static void resolve_surface_symbols(void)
+{
+	surface_flush_fn = (int (*)(unsigned long, unsigned long, unsigned long, void *))
+		dlsym(RTLD_DEFAULT, "CGSFlushSurface");
+	surface_bounds_fn = (int (*)(uint32_t, uint32_t, uint32_t, CGRect *))
+		dlsym(RTLD_DEFAULT, "CGSGetSurfaceBounds");
+}
+
 /* The context of the window server that draws on the screen, if any. */
-static void *screen_ctx;
+
 
 /*
  * Does the window server composite with OpenGL (Quartz Extreme) on some
@@ -856,6 +929,8 @@ static void *screen_ctx;
 int rdn_windows_top_down(void)
 {
 	static int known = -1;
+	if (known >= 0)
+		return known;
 	int (*list)(unsigned max, unsigned *displays, unsigned *count) =
 		(int (*)(unsigned, unsigned *, unsigned *))
 		dlsym(RTLD_DEFAULT, "CGGetActiveDisplayList");
@@ -863,8 +938,6 @@ int rdn_windows_top_down(void)
 		(int (*)(unsigned))dlsym(RTLD_DEFAULT, "CGDisplayUsesOpenGLAcceleration");
 	unsigned displays[8], count = 0, i;
 
-	if (known >= 0)
-		return known;
 	known = 0;
 	if (list && uses && !list(8, displays, &count))
 		for (i = 0; i < count; i++)
@@ -902,12 +975,9 @@ static int early_takeover(void)
  */
 void rdn_surface_flush(unsigned long cid, unsigned long wid, unsigned long sid)
 {
-	int (*flush)(unsigned long, unsigned long, unsigned long, void *) =
-		(int (*)(unsigned long, unsigned long, unsigned long, void *))
-		dlsym(RTLD_DEFAULT, "CGSFlushSurface");
-
-	if (flush)
-		flush(cid, wid, sid, NULL);
+	pthread_once(&surface_symbols_once, resolve_surface_symbols);
+	if (surface_flush_fn)
+		surface_flush_fn(cid, wid, sid, NULL);
 }
 
 static long (*bind_surface)(long, long, long, long, long);
@@ -922,12 +992,10 @@ static long (*bind_surface)(long, long, long, long, long);
 int rdn_surface_size(unsigned long cid, unsigned long wid, unsigned long sid,
 		     unsigned *width, unsigned *height)
 {
-	int (*bounds)(uint32_t, uint32_t, uint32_t, CGRect *) =
-		(int (*)(uint32_t, uint32_t, uint32_t, CGRect *))
-		dlsym(RTLD_DEFAULT, "CGSGetSurfaceBounds");
 	CGRect r = {{0, 0}, {0, 0}};
 
-	if (!bounds || bounds(cid, wid, sid, &r) ||
+	pthread_once(&surface_symbols_once, resolve_surface_symbols);
+	if (!surface_bounds_fn || surface_bounds_fn(cid, wid, sid, &r) ||
 	    !(r.size.width >= 1 && r.size.width <= 16384) ||
 	    !(r.size.height >= 1 && r.size.height <= 16384))
 		return 0;
@@ -1065,8 +1133,9 @@ static long adjust(int idx, long a, long b, long c, long d, long ret)
 		if (ret == 0 && a && RDN_CLAIMS_ACCELERATED) {
 			record_words((void *)a)[2] |= RECORD_ACCELERATED | RECORD_FULLSCREEN;
 			/* Words 12 and 13: video and texture memory, in bytes. */
-			record_words((void *)a)[12] = RDN_REPORTED_MEMORY;
-			record_words((void *)a)[13] = RDN_REPORTED_MEMORY;
+			uint32_t memory = renderer_memory();
+			record_words((void *)a)[12] = memory;
+			record_words((void *)a)[13] = memory;
 			/*
 			 * The software renderer's depth modes are 32 bits
 			 * only. Mesa's depth buffer has 24, and Call of Duty
@@ -1106,6 +1175,7 @@ static long adjust(int idx, long a, long b, long c, long d, long ret)
 
 			for (; record && guard < 64; record = *(void **)record, guard++) {
 				fmt = record_words(record);
+				if (fmt[12]) fmt[12] &= renderer_display_mask;
 				if (patch & 2)
 					fmt[1] = RDN_RENDERER_ID;
 				if (RDN_CLAIMS_ACCELERATED)
@@ -1178,6 +1248,9 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 	int restore_id = 0;
 
 	setup();
+	if (idx == IDX_gldInitializeLibrary)
+		renderer_display_mask = (uint32_t)c;
+	/* Capability enumeration spans displays; pixel formats select ownership. */
 	if (log_file) {
 		char objects[160];
 
@@ -1245,6 +1318,14 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 		    bind_surface && display_words) {
 			const uint32_t *r = (const uint32_t *)c;
 			uint32_t sid = r[2];
+			unsigned display;
+			/* The callback port must belong to this GPU. */
+			for (display = 0; display < 32; ++display)
+				if ((renderer_display_mask & (1u << display)) &&
+				    display_words[display])
+					break;
+			if (display == 32)
+				return 10006;
 			const struct rdn_engine_layout *lay = rdn_engine_layout();
 			int leopard = lay && !strncmp(lay->os, "10.5", 4);
 			/*
@@ -1256,7 +1337,7 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 			rdn_mesa_expect_surface((void *)a, sid);
 			err = bind_surface(r[0], r[1],
 						leopard ? (long)&sid : (long)sid,
-						0x24, display_words[0]);
+						0x24, display_words[display]);
 
 			if (log_file)
 				fprintf(log_file, TAG "   surface 0x%lx of window 0x%lx bound -> %lx\n",
@@ -1332,8 +1413,7 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 		if (idx == IDX_gldAttachDrawable) {
 			if (!b) {
 				rdn_mesa_detach((void *)a);
-				if (screen_ctx == (void *)a)
-					screen_ctx = NULL;
+
 				return 1;
 			}
 			if (b != 0x50 || !c)
@@ -1342,7 +1422,7 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 			rdn_window_server = 1;
 			ret = rdn_mesa_attach_screen((void *)a,
 				c ? ((const unsigned long *)c)[2] : 0) ? 2 : -1;
-			screen_ctx = ret == 2 ? (void *)a : NULL;
+
 			if (log_file) {
 				fprintf(log_file, TAG "   attached by us -> %lx\n", TAG_ARGS, ret);
 				dump("drawable", c, 0x80);
@@ -1350,7 +1430,7 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 			return ret;
 		}
 		if ((idx == IDX_gldInitDispatch || idx == IDX_gldUpdateDispatch) &&
-		    rdn_ws_core_image() && screen_ctx != (void *)a &&
+		    rdn_ws_core_image() && !rdn_mesa_is_compositor((void *)a) &&
 		    rdn_mesa_is_pbuffer((void *)a)) {
 			/* Core Image's own context: Mesa's, nothing is presented. */
 			if (b)
@@ -1364,7 +1444,7 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 			return idx == IDX_gldInitDispatch ? 4 : 0;
 		}
 		if ((idx == IDX_gldInitDispatch || idx == IDX_gldUpdateDispatch) &&
-		    screen_ctx == (void *)a) {
+		    rdn_mesa_is_compositor((void *)a)) {
 			if (b)
 				table_fill(b);
 			if (b && rdn_mesa_dispatch((void *)a, (void *)b))
@@ -1388,12 +1468,30 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 		static int32_t filtered[64];
 		const int32_t *in = (const int32_t *)b;
 		int n = 0;
+		uint32_t requested_mask = 0, requested_renderer = 0;
 
 		asked_samples = 0;
 		asked_aux_depth_stencil = 0;
 		asked_double = 0;
 
 		while (*in && n < 62) {
+			if (*in == 70) { /* kCGLPFARendererID */
+				filtered[n++] = *in++;
+				requested_renderer = (uint32_t)*in;
+				filtered[n++] = *in++;
+				continue;
+			}
+			if (*in == 84) { /* kCGLPFADisplayMask */
+				uint32_t requested = (uint32_t)in[1];
+				requested_mask = requested;
+				if (requested && !(requested & renderer_display_mask)) {
+					if (a) *(void **)a = NULL;
+					return 0;
+				}
+				filtered[n++] = *in++;
+				filtered[n++] = (uint32_t)*in++ & renderer_display_mask;
+				continue;
+			}
 			/*
 			 * kCGLPFAAccelerated and kCGLPFANoRecovery take no
 			 * value. 20, 21 and 22 are not public; the window
@@ -1442,6 +1540,20 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 			in++;
 		}
 		filtered[n] = 0;
+		/* Isolated Mesa modules cannot migrate a context's object namespace. */
+		if (!in_window_server() && !requested_renderer &&
+		    !rdn_gpu_migration_enabled()) {
+			static uint32_t (*display_mask)(uint32_t);
+			if (!display_mask)
+				display_mask = (uint32_t (*)(uint32_t))dlsym(RTLD_DEFAULT,
+					"CGDisplayIDToOpenGLDisplayMask");
+			uint32_t preferred = requested_mask ? requested_mask & -requested_mask :
+				(display_mask ? display_mask(CGMainDisplayID()) : 0);
+			if (preferred && !(renderer_display_mask & preferred)) {
+				if (a) *(void **)a = NULL;
+				return 0;
+			}
+		}
 		b = (long)filtered;
 #ifdef RDN_MESA
 		if (!in_window_server()) {
@@ -1496,7 +1608,7 @@ static long forward(int idx, long a, long b, long c, long d, long e, long f,
 			fmt[4] = 0x8000;	/* colour mode: ARGB 8888 */
 			fmt[6] = 1;		/* depth mode: none */
 			fmt[7] = 1;		/* stencil mode: none */
-			fmt[12] = 0xffffffff;	/* display mask */
+			fmt[12] = renderer_display_mask;
 			if (!in_window_server()) {
 				/*
 				 * A program: the software renderer has no

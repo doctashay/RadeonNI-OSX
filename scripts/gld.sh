@@ -37,13 +37,25 @@ install-mesa)
     # The bundle with Mesa inside, cross-built on the host
     # (scripts/build-mesa.sh darwin src/gallium/targets/rdn/RadeonNIGLDriver.dylib).
     bin=$(ls "$root"/third_party/mesa-*/build-darwin/src/gallium/targets/rdn/$NAME.dylib | tail -n 1)
-    [ -s "$bin" ] || { echo "build the bundle first" >&2; exit 1; }
-    gssh "rm -rf /tmp/$NAME.bundle && mkdir -p /tmp/$NAME.bundle/Contents/MacOS &&
-        cat > /tmp/$NAME.bundle/Contents/Info.plist" < "$root/gld/Info.plist"
-    gssh "cat > /tmp/$NAME.bundle/Contents/MacOS/$NAME && chmod 755 /tmp/$NAME.bundle/Contents/MacOS/$NAME &&
-        sudo rm -rf $SLE/$NAME.bundle && sudo cp -R /tmp/$NAME.bundle $SLE/ &&
-        sudo chown -R root:wheel $SLE/$NAME.bundle && sudo chmod -R go-w $SLE/$NAME.bundle &&
-        sudo sync && ls -l $SLE/$NAME.bundle/Contents/MacOS/" < "$bin"
+    directory=$(dirname "$bin")
+    for suffix in '' 1 2 3; do
+        [ -s "$directory/$NAME$suffix.dylib" ] || {
+            echo "build all four GL renderer modules first" >&2; exit 1;
+        }
+    done
+    for suffix in '' 1 2 3; do
+        module=$NAME$suffix
+        gssh "mkdir -p /tmp/$module.bundle/Contents/MacOS &&
+            cat > /tmp/$module.bundle/Contents/Info.plist" < <(
+                sed "s/$NAME/$module/g" "$root/gld/Info.plist")
+        gssh "cat > /tmp/$module.bundle/Contents/MacOS/$module &&
+            chmod 755 /tmp/$module.bundle/Contents/MacOS/$module &&
+            sudo mkdir -p $SLE/$module.bundle &&
+            sudo cp -R /tmp/$module.bundle/Contents $SLE/$module.bundle/ &&
+            sudo chown -R root:wheel $SLE/$module.bundle &&
+            sudo chmod -R go-w $SLE/$module.bundle" < "$directory/$module.dylib"
+    done
+    gssh "sudo sync"
     ;;
 uninstall)
     gssh "sudo rm -rf $SLE/$NAME.bundle && sudo sync && echo removed"

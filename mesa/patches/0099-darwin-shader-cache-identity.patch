@@ -1,0 +1,47 @@
+--- a/src/util/disk_cache.h
++++ b/src/util/disk_cache.h
+@@ -79,7 +79,43 @@
+ 
+ struct disk_cache;
+ 
+-#ifdef HAVE_DLADDR
++#if defined(__APPLE__) && defined(HAVE_DLADDR)
++#include <mach-o/loader.h>
++
++static inline bool
++disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx)
++{
++   Dl_info info;
++   if (!dladdr(ptr, &info) || !info.dli_fbase)
++      return false;
++   const struct mach_header *header = (const struct mach_header *)info.dli_fbase;
++   size_t header_size;
++   if (header->magic == MH_MAGIC)
++      header_size = sizeof(struct mach_header);
++   else if (header->magic == MH_MAGIC_64)
++      header_size = sizeof(struct mach_header_64);
++   else
++      return false;
++   const unsigned char *cmd = (const unsigned char *)header + header_size;
++   size_t remaining = header->sizeofcmds;
++   for (uint32_t i = 0; i < header->ncmds; i++) {
++      if (remaining < sizeof(struct load_command)) return false;
++      const struct load_command *load = (const struct load_command *)cmd;
++      if (load->cmdsize < sizeof(*load) || load->cmdsize > remaining)
++         return false;
++      if (load->cmd == LC_UUID && load->cmdsize >= sizeof(struct uuid_command)) {
++         const struct uuid_command *uuid = (const struct uuid_command *)load;
++         _mesa_blake3_update(ctx, uuid->uuid, sizeof(uuid->uuid));
++         _mesa_blake3_update(ctx, &header->cputype, sizeof(header->cputype));
++         _mesa_blake3_update(ctx, &header->cpusubtype, sizeof(header->cpusubtype));
++         return true;
++      }
++      remaining -= load->cmdsize;
++      cmd += load->cmdsize;
++   }
++   return false;
++}
++#elif defined(HAVE_DLADDR)
+ static inline bool
+ disk_cache_get_function_timestamp(void *ptr, uint32_t* timestamp)
+ {

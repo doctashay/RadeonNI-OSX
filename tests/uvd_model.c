@@ -194,7 +194,7 @@ int main(int argc, char **argv)
 	struct rdn_os os;
 	struct rdn_card card;
 	struct rdn_accel accel;
-	struct rdn_uvd uvd;
+	struct rdn_uvd uvd = {0};
 	uint8_t fw[FW_SIZE];
 	uint32_t fb, vd, dd, seq, i, ib_off = 0x200000;
 	int r;
@@ -277,6 +277,12 @@ int main(int argc, char **argv)
 	r = rdn_uvd_wake(&uvd);
 	check(r == 0 && (regs[CG_UPLL_FUNC_CNTL / 4] & UPLL_BYPASS_EN_MASK) == 0 &&
 	      regs[CG_UPLL_FUNC_CNTL_3 / 4] == 970296, "wake: PLL out of bypass, fb divider 970296");
+ card.power_video_vclk=54000;card.power_video_dclk=40000;
+ uint32_t biosFb=0,biosVd=0,biosDd=0;
+ check(!rdn_uvd_calc_dividers(2700,54000,40000,&biosFb,&biosVd,&biosDd) &&
+       !rdn_uvd_wake(&uvd) && regs[CG_UPLL_FUNC_CNTL_3/4]==biosFb,
+       "wake uses BIOS decoder clock targets when available");
+ card.power_video_vclk=card.power_video_dclk=0;
 	for (i = 0; i < 2; i++) {
 		uint32_t w0 = RDN_UVD_PACKET0(UVD_MPC_SET_ALU, 0), w1 = 0x1000 + i;
 
@@ -317,6 +323,7 @@ int main(int argc, char **argv)
 		accel.aperture = NULL;
 		accel.aperture_size = 0;
 		window_ops = 0;
+  memset(&uvd,0,sizeof(uvd));
 		r = rdn_uvd_init_window(&uvd, &accel, 2700, fw, FW_SIZE, RDN_UVD_DEFAULT_HANDLES, vcpu_shadow, vcpu_at,
 					ring_shadow, ring_at, RING_BYTES, 0);
 		check(r == 0 && uvd.ready, "segment: init succeeds (VCPU boots, ring test passes through the window)");

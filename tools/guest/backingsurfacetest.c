@@ -11,13 +11,15 @@
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl.h>
 #include "rdn_user.h"
+#include "rdn_probe_device.h"
+static const char *gld_path;
 
 static void *driver_symbol(const char *name)
 {
     unsigned i;
     for (i = 0; i < _dyld_image_count(); ++i) {
         const char *path = _dyld_get_image_name(i);
-        if (!strstr(path, "RadeonNIGLDriver")) continue;
+        if (!strstr(path, gld_path)) continue;
         struct nlist symbols[2];
         memset(symbols, 0, sizeof(symbols));
         symbols[0].n_un.n_name = (char *)name;
@@ -27,22 +29,26 @@ static void *driver_symbol(const char *name)
     return NULL;
 }
 #define CHECK(x) do { unsigned err = (x); if (err) { printf("line %d: 0x%x\n", __LINE__, err); return 1; } } while (0)
-int main(void)
+int main(int argc, char **argv)
 {
     const unsigned id = 0x7e000000U;
-    const unsigned w = 65, h = 33, stride = 288;
-    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
-        IOServiceMatching(RDN_UC_SERVICE_CLASS));
+    const int quartz = argc > 4;
+    const unsigned w = 65, h = 33, stride = quartz ? 512 : 288;
+    io_service_t svc = rdn_probe_device(argc > 1 ? argv[1] : "675d");
     io_connect_t device, surface;
-    CGLPixelFormatAttribute attrs[] = {kCGLPFARendererID, 0x21a00, 0};
+    unsigned renderer = argc > 2 ? strtoul(argv[2], NULL, 16) : 0x1a00;
+    gld_path = renderer == 0x1b00 ? "/RadeonNIGLDriver1.bundle/" : "/RadeonNIGLDriver.bundle/";
+    CGLPixelFormatAttribute attrs[] = {kCGLPFARendererID, renderer,
+        kCGLPFADisplayMask, argc > 3 ? strtoul(argv[3], NULL, 16) : 0x10, 0};
     CGLPixelFormatObj pf; CGLContextObj ctx; GLint n;
-    unsigned char *cpu = calloc(h, stride), rgba[4];
+    unsigned char *cpu = quartz ? valloc(h * stride) : calloc(h, stride), rgba[4];
     struct {IOAccelDeviceRegion region; IOAccelBounds rect;} shape;
     IOAccelSurfaceInformation info;
     unsigned i, y, failures = 0;
     IOByteCount size;
     setbuf(stdout, NULL);
     if (!svc || !cpu) return 2;
+    if (quartz) memset(cpu, 0, h * stride);
     CHECK(IOServiceOpen(svc, mach_task_self(), RDN_UC_TYPE, &device));
     CHECK(IOConnectMethodScalarIScalarO(device,RDN_UC_SURFACE_BUFFER,5,0,id,0,0,0,0));
     CHECK(IOServiceOpen(svc, mach_task_self(), 0, &surface));
@@ -72,6 +78,11 @@ int main(void)
                   cpu_image[i*4+2]!=0 || cpu_image[i*4+3]!=128;
     printf("CPU-only backing import: %u failures\n",failures);
     free(cpu_image);glDeleteTextures(1,&cpu_texture);
+    int *quartz_server = driver_symbol("_rdn_window_server");
+    if (quartz) {
+        if (!quartz_server) return 13;
+        *quartz_server = 1;
+    }
     int (*attach)(void *,unsigned long)=driver_symbol("_rdn_mesa_attach_screen");
     void **contexts=driver_symbol("_contexts");
     if (!attach || !contexts || !*contexts) return 3;
@@ -83,7 +94,10 @@ int main(void)
     failures += rgba[0]!=0 || rgba[1]!=255 || rgba[2]!=0 || rgba[3]!=128;
     glClearColor(1,0,0,0.25);glClear(GL_COLOR_BUFFER_BIT);glFinish();
     printf("direct backing after finish: %u,%u,%u,%u\n",cpu[0],cpu[1],cpu[2],cpu[3]);
-    failures += cpu[0]!=128 || cpu[1]!=0 || cpu[2]!=255 || cpu[3]!=0;
+    if (quartz)
+        failures += cpu[0]!=64 || cpu[1]!=255 || cpu[2]!=0 || cpu[3]!=0;
+    else
+        failures += cpu[0]!=128 || cpu[1]!=0 || cpu[2]!=255 || cpu[3]!=0;
     size=sizeof(info);
     CHECK(IOConnectMethodScalarIStructureO(surface,kIOAccelSurfaceReadLockOptions,1,&size,0,&info));
     printf("GPU -> CPU: %u,%u,%u,%u stride %u\n",cpu[0],cpu[1],cpu[2],cpu[3],(unsigned)info.rowBytes);

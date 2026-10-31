@@ -46,7 +46,7 @@ static uint32_t rdn_popcount32(uint32_t v)
 	return n;
 }
 
-static uint32_t rdn_remap_render_backend(uint32_t tiling_pipe_num,
+uint32_t rdn_remap_render_backend(uint32_t tiling_pipe_num,
 					 uint32_t max_rb_num,
 					 uint32_t total_max_rb_num,
 					 uint32_t disabled_rb_mask)
@@ -112,6 +112,17 @@ void rdn_gpu_init(struct rdn_accel *accel)
 	uint32_t disabled_rb_mask;
 	int i, j, ps_thread_count;
 	uint32_t n;
+
+	memset(cfg, 0, sizeof(*cfg));
+	switch (card->family) {
+	case RDN_FAMILY_CAYMAN:
+		rdn_cayman_gpu_init(accel);
+		return;
+	case RDN_FAMILY_TURKS:
+		break;
+	default:
+		return;
+	}
 
 	/* CHIP_TURKS */
 	cfg->num_ses = 1;

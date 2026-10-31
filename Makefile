@@ -30,12 +30,12 @@ CFLAGS_COMMON = -std=gnu99 -O2 -g -Wall -Wextra -Wno-unused-parameter
 CFLAGS_UPSTREAM = $(CFLAGS_COMMON) -Wno-sign-compare -Wno-type-limits \
 	-Wno-unused-variable -Wno-unused-but-set-variable
 
-HW_OBJS   = hw/rdn_uvd.o hw/rdn_gart.o hw/rdn_mc.o hw/rdn_watermark.o hw/rdn_pm.o hw/rdn_cursor.o hw/rdn_mem.o hw/rdn_gpu.o hw/rdn_cp.o hw/rdn_blit.o hw/rdn_selftest.o hw/rdn_pattern.o hw/rdn_modeset.o hw/rdn_dp.o hw/rdn_mode.o hw/rdn_dmt.o hw/rdn_i2c.o hw/rdn_post.o hw/rdn_atom.o hw/atom/atom.o
+HW_OBJS   = hw/rdn_uvd.o hw/rdn_gart.o hw/rdn_mc.o hw/rdn_watermark.o hw/rdn_cayman_dpm.o hw/rdn_smc.o hw/rdn_pm.o hw/rdn_cursor.o hw/rdn_mem.o hw/rdn_gpu.o hw/rdn_cp.o hw/rdn_blit.o hw/rdn_selftest.o hw/rdn_pattern.o hw/rdn_modeset.o hw/rdn_dp.o hw/rdn_mode.o hw/rdn_dmt.o hw/rdn_i2c.o hw/rdn_post.o hw/rdn_atom.o hw/atom/atom.o
 HW_HDRS   = $(wildcard hw/*.h hw/atom/*.h hw/linux/*.h)
-HW_OBJS  += hw/rdn_mc_layout.o
+HW_OBJS  += hw/rdn_cayman_gating.o hw/rdn_cayman_memory.o hw/rdn_mc_layout.o hw/rdn_cayman.o hw/rdn_dma.o
 
 TESTS     = atom_replay edid_modes i2c_edid board_outputs dp_link modeset_replay accel_replay blit_ops mem_alloc pm_states mc_replay gart_replay handover engine_detect arb_alias
-TESTS    += uvd_model uvd_guarded_model mc_layout_model gart_scratch mem_segment mem_range_compat
+TESTS    += family_framebuffer transmitter_init device_families cayman_gating_model cayman_dpm_model smc_model pm_virtual uvd_model uvd_guarded_model mc_layout_model display_banks gart_scratch mem_segment mem_range_compat
 
 X86_TESTS = $(addprefix build/x86/,$(TESTS))
 PPC_TESTS = $(addprefix build/ppc/,$(TESTS))
@@ -43,6 +43,33 @@ PPC_TESTS = $(addprefix build/ppc/,$(TESTS))
 # The tool talks to the real card through sysfs, so it is only useful on the
 # x86 host. The PowerPC build is there to keep it compiling big-endian.
 all: $(X86_TESTS) $(PPC_TESTS) build/x86/rdn_tool build/ppc/rdn_tool
+
+build/x86/rominfo: build/x86/tools/rominfo.o $(addprefix build/x86/,$(HW_OBJS))
+	$(CC) -o $@ $^
+
+build/ppc/rominfo: build/ppc/tools/rominfo.o $(addprefix build/ppc/,$(HW_OBJS))
+	$(PPC_CC) -static -o $@ $^
+
+build/x86/family_framebuffer: build/x86/tests/family_framebuffer.o $(addprefix build/x86/,$(HW_OBJS))
+	$(CC) -Wl,--wrap=atom_asic_init -o $@ $^
+
+build/ppc/family_framebuffer: build/ppc/tests/family_framebuffer.o $(addprefix build/ppc/,$(HW_OBJS))
+	$(PPC_CC) -static -Wl,--wrap=atom_asic_init -o $@ $^
+
+TRANSMITTER_WRAPS = -Wl,--wrap=atom_execute_table -Wl,--wrap=atom_parse_cmd_header \
+	-Wl,--wrap=atom_parse_data_header
+
+build/x86/transmitter_init: build/x86/tests/transmitter_init.o $(addprefix build/x86/,$(HW_OBJS))
+	$(CC) $(TRANSMITTER_WRAPS) -o $@ $^
+
+build/ppc/transmitter_init: build/ppc/tests/transmitter_init.o $(addprefix build/ppc/,$(HW_OBJS))
+	$(PPC_CC) -static $(TRANSMITTER_WRAPS) -o $@ $^
+
+build/x86/pm_virtual: build/x86/tests/pm_virtual.o $(addprefix build/x86/,$(HW_OBJS))
+	$(CC) -Wl,--wrap=atom_execute_table -o $@ $^
+
+build/ppc/pm_virtual: build/ppc/tests/pm_virtual.o $(addprefix build/ppc/,$(HW_OBJS))
+	$(PPC_CC) -static -Wl,--wrap=atom_execute_table -o $@ $^
 
 build/x86/rdn_tool: build/x86/tools/rdn_tool.o $(addprefix build/x86/,$(HW_OBJS))
 	$(CC) -o $@ $^
@@ -97,7 +124,13 @@ test-mem-segment: build/x86/mem_segment build/ppc/mem_segment build/x86/mem_rang
 	@set -e; $(call run_test,mem_segment,); \
 		$(call run_test,mem_range_compat,)
 
-test: all test-uvd test-mc-layout test-gart-scratch test-mem-segment
+test-fence-packet: build/x86/fence_packet build/ppc/fence_packet
+	@set -e; $(call run_test,fence_packet,)
+
+test-pm-virtual: build/x86/pm_virtual build/ppc/pm_virtual
+	@set -e; $(call run_test,pm_virtual,)
+
+test: all test-fence-packet test-smc test-cayman-dpm test-pm-virtual test-uvd test-mc-layout test-gart-scratch test-mem-segment
 	@if [ ! -f $(VBIOS) ] || [ ! -f $(REF_PHASE) ]; then \
 		echo "SKIP: need $(VBIOS) and $(REF_PHASE)"; \
 	else \
@@ -141,3 +174,28 @@ clean:
 	rm -rf build/x86 build/ppc
 
 .PHONY: all test test-uvd test-mc-layout test-gart-scratch test-mem-segment clean
+
+test-smc: build/x86/smc_model build/ppc/smc_model
+	@set -e; $(call run_test,smc_model,)
+
+build/x86/pmcheck: build/x86/tools/pmcheck.o $(addprefix build/x86/,$(HW_OBJS))
+	$(CC) -Wl,--wrap=atom_execute_table -o $@ $^
+
+build/ppc/pmcheck: build/ppc/tools/pmcheck.o $(addprefix build/ppc/,$(HW_OBJS))
+	$(PPC_CC) -static -Wl,--wrap=atom_execute_table -o $@ $^
+
+build/x86/cayman_dpm_model: build/x86/tests/cayman_dpm_model.o $(addprefix build/x86/,$(HW_OBJS))
+	$(CC) -Wl,--wrap=atom_execute_table -o $@ $^
+build/ppc/cayman_dpm_model: build/ppc/tests/cayman_dpm_model.o $(addprefix build/ppc/,$(HW_OBJS))
+	$(PPC_CC) -static -Wl,--wrap=atom_execute_table -o $@ $^
+test-cayman-dpm: build/x86/cayman_dpm_model build/ppc/cayman_dpm_model
+	@set -e; $(call run_test,cayman_dpm_model,)
+
+# Packet model supplies its own register and CP callbacks.
+build/x86/dma_model: tests/dma_model.c hw/rdn_dma.c $(HW_HDRS)
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS_COMMON) -Ihw tests/dma_model.c hw/rdn_dma.c -o $@
+
+build/ppc/dma_model: tests/dma_model.c hw/rdn_dma.c $(HW_HDRS)
+	@mkdir -p $(@D)
+	$(PPC_CC) $(CFLAGS_COMMON) -static -Ihw tests/dma_model.c hw/rdn_dma.c -o $@

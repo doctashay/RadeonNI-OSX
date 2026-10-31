@@ -21,7 +21,8 @@ enum OSMesaNV12Result {
    OSMESA_NV12_OK = 0,
    OSMESA_NV12_UNSUPPORTED = 1,
    OSMESA_NV12_RETIRED = 2,
-   OSMESA_NV12_PENDING = 3
+   OSMESA_NV12_PENDING = 3,
+   OSMESA_NV12_IN_PROGRESS = 4
 };
 
 /* Plane offsets are relative to the kernel-validated source span.
@@ -33,6 +34,13 @@ GLAPI int GLAPIENTRY OSMesaPackNV12Store(OSMesaContext context,
                                        const struct OSMesaNV12Source *source,
                                        GLuint destination_y, GLuint destination_uv,
                                        uint32_t timeout_ms);
+
+GLAPI int GLAPIENTRY OSMesaBeginPackNV12Store(OSMesaContext context,
+                                       const struct OSMesaNV12Source *source,
+                                       GLuint destination_y, GLuint destination_uv,
+                                       uint32_t timeout_ms);
+GLAPI int GLAPIENTRY OSMesaPollPackNV12Store(OSMesaContext context);
+GLAPI int GLAPIENTRY OSMesaCancelPackNV12Store(OSMesaContext context);
 
 #ifdef __cplusplus
 }

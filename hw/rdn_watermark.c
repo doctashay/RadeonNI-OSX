@@ -1,5 +1,5 @@
 /*
- * Line buffer and display watermarks for CRTC 0.
+ * Line buffer and display watermarks for the selected CRTC.
  *
  * The display controller reads the picture from video memory into a line
  * buffer ahead of the beam. The watermarks tell the memory controller how
@@ -12,7 +12,7 @@
  * Follows the Linux radeon driver: evergreen_bandwidth_update(),
  * evergreen_line_buffer_adjust(), evergreen_program_watermarks() and the
  * bandwidth and latency helpers before them in evergreen.c, with the
- * 20.12 fixed point arithmetic of include/drm/drm_fixed.h. One display, no
+ * 20.12 fixed point arithmetic of include/drm/drm_fixed.h. Active-head count supplied by the caller; no
  * scaling, not interlaced.
  *
  * Copyright 2009 Red Hat Inc.
@@ -45,7 +45,6 @@
 /* DCE5: half of a line buffer pair, in pixels times two. */
 #define LB_SIZE_HALF		(4096 * 2)
 #define BYTES_PER_PIXEL		4	/* Linux assumes this whatever the depth */
-#define NUM_HEADS		1
 
 /* drm_fixed.h: 20.12 fixed point */
 static uint32_t fx(uint32_t a)
@@ -93,7 +92,7 @@ static uint32_t min_u32(uint32_t a, uint32_t b)
 }
 
 struct wm_params {
-	uint32_t dram_channels;
+	uint32_t dram_channels, num_heads;
 	uint32_t yclk;		/* bandwidth per dram data pin in kHz */
 	uint32_t sclk;		/* engine clock in kHz */
 	uint32_t disp_clk;	/* display clock in kHz */
@@ -150,10 +149,10 @@ static uint32_t latency_watermark(const struct wm_params *wm)
 	worst_chunk_return_time = (512 * 8 * 1000) / available;
 	cursor_line_pair_return_time = (128 * 4 * 1000) / available;
 	dc_latency = 40000000 / wm->disp_clk;
-	latency = mc_latency + (NUM_HEADS + 1) * worst_chunk_return_time +
-		  NUM_HEADS * cursor_line_pair_return_time + dc_latency;
+	latency = mc_latency + (wm->num_heads + 1) * worst_chunk_return_time +
+		  wm->num_heads * cursor_line_pair_return_time + dc_latency;
 
-	lb_fill_bw = min_u32(fx_trunc(fx_div(fx(available), fx(NUM_HEADS))),
+	lb_fill_bw = min_u32(fx_trunc(fx_div(fx(available), fx(wm->num_heads))),
 			     wm->disp_clk * BYTES_PER_PIXEL / 1000);
 	if (!lb_fill_bw)
 		return latency;
@@ -172,8 +171,8 @@ static bool needs_priority(const struct wm_params *wm)
 	uint32_t line_time = wm->active_time + wm->blank_time;
 	uint32_t tolerant_lines = wm->lb_size / wm->src_width <= 2 ? 1 : 2;
 
-	return average > dram_bandwidth(wm, 3) / NUM_HEADS ||
-	       average > available_bandwidth(wm) / NUM_HEADS ||
+	return average > dram_bandwidth(wm, 3) / wm->num_heads ||
+	       average > available_bandwidth(wm) / wm->num_heads ||
 	       latency_watermark(wm) > tolerant_lines * line_time + wm->blank_time;
 }
 
@@ -190,21 +189,23 @@ static uint32_t priority_count(const struct wm_params *wm, uint32_t watermark)
 	return c;
 }
 
-void rdn_bandwidth_update(struct rdn_card *card)
+static void bandwidth_update(struct rdn_card *card, bool layout)
 {
 	uint32_t latency[2] = { 0, 0 }, priority[2] = { PRIORITY_OFF, PRIORITY_OFF };
 	uint32_t line_time = 0, arb_control3, tmp;
 	bool on = card->wm_clock && card->wm_hdisplay && card->wm_htotal;
 	unsigned i;
 
-	/* evergreen_line_buffer_adjust(): half of the pair's buffer, as Linux */
-	rdn_wreg(card, DC_LB_MEMORY_SPLIT, 0);
-	rdn_wreg(card, PIPE0_DMIF_BUFFER_CONTROL, DMIF_BUFFERS_ALLOCATED(on ? 1 : 0));
-	for (i = 0; i < 100000; i++) {
-		if (rdn_rreg(card, PIPE0_DMIF_BUFFER_CONTROL) &
-		    DMIF_BUFFERS_ALLOCATED_COMPLETED)
-			break;
-		card->os->delay_us(card->os->cookie, 1);
+	if (layout) {
+		/* evergreen_line_buffer_adjust(): half of the pair's buffer, as Linux */
+		rdn_wreg(card, DC_LB_MEMORY_SPLIT + rdn_crtc_offset(card->display_crtc), 0);
+		rdn_wreg(card, PIPE0_DMIF_BUFFER_CONTROL + card->display_crtc * 0x20, DMIF_BUFFERS_ALLOCATED(on ? 1 : 0));
+		for (i = 0; i < 100000; i++) {
+			if (rdn_rreg(card, PIPE0_DMIF_BUFFER_CONTROL + card->display_crtc * 0x20) &
+			    DMIF_BUFFERS_ALLOCATED_COMPLETED)
+				break;
+			card->os->delay_us(card->os->cookie, 1);
+		}
 	}
 
 	if (on) {
@@ -226,6 +227,7 @@ void rdn_bandwidth_update(struct rdn_card *card)
 		}
 
 		wm.dram_channels = channels;
+		wm.num_heads = card->display_heads ? card->display_heads : 1;
 		wm.disp_clk = card->wm_clock;
 		wm.src_width = card->wm_hdisplay;
 		wm.active_time = (uint32_t)div64((uint64_t)card->wm_hdisplay * 1000000,
@@ -242,7 +244,7 @@ void rdn_bandwidth_update(struct rdn_card *card)
 		 * caller has named others for B.
 		 */
 		for (i = 0; i < 2; i++) {
-			bool low = i == 1 && card->wm_low_sclk && card->wm_low_mclk;
+			bool low = (i == 1 || card->power_memory_dpm) && card->wm_low_sclk && card->wm_low_mclk;
 
 			wm.sclk = (low ? card->wm_low_sclk : card->sclk) * 10;
 			wm.yclk = (low ? card->wm_low_mclk : card->mclk) * 10;
@@ -259,21 +261,42 @@ void rdn_bandwidth_update(struct rdn_card *card)
 	}
 
 	/* select wm A, then B, then what was selected */
-	arb_control3 = rdn_rreg(card, PIPE0_ARBITRATION_CONTROL3);
+	arb_control3 = rdn_rreg(card, PIPE0_ARBITRATION_CONTROL3 + card->display_crtc * 0x20);
 	tmp = arb_control3;
 	tmp &= ~LATENCY_WATERMARK_MASK(3);
 	tmp |= LATENCY_WATERMARK_MASK(1);
-	rdn_wreg(card, PIPE0_ARBITRATION_CONTROL3, tmp);
-	rdn_wreg(card, PIPE0_LATENCY_CONTROL,
+	rdn_wreg(card, PIPE0_ARBITRATION_CONTROL3 + card->display_crtc * 0x20, tmp);
+	rdn_wreg(card, PIPE0_LATENCY_CONTROL + card->display_crtc * 0x20,
 		 LATENCY_LOW_WATERMARK(latency[0]) | LATENCY_HIGH_WATERMARK(line_time));
-	tmp = rdn_rreg(card, PIPE0_ARBITRATION_CONTROL3);
+	tmp = rdn_rreg(card, PIPE0_ARBITRATION_CONTROL3 + card->display_crtc * 0x20);
 	tmp &= ~LATENCY_WATERMARK_MASK(3);
 	tmp |= LATENCY_WATERMARK_MASK(2);
-	rdn_wreg(card, PIPE0_ARBITRATION_CONTROL3, tmp);
-	rdn_wreg(card, PIPE0_LATENCY_CONTROL,
+	rdn_wreg(card, PIPE0_ARBITRATION_CONTROL3 + card->display_crtc * 0x20, tmp);
+	rdn_wreg(card, PIPE0_LATENCY_CONTROL + card->display_crtc * 0x20,
 		 LATENCY_LOW_WATERMARK(latency[1]) | LATENCY_HIGH_WATERMARK(line_time));
-	rdn_wreg(card, PIPE0_ARBITRATION_CONTROL3, arb_control3);
+	rdn_wreg(card, PIPE0_ARBITRATION_CONTROL3 + card->display_crtc * 0x20, arb_control3);
 
-	rdn_wreg(card, PRIORITY_A_CNT, priority[0]);
-	rdn_wreg(card, PRIORITY_B_CNT, priority[1]);
+	rdn_wreg(card, PRIORITY_A_CNT + rdn_crtc_offset(card->display_crtc), priority[0]);
+	rdn_wreg(card, PRIORITY_B_CNT + rdn_crtc_offset(card->display_crtc), priority[1]);
+}
+
+void rdn_bandwidth_update(struct rdn_card *card)
+{
+	if (card && card->display_crtc < rdn_crtc_count(card) && card->display_heads <= rdn_crtc_count(card))
+		bandwidth_update(card, true);
+}
+
+void rdn_bandwidth_update_clocks(struct rdn_card *card)
+{
+	if (!card || card->display_crtc >= rdn_crtc_count(card) || card->display_heads > rdn_crtc_count(card))
+		return;
+	bandwidth_update(card, false);
+	if (!card->display_peers) return;
+	for (unsigned i = 0; i < rdn_crtc_count(card); ++i) {
+		struct rdn_card *peer = card->display_peers[i];
+		if (!peer || peer == card) continue;
+		peer->sclk = card->sclk; peer->mclk = card->mclk;
+		peer->wm_low_sclk = card->wm_low_sclk; peer->wm_low_mclk = card->wm_low_mclk;
+		if (peer->crtc_on) bandwidth_update(peer, false);
+	}
 }

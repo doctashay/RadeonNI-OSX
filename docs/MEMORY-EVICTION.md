@@ -1,8 +1,39 @@
 # Video memory, the GART and eviction (A7)
 
-Written 2026-10-08 so that another session can pick this up cold. Status:
-**nothing is implemented; one bug in the GART chunks was fixed on the way;
-the three piglit subtests that still fail have not been investigated.**
+## Live eviction (2026-10-25)
+
+Private GPU-only buffers of at least 64 KiB now receive stable GART aliases.
+The 4 GiB translation window reserves its upper 3 GiB for these aliases;
+ordinary uploads use the same allocator starting below them. VRAM aliases
+use non-SYSTEM PTEs. Eviction switches the alias to wired RAM and copies the
+old VRAM bytes with CP DMA before releasing the allocation. Promotion copies
+back to a new VRAM allocation before remapping the unchanged alias.
+
+The winsys evicts its own least-recently-used completed buffers on allocation
+failure, after reclaiming its cache. It promotes referenced buffers when room
+returns. Shared display storage, CPU-mapped buffers, and decoder allocations
+are excluded. This is per-winsys eviction, not a system-wide process eviction
+manager. Evicted bytes share the existing 512 MiB pinned-RAM budget with
+uploads. Timeout paths retain memory and reject further GPU submissions.
+
+The new kernel advertises managed-memory version 1. Compatible Mesa enables
+it automatically; `RDN_LIVE_EVICTION=0` disables it. `RDN_VRAM_BUDGET_MB` sets
+a smaller resident budget for regression tests; it is not needed in normal use.
+`RDN_STATS=1` logs actual evictions and promotions with the stable alias.
+
+`managedprobe` passed GPU reads before eviction, after freeing the old VRAM,
+and after promotion on PCI devices 6704 and 675d. `evictiontest` passed three
+rounds of sixteen 4 MiB tiled textures under a 16 MiB resident budget on both
+renderers: full-image comparisons, GPU writes while evicted, promotion, and
+allocation reuse. Failure-injection tests cover busy buffers, RAM exhaustion,
+unknown copy completion, and stable addresses on x86 and emulated PowerPC.
+These tests do not establish unbounded allocation or system-wide eviction.
+
+## Historical investigation (2026-10-08 through 2026-10-20)
+
+The remaining notes describe the old 1 GiB configuration and the investigation
+that preceded the implementation above. Historical piglit failures have not
+been reclassified by the new targeted tests.
 
 ## The question
 
@@ -150,3 +181,25 @@ bound textures. Linux solves it in one of two ways, and **neither is what the ca
 **Whether to do it:** nothing has run out of memory in practice since the decoder's buffers left the aperture; the only users are the three piglit `large-tex` subtests. The cheap middle path that was taken for the
 decoder (put the GPU-only bulk in the hidden 768 MB, keep what the CPU writes in the aperture) is the same idea without a mover, and could be extended to textures and render targets (the winsys already sends
 `NO_CPU_ACCESS` buffers to the hidden memory). Eviction proper is a large piece of kernel work for a problem that does not yet exist.
+
+
+### Device-wide diagnostic accounting
+
+V2 selector `RDN_UC_MEMORY_USAGE` returns a versioned snapshot under the
+accelerator allocation lock. It covers every client's visible, hidden and
+command heaps. Byte counts are explicit high/low 32-bit pairs, preserving
+the same structure layout for PPC32 and PPC64 clients.
+
+`total = reserved + allocated + free`. Reserved includes fixed carveouts
+and memory unavailable to the allocators; occupied is reserved plus allocated.
+Free and largest-block values are reported separately for visible and hidden
+VRAM. Command-reserve free space is separate because ordinary textures cannot
+use it. GART address-space capacity is not VRAM occupancy. Managed aliases
+and UVD allocations are accounted through the owning heap, never counted a
+second time as separate objects.
+
+`tools/guest/memoryusagetest.c` opens an owner and an independent observer,
+checks snapshot invariants, allocates visible/hidden VRAM, then closes the
+owner and samples again. Both PPC32 and PPC64 binaries compile on Leopard;
+the live allocation test awaits booting the diagnostic kernel. Concurrent
+client changes are printed as a global delta rather than assumed to be zero.

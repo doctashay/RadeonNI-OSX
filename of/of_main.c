@@ -159,8 +159,8 @@ static uint32_t of_peer(uint32_t ph)
  * made on; the others (6758 HD 6670, 6759, 675b, 675f) are untested. */
 static int is_turks(uint32_t d)
 {
-	return d == 0x675d || d == 0x6758 || d == 0x6759 || d == 0x675b ||
-	       d == 0x675f;
+	return d <= 0xffff && rdn_family_from_device((uint16_t)d) == RDN_FAMILY_TURKS &&
+		!rdn_device_is_mobile((uint16_t)d);
 }
 
 static uint32_t find_card_in(uint32_t ph, int depth)

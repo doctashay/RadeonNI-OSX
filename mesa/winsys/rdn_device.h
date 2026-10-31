@@ -22,7 +22,9 @@ extern "C" {
 #endif
 
 struct rdn_device_info {
+   bool queued_surface_present;
    uint32_t pci_device_id;
+   char model[128];
    /* GPU address of aperture offset 0. */
    uint64_t vram_gpu_base;
    /* Bytes the allocator below manages. */
@@ -31,6 +33,8 @@ struct rdn_device_info {
    uint64_t hidden_size;
    /* GPU address of offset 0 of what gart_alloc() hands out. */
    uint64_t gart_gpu_base;
+   /* Wired allocation budget, not the GPU virtual address span. */
+   uint64_t gart_size;
    /* Synchronized CP DMA burst limit for GART-to-GART copies; zero if unrestricted. */
    uint32_t cp_dma_gtt_copy_max_bytes;
    /* From the 3D engine setup (evergreen_gpu_init). */
@@ -50,6 +54,10 @@ struct rdn_region {
    uint32_t count;
    int32_t bounds[4];
    int16_t rects[RDN_REGION_RECTS][4];
+};
+
+struct rdn_screen {
+   uint32_t index, offset, width, height, pitch_pixels, bits_per_pixel, scanout;
 };
 
 struct rdn_surface {
@@ -78,9 +86,12 @@ struct rdn_device {
    void (*release_external)(struct rdn_device *dev, void *reference);
 
    /* Video memory. Offsets are byte offsets into the aperture. */
+   int (*alloc_command)(struct rdn_device *dev, uint64_t size, uint64_t align, uint64_t *offset);
    int (*alloc)(struct rdn_device *dev, uint64_t size, uint64_t align,
                 uint64_t *offset);
    void (*free)(struct rdn_device *dev, uint64_t offset);
+   int (*alloc_small)(struct rdn_device *, uint64_t, uint64_t, uint64_t *);
+   bool (*is_small)(struct rdn_device *, uint64_t);
    /*
     * Video memory the CPU cannot reach (beyond the aperture), for what only
     * the GPU reads and writes; freed with free(). NULL, or failing, when
@@ -108,7 +119,14 @@ struct rdn_device {
     */
    int (*gart_bind_user)(struct rdn_device *dev, void *address, uint64_t size,
                          uint64_t *offset);
-   void (*gart_unbind_user)(struct rdn_device *dev, uint64_t offset, uint64_t size);
+   int (*gart_unbind_user)(struct rdn_device *dev, uint64_t offset, uint64_t size);
+
+   int (*managed_alias)(struct rdn_device *, uint64_t physical, uint64_t bytes,
+                         unsigned alignment, uint64_t *alias);
+   int (*managed_evict)(struct rdn_device *, uint64_t alias, uint64_t bytes, void **backing);
+   int (*managed_promote)(struct rdn_device *, uint64_t alias, uint64_t physical,
+                           uint64_t bytes, void *backing);
+   int (*managed_release)(struct rdn_device *, uint64_t alias, uint64_t bytes, void *backing);
 
    /*
     * Run `words` command words stored at `offset`, in the CPU's byte order
@@ -118,6 +136,8 @@ struct rdn_device {
     */
    int (*submit)(struct rdn_device *dev, uint64_t offset, uint32_t words,
                  uint32_t *fence);
+   /* 1 for a confirmed graphics fault, 0 if healthy, negative on query failure. */
+   int (*graphics_fault)(struct rdn_device *dev);
    bool (*fence_done)(struct rdn_device *dev, uint32_t fence);
    /* 0 when reached. After it, the CPU sees what the GPU wrote. */
    int (*fence_wait)(struct rdn_device *dev, uint32_t fence,
@@ -171,6 +191,7 @@ struct rdn_device {
     * changes them; `screen` is kept as the device last read it).
     */
    void (*screen_refresh)(struct rdn_device *dev);
+   bool (*surface_screen)(struct rdn_device *dev, uint32_t id, struct rdn_screen *screen);
 
    /*
     * Optional: the shape on the screen of the window system's surface
@@ -212,6 +233,11 @@ struct rdn_device {
 
 /* Provided by the platform (target/). NULL when there is no usable card. */
 struct rdn_device *rdn_device_open(void);
+
+#ifdef __APPLE__
+/* Borrow an accelerator service port; never fall back to another GPU. */
+struct rdn_device *rdn_device_open_service(uint32_t service);
+#endif
 
 #ifdef __cplusplus
 }

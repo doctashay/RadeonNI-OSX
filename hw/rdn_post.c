@@ -52,6 +52,15 @@ int rdn_card_init(struct rdn_card *card, struct rdn_os *os, void *bios)
 {
 	memset(card, 0, sizeof(*card));
 	card->os = os;
+	/* Offline AtomBIOS tests may omit PCI callbacks. */
+	if (os->cfg_read32) {
+		uint32_t pci = os->cfg_read32(os->cookie, 0);
+		card->family = rdn_family_from_pci(pci);
+		if (card->family == RDN_FAMILY_UNKNOWN) {
+			rdn_log(os, RDN_LOG_ERROR, "unsupported PCI identity 0x%08x", pci);
+			return -EINVAL;
+		}
+	}
 	return rdn_atom_init(&card->atom, os, bios);
 }
 
@@ -63,10 +72,10 @@ void rdn_card_fini(struct rdn_card *card)
 bool rdn_card_posted(struct rdn_card *card)
 {
 	uint32_t reg = 0, v;
-	int i;
+	unsigned i;
 
 	/* first check CRTCs */
-	for (i = 0; i < RDN_NUM_CRTC; i++) {
+	for (i = 0; i < rdn_crtc_count(card); i++) {
 		v = rdn_rreg(card, EVERGREEN_CRTC_CONTROL + crtc_offsets[i]);
 		if (i == 0)
 			card->crtc_on = (v & EVERGREEN_CRTC_MASTER_EN) != 0;
@@ -120,7 +129,7 @@ static bool rdn_is_display_hung(struct rdn_card *card)
 	uint32_t crtc_status[RDN_NUM_CRTC];
 	uint32_t i, j, tmp;
 
-	for (i = 0; i < RDN_NUM_CRTC; i++) {
+	for (i = 0; i < rdn_crtc_count(card); i++) {
 		if (rdn_rreg(card, EVERGREEN_CRTC_CONTROL + crtc_offsets[i]) &
 		    EVERGREEN_CRTC_MASTER_EN) {
 			crtc_status[i] = rdn_rreg(card,
@@ -130,7 +139,7 @@ static bool rdn_is_display_hung(struct rdn_card *card)
 	}
 
 	for (j = 0; j < 10; j++) {
-		for (i = 0; i < RDN_NUM_CRTC; i++) {
+		for (i = 0; i < rdn_crtc_count(card); i++) {
 			if (crtc_hung & (1 << i)) {
 				tmp = rdn_rreg(card,
 					EVERGREEN_CRTC_STATUS_HV_COUNT + crtc_offsets[i]);

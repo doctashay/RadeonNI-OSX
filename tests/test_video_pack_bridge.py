@@ -30,11 +30,14 @@ struct OSMesaNV12Source {
  uint32_t y_top, y_bottom, uv_top, uv_bottom;
 };
 enum { OSMESA_NV12_OK, OSMESA_NV12_UNSUPPORTED,
-       OSMESA_NV12_RETIRED, OSMESA_NV12_PENDING };
+       OSMESA_NV12_RETIRED, OSMESA_NV12_PENDING, OSMESA_NV12_IN_PROGRESS };
 OSMesaContext OSMesaGetCurrentContext(void);
 int OSMesaCanPackNV12(OSMesaContext);
 int OSMesaPackNV12Store(OSMesaContext, const struct OSMesaNV12Source *,
                        GLuint, GLuint, uint32_t);
+int OSMesaBeginPackNV12Store(OSMesaContext, const struct OSMesaNV12Source *, GLuint, GLuint, uint32_t);
+int OSMesaPollPackNV12Store(OSMesaContext);
+int OSMesaCancelPackNV12Store(OSMesaContext);
 '''
 HARNESS = r'''
 #include <assert.h>
@@ -62,6 +65,13 @@ int OSMesaPackNV12Store(OSMesaContext c, const struct OSMesaNV12Source *s,
  CHECK(s->uv_top == reply.uv_top && s->uv_bottom == reply.uv_bottom);
  return pack_result;
 }
+int OSMesaBeginPackNV12Store(OSMesaContext c, const struct OSMesaNV12Source *s,
+                            GLuint y, GLuint uv, uint32_t timeout)
+{ return OSMesaPackNV12Store(c, s, y, uv, timeout); }
+int OSMesaPollPackNV12Store(OSMesaContext c)
+{ CHECK(c == (void *)1); return pack_result; }
+int OSMesaCancelPackNV12Store(OSMesaContext c)
+{ CHECK(c == (void *)1); return pack_result; }
 static int invoke(io_connect_t connection, uint32_t method, const void *in,
                    size_t input_bytes, void *out, size_t *output_bytes)
 {
@@ -103,6 +113,7 @@ int IOConnectMethodScalarIStructureI(io_connect_t c, uint32_t m, unsigned scalar
 }
 static void reset(void)
 {
+ CHECK(!async_video_jobs);
  acquisitions = retirements = packs = 0;
  capable = 1; acquire_error = retire_error = short_reply = 0;
  pack_result = OSMESA_NV12_OK; last_outcome = 99;
@@ -131,7 +142,7 @@ int main(void)
  CHECK(sizeof(struct rdn_video_gpu_acquire) == 64);
  CHECK(sizeof(struct rdn_video_gpu_retire) == 64);
  CHECK(RDN_VIDEO_ACQUIRE_GPU == 6 && RDN_VIDEO_RETIRE_GPU == 7);
- reset(); CHECK(!RDNGLQueryVideoPackingV1(1, &caps) && caps == 1);
+ reset(); CHECK(!RDNGLQueryVideoPackingV1(1, &caps) && caps == (RDN_GL_VIDEO_PACK_CAP_NV12_COMPLETED | RDN_GL_VIDEO_PACK_CAP_NV12_ASYNC));
  CHECK(RDNGLQueryVideoPackingV1(2, &caps) == 1 && caps == 0);
  capable = 0; CHECK(RDNGLQueryVideoPackingV1(1, &caps) == 1 && caps == 0);
  CHECK(RDNGLPackVideoFrameV1(&request) == 1 && !acquisitions);
@@ -176,6 +187,34 @@ int main(void)
  CHECK(RDNGLPackVideoFrameV1(&request) == 3 && !packs && retirements == 1);
  reset(); retire_error = 5;
  CHECK(RDNGLPackVideoFrameV1(&request) == 3 && packs == 1 && retirements == 1);
+ reset(); pack_result = OSMESA_NV12_IN_PROGRESS;
+ CHECK(RDNGLBeginVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_IN_PROGRESS);
+ CHECK(acquisitions == 1 && packs == 1 && !retirements);
+ CHECK(RDNGLBeginVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_UNSUPPORTED);
+ CHECK(acquisitions == 1);
+ ++request.source_token[0];
+ CHECK(RDNGLPollVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_FAILED_PENDING);
+ CHECK(!retirements);
+ --request.source_token[0];
+ CHECK(RDNGLPollVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_IN_PROGRESS);
+ CHECK(!retirements);
+ pack_result = OSMESA_NV12_OK;
+ CHECK(RDNGLPollVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_OK);
+ CHECK(retirements == 1 && last_outcome == RDN_VIDEO_GPU_RETIRED);
+ CHECK(RDNGLPollVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_FAILED_PENDING);
+ reset(); pack_result = OSMESA_NV12_IN_PROGRESS;
+ CHECK(RDNGLBeginVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_IN_PROGRESS);
+ CHECK(RDNGLCancelVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_IN_PROGRESS);
+ CHECK(!retirements);
+ pack_result = OSMESA_NV12_PENDING;
+ CHECK(RDNGLCancelVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_FAILED_PENDING);
+ CHECK(retirements == 1 && last_outcome == RDN_VIDEO_GPU_PENDING);
+ reset(); short_reply = 1;
+ CHECK(RDNGLBeginVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_FAILED_RETIRED);
+ CHECK(!packs && retirements == 1);
+ reset(); retire_error = 5;
+ CHECK(RDNGLBeginVideoFrameV1(&request) == RDN_GL_VIDEO_PACK_FAILED_PENDING);
+ CHECK(packs == 1 && retirements == 1);
  printf("PASS video pack bridge: %u checks\n", checks);
  return 0;
 }

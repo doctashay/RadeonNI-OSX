@@ -66,6 +66,7 @@ public:
 
 private:
 	RadeonNIAccel *fAccel;
+	RadeonNIAccel *fReadAccel;
 	UInt32 fWid, fMode;
 	/* Whose client this is, and its view of the surface while read-locked. */
 	task_t fTask;

@@ -1,0 +1,19 @@
+--- a/src/gallium/drivers/r600/r600_query.c
++++ b/src/gallium/drivers/r600/r600_query.c
+@@ -685,6 +685,16 @@
+ 		if (enable != old_enable || perfect_enable != old_perfect_enable) {
+ 			struct r600_context *ctx = (struct r600_context*)rctx;
+ 			r600_mark_atom_dirty(ctx, &ctx->db_misc_state.atom);
++			if (old_enable && !enable && rctx->gfx_level == CAYMAN &&
++			    debug_get_bool_option("RDN_QUERY_TRANSITION_FLUSH", false)) {
++				/* Diagnose cache state retained across the last query end. */
++				ctx->b.flags |= R600_CONTEXT_WAIT_3D_IDLE |
++					R600_CONTEXT_FLUSH_AND_INV |
++					R600_CONTEXT_FLUSH_AND_INV_CB |
++					R600_CONTEXT_FLUSH_AND_INV_DB |
++					R600_CONTEXT_FLUSH_AND_INV_CB_META |
++					R600_CONTEXT_FLUSH_AND_INV_DB_META;
++			}
+ 		}
+ 	}
+ }

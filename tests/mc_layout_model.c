@@ -161,6 +161,15 @@ int main(void)
 	check(!regs[0x300/4] && !regs[0x310/4] && !regs[0x324/4] && regs[0x328/4] == 0x80 &&
 	      regs[0x5490/4] == 3 && regs[0x20ac/4] == 0x80 && regs[0x2c00/4] == 0x5a5a1234,
 	      "VGA addresses, CPU access and host-endian state have the required final values");
+	setup(63);
+	pci = 0x67581002; regs[0x5428/4] = 2048;
+	regs[0x2024/4] = 0x0f7f0f00; regs[0x2038/4] = 0xf7ffff;
+	regs[(0x6810+off[5])/4] = 0x7ff00000;
+	check(!run(&out) && !illegal && regs[0x2024/4] == 0x007f0000 &&
+	      regs[0x2038/4] == 0x7ffff && regs[(0x6810+off[5])/4] == 0x7ff00000 &&
+	      !regs[(0x681c+off[5])/4], "2 GiB Turks preserves the upper half and high scanout offsets");
+	setup(0); pci = 0x67581002; regs[0x5428/4] = 2048;
+	check(run(&out) < 0 && !writes, "2 GiB size with a truncated MC window is rejected before writes");
 	setup(0);
 	check(!run(&out) && !illegal && delays == 100, "no-display path needs no vblank and only the blackout settling delay");
 	setup(1);
@@ -174,8 +183,30 @@ int main(void)
 	      "framebuffer zero cannot become the system-aperture default");
 	check(rdn_mc_layout_rebase_zero(&card, 15, RDN_MC_LAYOUT_SCRATCH_OFFSET, &out) < 0 && !writes,
 	      "unknown precondition flags reject before writes");
-	pci = 0x67581002;
-	check(run(&out) < 0 && !writes, "other ASIC identity is outside the first diagnostic scope");
+	setup(0); pci = 0x67041002; regs[0x5428/4] = 2048;
+	regs[0x2024/4] = 0x0f7f0f00;
+	check(!run(&out) && !illegal && regs[0x2024/4] == 0x007f0000,
+	      "Cayman cold 2 GiB window relocates using shared NI address registers");
+	setup(63); pci = 0x67041002; regs[0x5428/4] = 2048;
+	regs[0x2024/4] = 0xf87ff800; regs[0x2c04/4] = 0xf8000000;
+	for (i = 0; i < 6; i++)
+		regs[(0x681c+off[i])/4] = regs[(0x6820+off[i])/4] = 0xf8;
+	check(!run(&out) && out.old_base == 0xf800000000ull && !illegal &&
+	      regs[0x2024/4] == 0x007f0000 && regs[0x2038/4] == 0x7ffff,
+	      "native Cayman 40-bit firmware window relocates to zero");
+	for (i = 0; i < 6; i++)
+		check(!regs[(0x681c+off[i])/4] && !regs[(0x6820+off[i])/4] &&
+		      regs[(0x6810+off[i])/4] == 0x100000+i*0x10000 &&
+		      regs[(0x6814+off[i])/4] == 0x200000+i*0x10000,
+		      "40-bit scanout addresses retain their offsets");
+	setup(0); pci = 0x67041002; regs[0x5428/4] = 2048;
+	regs[0x2024/4] = 0xf83ff800; regs[0x2c04/4] = 0xf8000000;
+	check(run(&out) < 0 && !writes, "truncated Cayman window rejects before writes");
+	setup(0); pci = 0x67041002; regs[0x5428/4] = 2048;
+	regs[0x2024/4] = 0xf87ff800;
+	check(run(&out) < 0 && !writes, "Cayman HDP base must match the MC window");
+	setup(0); pci = 0x99991002;
+	check(run(&out) < 0 && !writes, "unknown PCI device rejects before writes");
 	for (i = 0; i < sizeof(corrupt_regs)/sizeof(corrupt_regs[0]); i++) {
 		setup(1); regs[corrupt_regs[i]/4] = corrupt_vals[i];
 		check(run(&out) < 0 && !writes && !delays, "unsupported memory or inherited engine state rejects before mutation");

@@ -108,6 +108,20 @@ static int run_case(OSMesaContext context, unsigned width, unsigned height,
  rglEnable(GL_SCISSOR_TEST); rglEnable(GL_BLEND);
  rglActiveTexture(GL_TEXTURE3); rglBindTexture(GL_TEXTURE_2D, textures[1]);
  int packed = OSMesaPackNV12Store(context, &source, textures[0], textures[1], 2000);
+ if (packed == OSMESA_NV12_OK) {
+  packed = OSMesaBeginPackNV12Store(context, &source, textures[0], textures[1], 2000);
+  if (packed == OSMESA_NV12_IN_PROGRESS &&
+      OSMesaBeginPackNV12Store(context, &source, textures[0], textures[1], 2000) !=
+          OSMESA_NV12_UNSUPPORTED) {
+   fprintf(stderr, "a second submission replaced the active job\n"); _exit(3);
+  }
+  for (unsigned polls = 0; packed == OSMESA_NV12_IN_PROGRESS && polls < 2200; ++polls) {
+   usleep(1000);
+   packed = OSMesaPollPackNV12Store(context);
+  }
+  if (packed == OSMESA_NV12_IN_PROGRESS)
+   packed = OSMesaCancelPackNV12Store(context);
+ }
  if (packed == OSMESA_NV12_PENDING) {
   fprintf(stderr, "packing completion unknown; retaining source and context until process exit\n");
   printf("{\"type\":\"case\",\"width\":%u,\"height\":%u,\"result\":3}\n", width, height);

@@ -4,6 +4,13 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 parent=$(dirname "$root")
 src=$root/third_party/mesa-26.2.4
+# The PPC64 build uses the Mesa tree prepared by the PPC32 build.
+for feature_patch in "$root"/mesa/patches/010[234567]-*.patch "$root"/mesa/patches/0112-*.patch "$root"/mesa/patches/011[68]-*.patch; do
+    if ! patch -d "$src" -p1 -R --dry-run -s -f < "$feature_patch" >/dev/null 2>&1; then
+        patch -d "$src" -p1 --batch --forward < "$feature_patch"
+    fi
+done
+
 tc=${RDN_PPC64_TOOLCHAIN:-/mnt/chromium-ppc/ppc64-darwin/toolchain}
 sdk=${RDN_PPC64_SDK:-/home/shay/toolchains/osxcross/target/SDK/MacOSX10.5.sdk}
 compat=$root/third_party/darwin9-compat64
@@ -59,14 +66,24 @@ if [ ! -f build-darwin9-ppc64/build.ninja ]; then
       -Dplatforms= -Dgles1=disabled -Dgles2=disabled -Dzstd=disabled \
       -Dvalgrind=disabled -Dlibunwind=disabled -Dvideo-codecs= \
       -Dgallium-va=disabled -Dbuildtype=release -Doptimization=2 \
-      -Dxmlconfig=disabled -Dshader-cache=disabled -Db_ndebug=true \
+      -Dxmlconfig=disabled -Dshader-cache=enabled -Dshader-cache-max-size=64M -Db_ndebug=true \
       --cross-file "$root/third_party/mesa-darwin9-ppc64-cross.ini" --wrap-mode=nodownload
 fi
+python3 -m mesonbuild.mesonmain configure build-darwin9-ppc64 -Dshader-cache=enabled -Dshader-cache-max-size=64M
 ninja -j "${RDN_JOBS:-8}" -C build-darwin9-ppc64 src/gallium/targets/rdn/RadeonNIGLDriver.dylib
 slice=$src/build-darwin9-ppc64/src/gallium/targets/rdn/RadeonNIGLDriver.dylib
-if [ -n "${RDN_PPC32_SLICE:-}" ]; then
+ppc32_dir=${RDN_PPC32_DIR:-}
+if [ -z "$ppc32_dir" ] && [ -n "${RDN_PPC32_SLICE:-}" ]; then
+    ppc32_dir=$(dirname "$RDN_PPC32_SLICE")
+fi
+if [ -n "$ppc32_dir" ]; then
     output=${RDN_UNIVERSAL_OUTPUT:-$root/gld/build-leopard-universal/RadeonNIGLDriver}
-    mkdir -p "$(dirname "$output")"
-    powerpc64-apple-darwin9-lipo -create "$RDN_PPC32_SLICE" "$slice" -output "$output"
-    powerpc64-apple-darwin9-lipo -info "$output"
+    [ "$(basename "$output")" = RadeonNIGLDriver ] || {
+        echo "universal output must end in RadeonNIGLDriver; all four modules are packaged together" >&2
+        exit 1
+    }
+    python3 "$root/scripts/package-leopard-gld.py" "$(dirname "$output")" \
+        --ppc32 "$ppc32_dir" --ppc64 "$(dirname "$slice")"
+else
+    echo "PPC64 slices built only; set RDN_PPC32_DIR to package installable universal GLDs" >&2
 fi

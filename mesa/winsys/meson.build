@@ -20,6 +20,7 @@ librdnwinsys = static_library(
   files('rdn_winsys.c'), rdn_surface_c, rdn_drm_surface_c,
   include_directories : [
     include_directories('shim'), inc_rdn_winsys,
+    include_directories('../../targets/rdn/hw'),
     include_directories('../radeon/drm'),
     inc_src, inc_include, inc_gallium, inc_gallium_aux, inc_amd_common,
   ],

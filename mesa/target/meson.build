@@ -20,6 +20,7 @@ else
     'rdn_device_linux.c',
     'hw/rdn_mem.c',
     'hw/rdn_gpu.c',
+    'hw/rdn_cayman.c',
     'hw/rdn_cp.c',
     'hw/rdn_blit.c',
     'hw/rdn_selftest.c',
@@ -148,11 +149,13 @@ if host_machine.system() == 'darwin'
       '@OUTPUT@',
     ],
   )
+  foreach gpu_index : range(4)
+  gpu_suffix = gpu_index == 0 ? '' : gpu_index.to_string()
   shared_module(
-    'RadeonNIGLDriver',
+    'RadeonNIGLDriver' + gpu_suffix,
     files('gld/RadeonNIGLDriver.c', 'gld/rdn_mesa.c', 'gld/rdn_hook.c', 'gld/rdn_arbtext.c', 'gld/rdn_video.c'), rdn_dispatch_c,
     rdn_sources,
-    c_args : ['-DRDN_MESA'],
+    c_args : ['-DRDN_MESA', '-DRDN_GPU_INDEX=' + gpu_index.to_string()],
     include_directories : [rdn_inc, include_directories('gld')],
     # Only the gld* entry points leave the bundle. The static libstdc++
     # would otherwise export its weak symbols, and on Mac OS X 10.5 dyld
@@ -167,4 +170,5 @@ if host_machine.system() == 'darwin'
     name_prefix : '',
     install : false,
   )
+  endforeach
 endif

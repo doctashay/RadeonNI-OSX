@@ -16,6 +16,7 @@ struct rdn_nv12 *rdn_nv12_create(struct pipe_screen *screen);
 bool rdn_nv12_available(const struct rdn_nv12 *pack);
 int rdn_nv12_run(struct rdn_nv12 *pack, struct pipe_resource *source[4],
                  struct pipe_resource *destination[2], uint64_t timeout_ns);
+int rdn_nv12_poll(struct rdn_nv12 *pack, bool abandon);
 void rdn_nv12_destroy(struct rdn_nv12 *pack);
 bool rdn_nv12_has_quarantine(void);
 #endif

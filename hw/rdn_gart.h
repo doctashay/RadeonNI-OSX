@@ -2,8 +2,8 @@
  * The GART: a page table in video memory through which the GPU reads and
  * writes pages of system memory.
  *
- * The table gives the GPU a range of its own address space (1 GB starting
- * at RDN_GART_GPU_START, where Linux puts it too) whose pages are whatever
+ * The table gives the GPU a range of its own address space (4 GiB starting
+ * at or above RDN_GART_GPU_START) whose pages are whatever
  * bus addresses the OS layer's user binds there. Video memory stays where
  * it is; the "system aperture" registers are set to cover it so that it is
  * not looked up in the table. A page nobody has bound points at a dummy
@@ -20,7 +20,7 @@
 
 #define RDN_GART_PAGE_SIZE	4096
 #define RDN_GART_GPU_START	0x40000000ull
-#define RDN_GART_PAGES		0x40000		/* 1 GB */
+#define RDN_GART_PAGES		0x100000		/* 4 GiB */
 /* Bytes of video memory the table takes: eight a page. */
 #define RDN_GART_TABLE_BYTES	(RDN_GART_PAGES * 8)
 
@@ -54,16 +54,28 @@ int rdn_gart_resume(struct rdn_gart *gart);
 
 /* Point page `page` of the range at a bus address, or back at the dummy. */
 void rdn_gart_set_page(struct rdn_gart *gart, uint32_t page, uint64_t bus_addr);
+void rdn_gart_set_vram_page(struct rdn_gart *gart, uint32_t page, uint64_t gpu_addr);
 void rdn_gart_clear_page(struct rdn_gart *gart, uint32_t page);
 /* After changing pages and before the GPU uses them. */
 void rdn_gart_flush(struct rdn_gart *gart);
 /* On error, keep affected mappings/pages pinned; no rollback is implied. */
 int rdn_gart_flush_checked(struct rdn_gart *gart);
 
-/* The GPU's address of a page of the range. */
-static inline uint64_t rdn_gart_addr(uint32_t page)
+/* Keep the 4 GiB GART window beyond low-address VRAM. */
+static inline uint64_t rdn_gart_gpu_start(const struct rdn_accel *accel)
 {
-	return RDN_GART_GPU_START + (uint64_t)page * RDN_GART_PAGE_SIZE;
+	uint64_t end = accel->vram_base + accel->vram_size;
+	if (accel->vram_base < 0x80000000ull && end > RDN_GART_GPU_START)
+		return (end + 0x3fffffffull) & ~0x3fffffffull;
+	return RDN_GART_GPU_START;
 }
+
+static inline uint64_t rdn_gart_addr(const struct rdn_accel *accel, uint32_t page)
+{
+	return rdn_gart_gpu_start(accel) + (uint64_t)page * RDN_GART_PAGE_SIZE;
+}
+
+int rdn_cayman_gart_setup(struct rdn_gart *gart);
+void rdn_cayman_gart_disable(struct rdn_gart *gart);
 
 #endif /* RDN_GART_H */

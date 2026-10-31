@@ -47,6 +47,7 @@
 #define u32 uint32_t
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #include "linux/evergreen_blit_shaders.h"
+#include "linux/cayman_blit_shaders.h"
 #undef u32
 
 #ifndef CB_COLOR0_BASE
@@ -122,6 +123,35 @@ void rdn_draw_put_shaders(struct rdn_accel *accel, uint32_t offset)
 {
 	uint32_t i;
 
+	if (rdn_family_engine(accel->card->family) == RDN_ENGINE_CAYMAN) {
+		for (i = 0; i < ARRAY_SIZE(draw_vs); i++) {
+			uint32_t v = draw_vs[i];
+			if (i == 1)
+				v -= 1u << 22;
+			if (i == 5)
+				v &= ~(1u << 21);
+			if (i == 7)
+				v = 0x88000000;
+			if (i == 8 || i == 12)
+				v &= 0x03ffffff;
+			if (i == 10 || i == 14)
+				v &= ~(1u << 19);
+			rdn_vram_write32(accel, offset + i * 4, v);
+		}
+
+		// Cayman terminates with CF_END instead of an export EOP bit.
+		for (i = 0; i < ARRAY_SIZE(draw_ps); i++) {
+			uint32_t v = i < 6 || i >= 16 ? draw_ps[i] :
+				(i == 6 ? 0 : i == 7 ? 0x88000000 : draw_ps[i - 2]);
+			if (i == 0)
+				v++;
+			if (i == 5)
+				v &= ~(1u << 21);
+			rdn_vram_write32(accel, offset + RDN_DRAW_PS + i * 4, v);
+		}
+		return;
+	}
+
 	for (i = 0; i < ARRAY_SIZE(draw_vs); i++)
 		rdn_vram_write32(accel, offset + i * 4, draw_vs[i]);
 	for (i = 0; i < ARRAY_SIZE(draw_ps); i++)
@@ -139,7 +169,8 @@ void rdn_draw_surface_sync(struct rdn_ib *ib, uint32_t sync_type,
 		cp_coher_size = ((size + 255) >> 8);
 
 	rdn_ib_emit(ib, PACKET3(PACKET3_SURFACE_SYNC, 3));
-	rdn_ib_emit(ib, sync_type);
+	rdn_ib_emit(ib, sync_type |
+		(rdn_family_engine(ib->accel->card->family) == RDN_ENGINE_CAYMAN ? 1u << 31 : 0));
 	rdn_ib_emit(ib, cp_coher_size);
 	rdn_ib_emit(ib, (uint32_t)(mc_addr >> 8));
 	rdn_ib_emit(ib, 10); /* poll interval */
@@ -155,6 +186,44 @@ void rdn_draw_default_state(struct rdn_ib *ib)
 	/* set clear context state */
 	rdn_ib_emit(ib, PACKET3(PACKET3_CLEAR_STATE, 0));
 	rdn_ib_emit(ib, 0);
+
+	if (rdn_family_engine(ib->accel->card->family) == RDN_ENGINE_CAYMAN) {
+		rdn_ib_emit(ib, PACKET3(PACKET3_CONTEXT_CONTROL, 1));
+		rdn_ib_emit(ib, 0x80000000);
+		rdn_ib_emit(ib, 0x80000000);
+		rdn_ib_emit(ib, PACKET3(PACKET3_EVENT_WRITE, 0));
+		rdn_ib_emit(ib, EVENT_TYPE(0x10) | EVENT_INDEX(4));
+		rdn_ib_emit(ib, PACKET3(PACKET3_SET_CONFIG_REG, 2));
+		rdn_ib_emit(ib, (0x8c00 - PACKET3_SET_CONFIG_REG_START) >> 2);
+		rdn_ib_emit(ib, EXPORT_SRC_C);
+		rdn_ib_emit(ib, NUM_CLAUSE_TEMP_GPRS(4));
+		rdn_ib_emit(ib, PACKET3(PACKET3_SET_CONFIG_REG, 2));
+		rdn_ib_emit(ib, (0x8c10 - PACKET3_SET_CONFIG_REG_START) >> 2);
+		rdn_ib_emit(ib, 0);
+		rdn_ib_emit(ib, 0);
+		rdn_ib_emit(ib, PACKET3(PACKET3_SET_CONFIG_REG, 1));
+		rdn_ib_emit(ib, (SQ_DYN_GPR_CNTL_PS_FLUSH_REQ - PACKET3_SET_CONFIG_REG_START) >> 2);
+		rdn_ib_emit(ib, 1u << 8);
+		rdn_ib_emit(ib, PACKET3(PACKET3_SET_CONFIG_REG, 3));
+		rdn_ib_emit(ib, (0x8e20 - PACKET3_SET_CONFIG_REG_START) >> 2);
+		rdn_ib_emit(ib, 0xffffffff);
+		rdn_ib_emit(ib, 0xffffffff);
+		rdn_ib_emit(ib, 0xfffffffe);
+		for (i = 0; i < cayman_default_size; i++)
+			rdn_ib_emit(ib, cayman_default_state[i]);
+		rdn_ib_emit(ib, PACKET3(PACKET3_SET_CONTEXT_REG, 1));
+		rdn_ib_emit(ib, (0x28354 - PACKET3_SET_CONTEXT_REG_START) >> 2);
+		rdn_ib_emit(ib, 0xf);
+		// Zero dynamic GPR limits can prevent shader dispatch on Cayman.
+		rdn_ib_emit(ib, PACKET3(PACKET3_SET_CONTEXT_REG, 1));
+		rdn_ib_emit(ib, (0x28838 - PACKET3_SET_CONTEXT_REG_START) >> 2);
+		rdn_ib_emit(ib, 30u | (30u << 5) | (30u << 10) |
+			(30u << 15) | (30u << 20) | (30u << 25));
+		rdn_ib_emit(ib, PACKET3(PACKET3_SET_CONTEXT_REG, 1));
+		rdn_ib_emit(ib, (0x286e0 - PACKET3_SET_CONTEXT_REG_START) >> 2);
+		rdn_ib_emit(ib, 1u << 16);
+		return;
+	}
 
 	/* CHIP_TURKS */
 	sq_config = VC_ENABLE;

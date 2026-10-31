@@ -1,4 +1,4 @@
-/* One bounded UVD stream; client mappings never contain GPU commands. */
+/* Bounded UVD sessions; client mappings never contain GPU commands. */
 #include <IOKit/IOLib.h>
 #include <IOKit/IODMACommand.h>
 #include <libkern/libkern.h>
@@ -10,6 +10,10 @@
 extern "C" {
 #include "rdn_cp_dma_readback.h"
 }
+
+#if RDN_VIDEO_MAX_SESSIONS > RDN_UVD_DEFAULT_HANDLES
+#error Video session capacity exceeds the allocated firmware handle table.
+#endif
 
 enum { kVideoPage=4096, kVideoTimeout=1000, kVideoSpans=6 };
 enum { kVideoMessage,kVideoFeedback,kVideoIB,kVideoBitstream,kVideoDPB,kVideoTarget };
@@ -26,7 +30,7 @@ struct RadeonNIVideoSession {
  UInt8 *snapshot;
  UInt32 offsets[kVideoSpans], sizes[kVideoSpans], allocation, allocationBytes;
  UInt32 nextRequest, nextOutput, held[2], handle;
- bool allocated, submitted, created, destroyed, quarantined, snapshotCharged, awake, validation, decodeFailed;
+ bool allocated, stagingReserved, submitted, created, destroyed, quarantined, snapshotCharged, awake, validation, decodeFailed;
  bool gpuOutput, gpuProducer, gpuImporter, gpuAcquired, gpuUnknown;
  UInt32 gpuToken[8];
  UInt64 allocatedAddress, gpuAllocation[2], addresses[kVideoSpans];
@@ -72,6 +76,34 @@ static int videoAllocateSegment(rdn_mem *pool,UInt64 gpuBase,UInt32 bytes,
  }
  return -ENOMEM;
 }
+RadeonNIVideoSession *RadeonNIAccel::videoFind(RadeonNIVideoUserClient *owner)
+{
+ for(unsigned i=0;i<RDN_VIDEO_MAX_SESSIONS;++i)
+  if(fVideoSessions[i] && fVideoSessions[i]->owner==owner) return fVideoSessions[i];
+ return 0;
+}
+void RadeonNIAccel::videoReserveStaging(void)
+{
+ IOLockLock(fUvdLock);
+ IOLockLock(fLock);
+ if(!fVideoStagingBytes && fFramebuffer && fUvd.guarded && fUvd.vcpu_bytes &&
+    (fFramebuffer->getProperty("EnableUVDSessions")==kOSBooleanTrue ||
+     fFramebuffer->getProperty("EnableUVDValidation")==kOSBooleanTrue)) {
+  const UInt32 bytes=RDN_VIDEO_MAX_UPLOAD_BYTES+(3+2*kVideoDPB)*kVideoPage;
+  UInt64 low=fUvd.vcpu_gpu&~((1ull<<28)-1), high=low+(1ull<<28), offset=0;
+  if(high>fAccel.vram_base && low<fAccel.vram_base+fAccel.aperture_size) {
+   low=low>fAccel.vram_base?low-fAccel.vram_base:0;
+   high-=fAccel.vram_base;
+   if(high>fAccel.aperture_size) high=fAccel.aperture_size;
+   if(!videoAllocateSegment(&fMem,fAccel.vram_base,bytes,low,high,&offset)) {
+    fVideoStagingOffset=(UInt32)offset;
+    fVideoStagingBytes=bytes;
+   }
+  }
+ }
+ IOLockUnlock(fLock);
+ IOLockUnlock(fUvdLock);
+}
 /* fUvdLock held; brief fLock sections never enclose a firmware wait. */
 bool RadeonNIAccel::videoReady(bool administrator,bool validation)
 {
@@ -101,7 +133,7 @@ void RadeonNIAccel::videoQuery(bool administrator,rdn_video_query *out)
  if(production) out->flags|=RDN_VIDEO_CAP_PRODUCTION;
  if(validation) out->flags|=RDN_VIDEO_CAP_VALIDATION;
  IOLockLock(fLock);
- if(fVideoSession || fUvdUsers || fUvdLive) out->flags|=RDN_VIDEO_CAP_BUSY;
+ if(fVideoSessionCount==RDN_VIDEO_MAX_SESSIONS || fUvdUsers || fUvdLive) out->flags|=RDN_VIDEO_CAP_BUSY;
  IOLockUnlock(fLock);
  out->unavailable_reason=fRetiring?1:fUvd.failed?2:!(production||validation)?3:0;
  if(production||validation) {
@@ -109,8 +141,8 @@ void RadeonNIAccel::videoQuery(bool administrator,rdn_video_query *out)
   out->max_refs=RDN_UVD_H264_MAX_REFS;
   out->profile_mask=RDN_VIDEO_PROFILE_BASELINE|RDN_VIDEO_PROFILE_MAIN|RDN_VIDEO_PROFILE_HIGH;
   out->level_mask=0x1fff; /* Levels10,11,12,13,20,21,22,30,31,32,40,41,42. */
-  out->max_upload_bytes=RDN_VIDEO_MAX_UPLOAD_BYTES; out->max_sessions=1; out->max_inflight=1;
-  out->output_slots=2; out->max_vram_bytes=128u*1024*1024; out->max_cpu_bytes=20u*1024*1024;
+  out->max_upload_bytes=RDN_VIDEO_MAX_UPLOAD_BYTES; out->max_sessions=RDN_VIDEO_MAX_SESSIONS; out->max_inflight=1;
+  out->output_slots=2; out->max_vram_bytes=128u*1024*1024; out->max_cpu_bytes=RDN_VIDEO_CPU_BUDGET;
  }
  IOLockUnlock(fUvdLock);
 }
@@ -118,7 +150,8 @@ void RadeonNIAccel::videoPoison(int error)
 {
  fUvd.failed=true; fUvd.ready=false;
  fUvdState=RDN_UVD_DIAGNOSTIC_FAULTED; fUvdError=error;
- if(fVideoSession) fVideoSession->quarantined=true;
+ for(unsigned i=0;i<RDN_VIDEO_MAX_SESSIONS;++i)
+  if(fVideoSessions[i]) fVideoSessions[i]->quarantined=true;
 }
 int RadeonNIAccel::videoCommand(UInt32 type,const rdn_uvd_h264_picture *picture,UInt32 bitstreamBytes)
 {
@@ -228,7 +261,7 @@ int RadeonNIAccel::videoReadback(bool guardsOnly)
  RadeonNIVideoSession *s=fVideoSession;
  struct rdn_cp_dma_copy copies[1+2*kVideoSpans];
  bzero(copies,sizeof(copies));
- uint64_t destination=RDN_GART_GPU_START+s->gartOffset;
+ uint64_t destination=gartAddress(s->gartOffset);
  copies[0].source.address=s->buffers.target.address;
  copies[0].source.bytes=copies[0].destination.bytes=copies[0].bytes=s->layout.target_allocation_bytes;
  copies[0].destination.address=destination;
@@ -311,7 +344,7 @@ void RadeonNIAccel::videoCleanup(bool destroy)
   if(!error) s->destroyed=true;
   if(error) videoPoison(error);
  }
- if(s->awake && (!s->submitted || s->destroyed) && !s->quarantined && !fUvd.failed) {
+ if(fVideoSessionCount==1 && s->awake && (!s->submitted || s->destroyed) && !s->quarantined && !fUvd.failed) {
   int error=rdn_uvd_idle(&fUvd);
   if(error) videoPoison(error);
   else s->awake=false;
@@ -328,13 +361,15 @@ void RadeonNIAccel::videoCleanup(bool destroy)
   IOLockLock(fLock);
   for(unsigned i=0;i<2;++i)
    if(s->gpuAllocated[i]) rdn_mem_free(s->gpuHidden[i]?&fHidden:&fMem,s->gpuAllocation[i]);
-  if(s->allocated) rdn_mem_free(&fMem,s->allocatedAddress);
-  fVideoBusy=false;
+  if(s->allocated && !s->stagingReserved) rdn_mem_free(&fMem,s->allocatedAddress);
+  fVideoSessions[s->handle-1]=0;
+  --fVideoSessionCount;
+  fVideoBusy=fVideoSessionCount!=0;
   IOLockUnlock(fLock);
   IOFree(s,sizeof(*s)); fVideoSession=0;
  } else {
   s->quarantined=true;
-  /* Keep the single quota occupied until reboot; DMA ownership is uncertain. */
+  /* Keep this handle and its allocations quarantined while DMA ownership is uncertain. */
  }
 }
 IOReturn RadeonNIAccel::videoCreate(RadeonNIVideoUserClient *owner,bool administrator,const rdn_video_create *in,rdn_video_session *out)
@@ -353,10 +388,17 @@ IOReturn RadeonNIAccel::videoCreate(RadeonNIVideoUserClient *owner,bool administ
  RadeonNIVideoSession *s=0;
  uint64_t allocation=0,address=0; uint32_t words=0;
  UInt64 visibleFree=0,visibleLargest=0,hiddenFree=0,hiddenLargest=0,segmentStart=0,segmentEnd=0;
- UInt32 cpuBytes=0; bool rawBusy=false; const char *failureStage="session";
+ UInt32 cpuBytes=0,sessionSlot=0; bool rawBusy=false,stagingBusy=false; const char *failureStage="session";
  if(!videoReady(administrator,(in->flags&RDN_VIDEO_CREATE_VALIDATION)!=0)) { result=kIOReturnNotReady; goto done; }
  if((in->flags&RDN_VIDEO_CREATE_GPU_OUTPUT) && fFramebuffer->getProperty("EnableUVDGPUOutput")!=kOSBooleanTrue) { result=kIOReturnUnsupported; goto done; }
- if(fVideoSession) { result=kIOReturnBusy; goto done; }
+ if(videoFind(owner) || fVideoSessionCount==RDN_VIDEO_MAX_SESSIONS) {
+  IOLog("RadeonNI UVD create busy active=%u maximum=%u duplicate_owner=%u\n",
+   (unsigned)fVideoSessionCount,(unsigned)RDN_VIDEO_MAX_SESSIONS,(unsigned)(videoFind(owner)!=0));
+  result=kIOReturnBusy; goto done;
+ }
+ for(;sessionSlot<RDN_VIDEO_MAX_SESSIONS && fVideoSessions[sessionSlot];++sessionSlot) {}
+ for(unsigned i=0;i<RDN_VIDEO_MAX_SESSIONS;++i)
+  if(fVideoSessions[i] && fVideoSessions[i]->stagingReserved) stagingBusy=true;
  if(fVideoEpoch==UINT64_MAX) { result=kIOReturnNoResources; goto done; }
  IOLockLock(fLock);
  rawBusy=fUvdUsers || fUvdLive;
@@ -365,11 +407,11 @@ IOReturn RadeonNIAccel::videoCreate(RadeonNIVideoUserClient *owner,bool administ
  if(rawBusy) { result=kIOReturnBusy; goto done; }
  s=(RadeonNIVideoSession *)IOMalloc(sizeof(*s));
  if(!s) goto fail;
- bzero(s,sizeof(*s)); fVideoSession=s; s->owner=owner; s->config=in->config; s->layout=layout;
+ bzero(s,sizeof(*s)); fVideoSession=s; fVideoSessions[sessionSlot]=s; ++fVideoSessionCount; s->owner=owner; s->config=in->config; s->layout=layout;
  ++fVideoEpoch; s->token.high=(UInt32)(fVideoEpoch>>32); s->token.low=(UInt32)fVideoEpoch;
  s->validation=(in->flags&RDN_VIDEO_CREATE_VALIDATION)!=0;
  s->gpuOutput=(in->flags&RDN_VIDEO_CREATE_GPU_OUTPUT)!=0;
- s->handle=1; s->nextRequest=s->nextOutput=1;
+ s->handle=sessionSlot+1; s->nextRequest=s->nextOutput=1;
  s->sizes[kVideoMessage]=s->sizes[kVideoFeedback]=s->sizes[kVideoIB]=kVideoPage;
  s->sizes[kVideoBitstream]=RDN_VIDEO_MAX_UPLOAD_BYTES;
  s->sizes[kVideoDPB]=layout.dpb_allocation_bytes; s->sizes[kVideoTarget]=layout.target_allocation_bytes;
@@ -390,7 +432,11 @@ IOReturn RadeonNIAccel::videoCreate(RadeonNIVideoUserClient *owner,bool administ
  if(segmentEnd>fAccel.aperture_size) segmentEnd=fAccel.aperture_size;
  IOLockLock(fLock);
  fVideoBusy=true;
- if(!videoAllocateSegment(&fMem,fAccel.vram_base,s->allocationBytes,segmentStart,segmentEnd,&allocation)) {
+ if(!stagingBusy && fVideoStagingBytes>=s->allocationBytes && fVideoStagingOffset>=segmentStart &&
+    (UInt64)fVideoStagingOffset+s->allocationBytes<=segmentEnd) {
+  allocation=fVideoStagingOffset;
+  s->allocated=true; s->stagingReserved=true; s->allocatedAddress=allocation;
+ } else if(!videoAllocateSegment(&fMem,fAccel.vram_base,s->allocationBytes,segmentStart,segmentEnd,&allocation)) {
   s->allocated=true; s->allocatedAddress=allocation;
  }
  IOLockUnlock(fLock);
@@ -457,7 +503,9 @@ IOReturn RadeonNIAccel::videoCreate(RadeonNIVideoUserClient *owner,bool administ
  }
  {
   failureStage="uvd-create";
-  int error=rdn_uvd_wake(&fUvd);
+  int error=prepareVideoPower(false);
+  if(error){result=error==-EBUSY?kIOReturnBusy:kIOReturnNotReady;goto fail;}
+  error=fVideoSessionCount==1?rdn_uvd_wake(&fUvd):0;
   if(error) { videoPoison(error); result=kIOReturnIOError; goto fail; }
   s->awake=true;
   error=videoCommand(RDN_UVD_H264_MSG_CREATE,0,0);
@@ -490,8 +538,8 @@ fail:
   s?(unsigned)(s->gpuHidden[0]|(s->gpuHidden[1]<<1)):0,
   (unsigned long long)visibleFree,(unsigned long long)visibleLargest,
   (unsigned long long)hiddenFree,(unsigned long long)hiddenLargest,(unsigned)cpuBytes);
- videoCleanup(false);
- if(!s) { IOLockLock(fLock); fVideoBusy=false; IOLockUnlock(fLock); }
+ if(s) videoCleanup(false);
+ if(!s) { IOLockLock(fLock); fVideoBusy=fVideoSessionCount!=0; IOLockUnlock(fLock); }
 done:
  IOLockUnlock(fUvdLock); return result;
 }
@@ -505,6 +553,7 @@ IOReturn RadeonNIAccel::videoDecodeImpl(RadeonNIVideoUserClient *owner,const rdn
  if(in->version!=RDN_VIDEO_API_VERSION || in->bytes!=sizeof(*in) || !videoZero(in->reserved,2) ||
     !in->bitstream_bytes || in->bitstream_bytes>RDN_VIDEO_MAX_UPLOAD_BYTES) return kIOReturnBadArgument;
  IOLockLock(fUvdLock);
+ fVideoSession=videoFind(owner);
  IOReturn result=kIOReturnNotReady;
  RadeonNIVideoSession *s=fVideoSession; UInt32 slot=0; uint32_t padded=0;
  bool timed=false; UInt64 snapshotStart=0,snapshotEnd=0;
@@ -605,6 +654,7 @@ IOReturn RadeonNIAccel::videoRelease(RadeonNIVideoUserClient *owner,const rdn_vi
 {
  if(in->version!=RDN_VIDEO_API_VERSION || in->bytes!=sizeof(*in) || !videoZero(in->reserved,2) || in->slot>=2 || !in->output_sequence) return kIOReturnBadArgument;
  IOLockLock(fUvdLock);
+ fVideoSession=videoFind(owner);
  RadeonNIVideoSession *s=fVideoSession; IOReturn result=kIOReturnBadArgument;
  if(!fRetiring && s && s->owner==owner && videoToken(s->token,in->session) && s->held[in->slot]==in->output_sequence) {
   s->held[in->slot]=0; result=kIOReturnSuccess;
@@ -615,6 +665,7 @@ IOReturn RadeonNIAccel::videoDestroy(RadeonNIVideoUserClient *owner,const rdn_vi
 {
  if(in->version!=RDN_VIDEO_API_VERSION || in->bytes!=sizeof(*in) || !videoZero(in->reserved,4)) return kIOReturnBadArgument;
  IOLockLock(fUvdLock);
+ fVideoSession=videoFind(owner);
  IOReturn result=kIOReturnBadArgument;
  if(fVideoSession && fVideoSession->owner==owner && videoToken(fVideoSession->token,in->session)) {
   videoCleanup(true); result=fVideoSession?kIOReturnIOError:kIOReturnSuccess;
@@ -624,12 +675,17 @@ IOReturn RadeonNIAccel::videoDestroy(RadeonNIVideoUserClient *owner,const rdn_vi
 void RadeonNIAccel::videoClose(RadeonNIVideoUserClient *owner)
 {
  IOLockLock(fUvdLock);
- if(fVideoSession && (!owner || fVideoSession->owner==owner)) videoCleanup(true);
+ for(unsigned i=0;i<RDN_VIDEO_MAX_SESSIONS;++i) {
+  if(fVideoSessions[i] && (!owner || fVideoSessions[i]->owner==owner)) {
+   fVideoSession=fVideoSessions[i]; videoCleanup(true);
+  }
+ }
  IOLockUnlock(fUvdLock);
 }
 IOReturn RadeonNIAccel::videoMemory(RadeonNIVideoUserClient *owner,UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory)
 {
  IOLockLock(fUvdLock);
+ fVideoSession=videoFind(owner);
  IOReturn result=kIOReturnNotReady;
  RadeonNIVideoSession *s=fVideoSession; RadeonNIVideoMemory *descriptor=0;
  if(!fRetiring && s && s->owner==owner && s->created && !s->quarantined) {
@@ -649,6 +705,7 @@ IOReturn RadeonNIAccel::videoAcquireGpu(RadeonNIVideoUserClient *owner,
 {
  if(in->version!=RDN_VIDEO_API_VERSION || in->bytes!=sizeof(*in) || !videoZero(in->reserved,6)) return kIOReturnBadArgument;
  IOLockLock(fUvdLock);
+ fVideoSession=videoFind(owner);
  IOReturn result=kIOReturnBadArgument; RadeonNIVideoSession *s=fVideoSession;
  if(!fRetiring && s && s->owner==owner && s->gpuOutput && s->gpuProducer && !s->gpuAcquired &&
     !s->quarantined && !s->gpuUnknown && !memcmp(in->source_token,s->gpuToken,sizeof(s->gpuToken))) {
@@ -672,6 +729,7 @@ IOReturn RadeonNIAccel::videoRetireGpu(RadeonNIVideoUserClient *owner,const rdn_
     (in->role!=RDN_VIDEO_GPU_PRODUCER && in->role!=RDN_VIDEO_GPU_IMPORTER) ||
     in->outcome>RDN_VIDEO_GPU_PENDING) return kIOReturnBadArgument;
  IOLockLock(fUvdLock);
+ fVideoSession=videoFind(owner);
  IOReturn result=kIOReturnBadArgument; RadeonNIVideoSession *s=fVideoSession;
  if(s && s->owner==owner && s->gpuOutput && !memcmp(in->source_token,s->gpuToken,sizeof(s->gpuToken))) {
   bool *held=in->role==RDN_VIDEO_GPU_PRODUCER?&s->gpuProducer:&s->gpuImporter;

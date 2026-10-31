@@ -418,9 +418,9 @@ static void rlc_tests(struct rdn_uvd *uvd, struct rdn_accel *accel, const uint8_
 		RLC_CNTL, RLC_HB_CNTL, RLC_HB_BASE, RLC_HB_RPTR, RLC_HB_WPTR,
 		RLC_HB_WPTR_LSB_ADDR, RLC_HB_WPTR_MSB_ADDR, RLC_MC_CNTL, RLC_UCODE_CNTL
 	};
-	static const uint32_t bad_sizes[] = { 0, 1, 3071, 3073, 4096, 0xffffffffu };
+	static const uint32_t bad_sizes[] = { 0, 1, 3071, 3072, 3073, 4095, 4096, 4097, 0xffffffffu };
 	static const uint32_t configured[] = { RLC_ENABLE, 2, 0xffffffffu };
-	uint8_t storage[RDN_UVD_RLC_BYTES + 2];
+	uint8_t storage[rdn_uvd_rlc_bytes(accel->card) + 2];
 	uint8_t *rlc = storage + 1;
 	unsigned i, start, cursor, before;
 	int good, r;
@@ -430,18 +430,18 @@ static void rlc_tests(struct rdn_uvd *uvd, struct rdn_accel *accel, const uint8_
 	reset_model(uvd);
 	mem[VCPU_OFFSET] = mem[RING_OFFSET] = 0xa5;
 	for (i = 0; i < sizeof(bad_sizes) / sizeof(bad_sizes[0]); i++)
-		check(init_rlc_model(uvd, accel, fw, rlc, bad_sizes[i]) < 0,
-		      "RLC requires exactly 3072 firmware bytes");
-	check(init_rlc_model(uvd, accel, fw, NULL, RDN_UVD_RLC_BYTES) < 0,
+		if (bad_sizes[i] != rdn_uvd_rlc_bytes(accel->card)) check(init_rlc_model(uvd, accel, fw, rlc, bad_sizes[i]) < 0,
+		      "RLC requires the exact ASIC firmware size");
+	check(init_rlc_model(uvd, accel, fw, NULL, rdn_uvd_rlc_bytes(accel->card)) < 0,
 	      "null RLC firmware rejected");
 	check(init_rlc_model(uvd, accel, fw, (const uint8_t *)(UINTPTR_MAX - 7),
-		RDN_UVD_RLC_BYTES) < 0, "RLC pointer extent overflow rejected");
-	check(init_rlc_model(uvd, accel, fw, mem + VCPU_OFFSET, RDN_UVD_RLC_BYTES) < 0 &&
-	      init_rlc_model(uvd, accel, fw, mem + RING_OFFSET, RDN_UVD_RLC_BYTES) < 0,
+		rdn_uvd_rlc_bytes(accel->card)) < 0, "RLC pointer extent overflow rejected");
+	check(init_rlc_model(uvd, accel, fw, mem + VCPU_OFFSET, rdn_uvd_rlc_bytes(accel->card)) < 0 &&
+	      init_rlc_model(uvd, accel, fw, mem + RING_OFFSET, rdn_uvd_rlc_bytes(accel->card)) < 0,
 	      "RLC firmware cannot alias either output buffer");
 	check(rdn_uvd_init_rlc(uvd, accel, 2700, fw, FW_SIZE, 10,
 		VCPU_OFFSET, RING_OFFSET, RING_BYTES, RDN_UVD_F_MINIMAL,
-		rlc, RDN_UVD_RLC_BYTES) < 0, "RLC path still rejects minimal initialization");
+		rlc, rdn_uvd_rlc_bytes(accel->card)) < 0, "RLC path still rejects minimal initialization");
 	check(!reads && !writes && !delays && mem[VCPU_OFFSET] == 0xa5 &&
 	      mem[RING_OFFSET] == 0xa5 && rdn_uvd_storage_releasable(uvd),
 	      "malformed RLC input leaves hardware and output buffers untouched");
@@ -450,7 +450,7 @@ static void rlc_tests(struct rdn_uvd *uvd, struct rdn_accel *accel, const uint8_
 		reset_model(uvd);
 		regs[RLC_CNTL / 4] = configured[i];
 		mem[VCPU_OFFSET] = mem[RING_OFFSET] = 0xa5;
-		check(init_rlc_model(uvd, accel, fw, rlc, RDN_UVD_RLC_BYTES) == -16 &&
+		check(init_rlc_model(uvd, accel, fw, rlc, rdn_uvd_rlc_bytes(accel->card)) == -16 &&
 		      reads == 1 && !writes && !delays && !uvd->started && !uvd->failed &&
 		      uvd->rlc_cntl_snapshot == configured[i] &&
 		      regs[RLC_CNTL / 4] == configured[i] &&
@@ -461,16 +461,16 @@ static void rlc_tests(struct rdn_uvd *uvd, struct rdn_accel *accel, const uint8_
 
 	reset_model(uvd);
 	regs[SRBM_SOFT_RESET_UVD_REG / 4] = SOFT_RESET_UVD | (1u << 12);
-	r = init_rlc_model(uvd, accel, fw, rlc, RDN_UVD_RLC_BYTES);
+	r = init_rlc_model(uvd, accel, fw, rlc, rdn_uvd_rlc_bytes(accel->card));
 	check(!r && uvd->ready && uvd->rlc_loaded && uvd->rlc_cntl_snapshot == RLC_ENABLE,
 	      "unaligned big-endian RLC image initializes successfully");
 	start = first_write(RLC_CNTL);
 	cursor = start;
-	good = cursor + 9 + 2 * (RDN_UVD_RLC_BYTES / 4) + 2 < write_log_count;
+	good = cursor + 9 + 2 * (rdn_uvd_rlc_bytes(accel->card) / 4) + 2 < write_log_count;
 	for (i = 0; good && i < sizeof(zero_regs) / sizeof(zero_regs[0]); i++, cursor++)
 		good = write_log[cursor].reg == zero_regs[i] && !write_log[cursor].value;
 	check(good, "discrete RLC stops and clears all history/MC/microcode controls in order");
-	for (i = 0; good && i < RDN_UVD_RLC_BYTES / 4; i++, cursor += 2) {
+	for (i = 0; good && i < rdn_uvd_rlc_bytes(accel->card) / 4; i++, cursor += 2) {
 		uint32_t word = (uint32_t)rlc[4 * i] * 0x1000000u +
 			(uint32_t)rlc[4 * i + 1] * 0x10000u +
 			(uint32_t)rlc[4 * i + 2] * 0x100u + rlc[4 * i + 3];
@@ -479,7 +479,7 @@ static void rlc_tests(struct rdn_uvd *uvd, struct rdn_accel *accel, const uint8_
 		       write_log[cursor + 1].reg == RLC_UCODE_DATA &&
 		       write_log[cursor + 1].value == word;
 	}
-	check(good && i == 768, "all 768 RLC words reach MMIO in firmware big-endian order");
+	check(good && i == rdn_uvd_rlc_bytes(accel->card) / 4, "entire ASIC RLC image reaches MMIO in firmware big-endian order");
 	check(good && write_log[cursor].reg == RLC_UCODE_ADDR &&
 	      write_log[cursor].value == 0 && write_log[cursor + 1].reg == RLC_CNTL &&
 	      write_log[cursor + 1].value == RLC_ENABLE,
@@ -505,7 +505,7 @@ static void rlc_tests(struct rdn_uvd *uvd, struct rdn_accel *accel, const uint8_
 
 	reset_model(uvd);
 	bad_rlc_readback = 1;
-	r = init_rlc_model(uvd, accel, fw, rlc, RDN_UVD_RLC_BYTES);
+	r = init_rlc_model(uvd, accel, fw, rlc, rdn_uvd_rlc_bytes(accel->card));
 	check(r == -5 && uvd->failed && uvd->started && !uvd->ready && !uvd->rlc_loaded &&
 	      !uvd->rlc_cntl_snapshot && !rdn_uvd_storage_releasable(uvd),
 	      "RLC enable mismatch fails sticky and quarantines hardware-visible storage");
@@ -514,7 +514,7 @@ static void rlc_tests(struct rdn_uvd *uvd, struct rdn_accel *accel, const uint8_
 	      "RLC readback failure does not start PLL/VCPU or wait indefinitely");
 	before = writes;
 	rdn_uvd_fini(uvd);
-	check(init_rlc_model(uvd, accel, fw, rlc, RDN_UVD_RLC_BYTES) < 0 &&
+	check(init_rlc_model(uvd, accel, fw, rlc, rdn_uvd_rlc_bytes(accel->card)) < 0 &&
 	      writes == before && regs[RLC_CNTL / 4] == RLC_ENABLE,
 	      "failed RLC cannot be retried or blindly restored by fini");
 
@@ -522,7 +522,7 @@ static void rlc_tests(struct rdn_uvd *uvd, struct rdn_accel *accel, const uint8_
 		reset_model(uvd);
 		no_pll = i == 0;
 		no_vcpu = i == 1;
-		r = init_rlc_model(uvd, accel, fw, rlc, RDN_UVD_RLC_BYTES);
+		r = init_rlc_model(uvd, accel, fw, rlc, rdn_uvd_rlc_bytes(accel->card));
 		check(r < 0 && uvd->started && uvd->failed && !uvd->ready &&
 		      uvd->rlc_loaded && regs[RLC_CNTL / 4] == RLC_ENABLE &&
 		      !rdn_uvd_storage_releasable(uvd) && delays < 1200,
@@ -534,13 +534,13 @@ static int prepare_rlc_model(struct rdn_uvd *uvd, struct rdn_accel *accel,
 			     const uint8_t *fw, const uint8_t *rlc)
 {
 	return rdn_uvd_prepare_rlc(uvd, accel, 2700, fw, FW_SIZE, 10,
-		VCPU_OFFSET, RING_OFFSET, RING_BYTES, 0, rlc, RDN_UVD_RLC_BYTES);
+		VCPU_OFFSET, RING_OFFSET, RING_BYTES, 0, rlc, rdn_uvd_rlc_bytes(accel->card));
 }
 
 static void split_start_tests(struct rdn_uvd *uvd, struct rdn_accel *accel,
 			      const uint8_t *fw)
 {
-	uint8_t rlc[RDN_UVD_RLC_BYTES];
+	uint8_t rlc[rdn_uvd_rlc_bytes(accel->card)];
 	uint32_t seq = 0;
 	unsigned i, boundary, before_reads, before_writes, before_delays;
 	int r, untouched;
@@ -833,6 +833,7 @@ int main(int argc, char **argv)
 	os.free = os_free;
 	memset(&card, 0, sizeof(card));
 	card.os = &os;
+	check(rdn_uvd_rlc_bytes(&card) == 3072, "Turks RLC image is 768 words");
 	memset(&accel, 0, sizeof(accel));
 	accel.card = &card;
 	accel.aperture = (volatile uint32_t *)mem;
@@ -932,6 +933,24 @@ int main(int argc, char **argv)
 	rlc_tests(&uvd, &accel, fw);
 	split_start_tests(&uvd, &accel, fw);
 	fence_packet_tests(&uvd, &accel, fw);
+
+	card.family = RDN_FAMILY_CAYMAN;
+	check(rdn_uvd_rlc_bytes(&card) == 4096, "Cayman RLC image is 1024 words");
+	reset_model(&uvd);
+	r = rdn_uvd_init_checked(&uvd, &accel, 2700, fw, FW_SIZE,
+		RDN_UVD_DEFAULT_HANDLES, VCPU_OFFSET, RING_OFFSET, RING_BYTES, 0);
+	check(!r && uvd.ready && regs[UVD_VCPU_CHIP_ID_REG / 4] == 0x0100000f,
+	      "Cayman boots its own firmware ASIC path");
+	rdn_uvd_fini(&uvd);
+	failure_tests(&uvd, &accel, fw);
+	rlc_tests(&uvd, &accel, fw);
+	split_start_tests(&uvd, &accel, fw);
+	fence_packet_tests(&uvd, &accel, fw);
+	reset_model(&uvd);
+	card.family = (enum rdn_family)99;
+	r = rdn_uvd_init_checked(&uvd, &accel, 2700, fw, FW_SIZE,
+		RDN_UVD_DEFAULT_HANDLES, VCPU_OFFSET, RING_OFFSET, RING_BYTES, 0);
+	check(r < 0 && !writes, "unsupported ASIC rejected before MMIO writes");
 
 	free(mem);
 	printf("%s\n", failures ? "FAIL" : "PASS");

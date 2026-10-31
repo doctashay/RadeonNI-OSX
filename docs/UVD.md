@@ -1,5 +1,33 @@
 # UVD (hardware video decode): status, architecture, how it was brought up
 
+## HD 6670, 2 GiB, 2026-10-24
+
+The 6758 profile had UVD diagnostics, early preparation, typed sessions and
+GPU output disabled. Enabling early preparation alone reserved the firmware
+region but failed startup at the original `0xf00000000` VRAM base.
+
+Cold relocation now accepts Turks 6758/675d with 1 or 2 GiB, checks the full
+reported MC extent, and preserves all scanout offsets. With 2 GiB at GPU
+address zero, GART moves to `0x80000000` instead of overlapping VRAM at 1 GiB.
+GART queries, surface imports, video readback and DMA staging use that address.
+The existing cold-start exclusions and rollback checks remain in force.
+
+Installed kernel `2920c03fafa202fbd92a77b46857e039d3161b08381ed4271c611bbb98bda545`
+booted on the 6670 with UVD ring ready, status 2, error 0 and `up=1`.
+The fixed 864x480 H.264 fixture matched all 622080 decoded NV12 bytes:
+`f8128078aebc6e5dcf4f80afecd8ff1f01ce3f82ae6d543bb9dcb828f496250e`.
+The post-relocation VRAM test verified 1973698560 bytes with two patterns,
+including the allocation ending at `0x80000000`. Resize/presentation and
+three offscreen scenes passed afterward. This is a decoder fixture and memory
+validation, not a new Aurora playback benchmark.
+
+The installed personality enables `EnableUVDDiagnostics`,
+`UVDDiagnosticsBeforeCP`, `UVDDiagnosticsRebaseVRAM`, `EnableUVDSessions`,
+`EnableUVDGPUOutput` and `EnableUVDValidation`, with `UVDValidatedAPI=1`.
+Boot arguments remain `rdn_dpm=0 rdn_irq=0`. Backup and installer are under
+`/Users/shay/uvd2gb-6670-20261024`; the independent-head display changes were
+not included in this deployed kernel.
+
 Read this before any work on video decode on the 7570. Status (2026-10-19): **the UVD block boots from our code,
 Mesa's own UVD code decodes H.264 on it, and the `rdnvd` library (parser, DPB, output order, decoder, picture
 read-out) decodes real streams bit-exactly on the real G5**: Baseline, Main and High, CAVLC and CABAC, I/P/B pictures
@@ -617,3 +645,99 @@ controller fault is recorded. Open: the memory base (Linux moves it to 0, we kee
 Linux's own behaviour on this G5 (registers and memory base while UVD runs), i.e. the ArchPOWER
 route of the earlier proposal; or, inside the kext, trying the block with its memory reached
 through the GART. `rdnuvd init <flags>` and the failure dump in the kernel log are the tools.
+
+### Cayman diagnostic preparation (2026-10-24)
+
+Cayman selects firmware ASIC ID `0x0100000f`; Turks keeps `0x01000011`.
+Both use the upstream `SUMO_uvd.bin` firmware. RLC validation and upload use
+768 words for Turks and 1024 words for Cayman, including the kext checks. The cold-layout transaction also
+admits FirePro V7900 (`6704:1002`) and retains its existing quiescence, address
+readback, and rollback checks. A separate native test package includes Cayman
+SMC and UVD firmware and enables cold UVD diagnostics. Decoder sessions and GPU
+output stay disabled in that package until native fixture output and concurrent
+rendering pass. Model tests cover startup, bounded failures, fences, and 2 GiB
+relocation; Cayman hardware decode remains unverified.
+
+
+### Dual-GPU validation (2026-10-24)
+
+Cold relocation now accepts the V7900 firmware's `0xf800000000` VRAM base,
+checks its full 2 GiB window and HDP base, and preserves relative scanout offsets.
+The 111 layout checks pass on the host and native PowerPC. An unposted card
+no longer rejects graphics services on another PCI device or changes that
+other card's console. Posted firmware-console handover retains the global
+exclusion check. Failed relocation with unrestored access stays quarantined.
+
+On the dual V7900/7570 G5, both cards booted with relocation and scratch
+verification successful, then decoded the H.264 fixture with the exact NV12
+reference SHA-256 `f8128078aebc6e5dcf4f80afecd8ff1f01ce3f82ae6d543bb9dcb828f496250e`.
+The dual-display render/readback test passed on both physical devices after
+UVD initialization. `uvdprobe` and `uvdfixtureprobe` accept a final hexadecimal
+PCI device ID (`6704` or `675d`); ambiguous selection fails without submission.
+
+The native production personalities require `FW_UVD` (`SUMO_uvd.bin`),
+ASIC-specific `FW_RLC`, `EnableUVDDiagnostics`, `UVDDiagnosticsBeforeCP`,
+`UVDDiagnosticsRebaseVRAM`, `EnableUVDSessions`, `EnableUVDGPUOutput`, and
+`UVDValidatedAPI=1`. `EnableUVDValidation` is off in production. These properties
+must be in the verified boot cache; changing the installed plist alone does
+not alter the running driver's capabilities.
+
+Aurora's backend now selects the requested physical PCI device instead of the
+first accelerator, admits Cayman, and resolves frame-packing entry points from
+the current CGL renderer's GLD slot. Previously the slot-0 bridge made the
+FirePro hardware decoder fall back to FFmpeg when converting its first frame.
+The deployed framework is `3cf41d1296e19c7b9315b5b4434908fc2e1b29c72bf6e97e38ef48ace23a3c5c`;
+the driver is `88e4bde463e735d080d90992c4465d6088248dfda86725e5bd99bdf83668d373`.
+
+Native Aurora checks report `RadeonUvdVideoDecoder`, platform decoding true,
+and completed GPU frame delivery. Ten-second 720p30 and 1080p30 measured
+intervals each presented 299 frames with zero additional dropped/corrupt
+frames. Paused 1-second frames at both resolutions matched the existing
+software compositor screenshots exactly. The 1080p30 run used 11.61 total
+CPU-seconds including WindowServer, versus 20.70 in the preceding software
+fallback run; these are individual runs, not a controlled thermal A/B suite.
+
+1080p60 remains throughput-limited: over ten wall-clock seconds the media clock
+advanced 6.35 seconds, 23 frames were dropped, and UVD remained selected.
+The FirePro was at 550/1250 MHz and about 82 C. Enabling and correcting UVD does
+not resolve that remaining throughput limit; its bottleneck has not yet been isolated. Evidence lives in
+`h264-validation-20261022/v7900-bringup-20261024` alongside the native boot,
+fixture, renderer, browser decoder, and 1080p60 records.
+
+The user's subsequent live YouTube playback also reported H.264 High at
+1920x1080, `RadeonUvdVideoDecoder`, and platform decoding true. Its early
+snapshot contained 98 dropped frames out of 286 total, so this confirms real
+site hardware decoding without claiming that YouTube presentation is fixed.
+See `uvd-current-youtube.json` for the media events and snapshot.
+
+### Multiple production sessions (2026-10-26)
+
+The bounded video API admits ten sessions per physical GPU, with one session
+per video user-client connection. Each session has a distinct firmware handle,
+DPB, target, upload mapping, and feedback sequence. The wire ABI remains version
+1; clients must accept `max_sessions` from 1 through 10. Firmware storage already
+reserves ten handles. Memory exhaustion can limit admission before all slots fill.
+
+Commands remain serialized under the UVD lock; ten handles do not imply ten
+parallel decode engines. Closing a session destroys only its firmware context;
+clocks stop after the last session closes. Quarantined sessions keep their handle
+and DMA allocations. Global CPU mapping charges, including stale mappings, are
+bounded at 200 MiB; individual allocation limits remain unchanged.
+
+Aurora must accept the expanded capability count and avoid interpreting a
+transient query-lock BUSY response as unsupported codec configuration. Its
+backend caches capabilities for the open connection and retries initial lock
+contention with a bounded timeout. Create/decode still validate live driver state.
+
+`uvdmultitest --run <pci-device-id>` opens ten connections, rejects an eleventh,
+interleaves three fixture decodes on every handle, checks the exact reference
+NV12 SHA-256, and destroys all sessions. `--query` only reads capabilities;
+`--admission` measures the current admission limit without decoding. Native
+build and model tests do not replace this on-card test after booting the driver.
+
+Native boot validation passed on both FirePro V7900 (`6704`) and Radeon 7570
+(`675d`). Each admitted ten sessions, rejected the eleventh with `kIOReturnBusy`,
+and completed three interleaved fixture decodes on every session. All 60 output
+hashes matched the reference and all 20 destroy calls succeeded. This verifies
+handle isolation and fixture correctness, not ten-stream real-time throughput.
+Evidence: `I:/Aurora/uvd-multisession-20261026/native-ten-{6704,675d}.json`.

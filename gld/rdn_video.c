@@ -1,5 +1,7 @@
 /* Resolve a typed decoder lease and pack it in the current Mesa context. */
 #include <string.h>
+#include <stdlib.h>
+#include <pthread.h>
 #include <IOKit/IOKitLib.h>
 #include <GL/rdn_nv12.h>
 
@@ -62,7 +64,7 @@ int RDNGLQueryVideoPackingV1(uint32_t version, uint32_t *capabilities)
  if (version != RDN_GL_VIDEO_PACK_VERSION_1 ||
      !OSMesaCanPackNV12(OSMesaGetCurrentContext()))
   return RDN_GL_VIDEO_PACK_UNSUPPORTED;
- *capabilities = RDN_GL_VIDEO_PACK_CAP_NV12_COMPLETED;
+ *capabilities = RDN_GL_VIDEO_PACK_CAP_NV12_COMPLETED | RDN_GL_VIDEO_PACK_CAP_NV12_ASYNC;
  return RDN_GL_VIDEO_PACK_OK;
 }
 
@@ -129,4 +131,133 @@ int RDNGLPackVideoFrameV1(const struct RDNGLVideoPackRequestV1 *request)
  if (result || packed == OSMESA_NV12_PENDING)
   return RDN_GL_VIDEO_PACK_FAILED_PENDING;
  return packed;
+}
+
+
+struct async_video_pack {
+ OSMesaContext context;
+ struct RDNGLVideoPackRequestV1 request;
+ struct async_video_pack *next;
+};
+static pthread_mutex_t async_video_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct async_video_pack *async_video_jobs;
+
+static int finish_async_video(struct async_video_pack *job, int packed)
+{
+ kern_return_t result = retire_source(job->request.video_connection,
+  job->request.source_token,
+  packed == OSMESA_NV12_PENDING ? RDN_VIDEO_GPU_PENDING : RDN_VIDEO_GPU_RETIRED);
+ free(job);
+ return result ? RDN_GL_VIDEO_PACK_FAILED_PENDING : packed;
+}
+
+__attribute__((visibility("default")))
+int RDNGLBeginVideoFrameV1(const struct RDNGLVideoPackRequestV1 *request)
+{
+ struct rdn_video_gpu_acquire acquire;
+ struct rdn_video_gpu_source source;
+ struct OSMesaNV12Source image;
+ struct async_video_pack *job, *entry;
+ OSMesaContext context = OSMesaGetCurrentContext();
+ unsigned count = 0;
+ int packed = OSMESA_NV12_RETIRED;
+ if (!request || request->version != RDN_GL_VIDEO_PACK_VERSION_1 ||
+     request->bytes != sizeof(*request) || request->flags ||
+     !request->video_connection || !request->coded_width || !request->coded_height ||
+     (request->coded_width & 1) || (request->coded_height & 1) ||
+     !request->destination_y || !request->destination_uv ||
+     request->destination_y == request->destination_uv || !request->timeout_ms ||
+     request->timeout_ms > RDN_GL_VIDEO_PACK_MAX_TIMEOUT_MS ||
+     !words_zero(request->reserved, 7) || words_zero(request->source_token, 8))
+  return RDN_GL_VIDEO_PACK_FAILED_RETIRED;
+ if (!OSMesaCanPackNV12(context)) return RDN_GL_VIDEO_PACK_UNSUPPORTED;
+ pthread_mutex_lock(&async_video_lock);
+ for (entry = async_video_jobs; entry; entry = entry->next) {
+  ++count;
+  if (entry->context == context) break;
+ }
+ if (entry || count >= 16) {
+  pthread_mutex_unlock(&async_video_lock);
+  return RDN_GL_VIDEO_PACK_UNSUPPORTED;
+ }
+ job = calloc(1, sizeof(*job));
+ if (!job) {
+  pthread_mutex_unlock(&async_video_lock);
+  return RDN_GL_VIDEO_PACK_FAILED_RETIRED;
+ }
+ job->context = context;
+ job->request = *request;
+ memset(&acquire, 0, sizeof(acquire));
+ memset(&source, 0, sizeof(source));
+ acquire.version = RDN_VIDEO_API_VERSION;
+ acquire.bytes = sizeof(acquire);
+ memcpy(acquire.source_token, request->source_token, sizeof(acquire.source_token));
+ kern_return_t result = acquire_source(request->video_connection, &acquire, &source);
+ if (result) {
+  pthread_mutex_unlock(&async_video_lock);
+  if (result == kIOReturnUnderrun)
+   return finish_async_video(job, OSMESA_NV12_RETIRED);
+  free(job);
+  return RDN_GL_VIDEO_PACK_FAILED_RETIRED;
+ }
+ if (source.version == RDN_VIDEO_API_VERSION && source.bytes == sizeof(source) &&
+     !memcmp(source.source_token, request->source_token, sizeof(source.source_token)) &&
+     source.coded_width == request->coded_width &&
+     source.coded_height == request->coded_height &&
+     source.layout == RDN_VIDEO_LAYOUT_FIELD_NV12 && words_zero(source.reserved, 4)) {
+  image.handle = RDN_TARGET_VRAM_HANDLE;
+  image.offset = source.vram_offset;
+  image.bytes = source.target_bytes;
+  image.pitch = source.pitch;
+  image.width = source.coded_width;
+  image.height = source.coded_height;
+  image.y_top = source.y_top;
+  image.y_bottom = source.y_bottom;
+  image.uv_top = source.uv_top;
+  image.uv_bottom = source.uv_bottom;
+  packed = OSMesaBeginPackNV12Store(context, &image, request->destination_y,
+                                  request->destination_uv, request->timeout_ms);
+ }
+ if (packed == OSMESA_NV12_IN_PROGRESS) {
+  job->next = async_video_jobs;
+  async_video_jobs = job;
+  pthread_mutex_unlock(&async_video_lock);
+  return RDN_GL_VIDEO_PACK_IN_PROGRESS;
+ }
+ pthread_mutex_unlock(&async_video_lock);
+ return finish_async_video(job, packed);
+}
+
+static int poll_async_video(const struct RDNGLVideoPackRequestV1 *request, int cancel)
+{
+ OSMesaContext context = OSMesaGetCurrentContext();
+ struct async_video_pack **link, *job;
+ if (!request || !context) return RDN_GL_VIDEO_PACK_FAILED_PENDING;
+ pthread_mutex_lock(&async_video_lock);
+ for (link = &async_video_jobs; (job = *link) != NULL; link = &job->next)
+  if (job->context == context && !memcmp(&job->request, request, sizeof(*request))) break;
+ if (!job) {
+  pthread_mutex_unlock(&async_video_lock);
+  return RDN_GL_VIDEO_PACK_FAILED_PENDING;
+ }
+ int packed = cancel ? OSMesaCancelPackNV12Store(context) : OSMesaPollPackNV12Store(context);
+ if (packed == OSMESA_NV12_IN_PROGRESS) {
+  pthread_mutex_unlock(&async_video_lock);
+  return RDN_GL_VIDEO_PACK_IN_PROGRESS;
+ }
+ *link = job->next;
+ pthread_mutex_unlock(&async_video_lock);
+ return finish_async_video(job, packed);
+}
+
+__attribute__((visibility("default")))
+int RDNGLPollVideoFrameV1(const struct RDNGLVideoPackRequestV1 *request)
+{
+ return poll_async_video(request, 0);
+}
+
+__attribute__((visibility("default")))
+int RDNGLCancelVideoFrameV1(const struct RDNGLVideoPackRequestV1 *request)
+{
+ return poll_async_video(request, 1);
 }
