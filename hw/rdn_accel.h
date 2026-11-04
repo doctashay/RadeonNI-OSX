@@ -131,6 +131,24 @@ void rdn_accel_fini(struct rdn_accel *accel);
 void rdn_gpu_init(struct rdn_accel *accel);
 void rdn_cayman_gpu_init(struct rdn_accel *accel);
 void rdn_cayman_ring_setup(struct rdn_accel *accel);
+/*
+ * GPU hang recovery (Linux cayman_gpu_check_soft_reset/cayman_gpu_soft_reset,
+ * graphics blocks only). rdn_cayman_hang_mask returns RDN_HANG_* bits for the
+ * engines that report work in progress; rdn_accel_recover halts the CP, resets
+ * the busy graphics blocks, marks every emitted fence complete, reloads the
+ * microcode and restarts the ring. The memory controller, GART, RLC, display
+ * and UVD are left alone. Returns 0 when the ring test passes afterwards.
+ */
+#define RDN_HANG_GFX	(1u << 0)
+#define RDN_HANG_CP	(1u << 1)
+#define RDN_HANG_GRBM	(1u << 2)
+#define RDN_HANG_DMA	(1u << 3)
+#define RDN_HANG_DMA1	(1u << 4)
+struct rdn_hang_regs { uint32_t grbm_status, grbm_se0, grbm_se1, srbm_status, cp_rptr, cp_wptr, fence; };
+uint32_t rdn_cayman_hang_mask(struct rdn_accel *accel, struct rdn_hang_regs *regs);
+void rdn_cayman_soft_reset(struct rdn_accel *accel, uint32_t mask);
+int rdn_accel_recover(struct rdn_accel *accel, const struct rdn_accel_fw *fw,
+		      uint32_t *mask_before, uint32_t *mask_after);
 uint32_t rdn_remap_render_backend(uint32_t pipes, uint32_t max_rb,
 				uint32_t total_rb, uint32_t disabled);
 

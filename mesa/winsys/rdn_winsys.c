@@ -1403,16 +1403,57 @@ static unsigned rdn_cs_get_buffer_list(struct radeon_cmdbuf *rcs,
    return cs->num_buffers;
 }
 
+/* Dedicated command allocations must stay separate from the BO cache. */
+#define RDN_IDLE_IB_LIMIT 8
+#define RDN_IDLE_IB_BYTES (2 * 1024 * 1024)
+
+static void rdn_idle_ibs_clear(struct radeon_drm_winsys *ws)
+{
+   list_for_each_entry_safe(struct rdn_pending_ib, ib, &ws->idle_ibs, list) {
+      ws->dev->free(ws->dev, ib->offset);
+      list_del(&ib->list);
+      FREE(ib);
+   }
+   ws->idle_ib_count = 0;
+   ws->idle_ib_bytes = 0;
+}
+
+static bool rdn_idle_ib_get(struct radeon_drm_winsys *ws, uint64_t size, uint64_t *offset)
+{
+   list_for_each_entry(struct rdn_pending_ib, ib, &ws->idle_ibs, list) {
+      if (ib->size != size)
+         continue;
+      *offset = ib->offset;
+      ws->idle_ib_count--;
+      ws->idle_ib_bytes -= size;
+      ws->ib_pool_hits++;
+      list_del(&ib->list);
+      FREE(ib);
+      return true;
+   }
+   return false;
+}
+
 /* Give back the command buffers the GPU has finished with. */
 static void rdn_reap_ibs(struct radeon_drm_winsys *ws, bool wait)
 {
    list_for_each_entry_safe(struct rdn_pending_ib, ib, &ws->pending_ibs, list) {
       if (!rdn_busy_wait(ws, &ib->busy, wait ? OS_TIMEOUT_INFINITE : 0))
          break;
-      if (ws->dev->alloc_command) ws->dev->free(ws->dev, ib->offset);
-      else rdn_cache_put(ws, ib->offset, ib->size, RDN_VISIBLE, &ib->busy);
       list_del(&ib->list);
-      FREE(ib);
+      if (ws->dev->alloc_command && ws->idle_ib_count < RDN_IDLE_IB_LIMIT &&
+          ib->size <= RDN_IDLE_IB_BYTES - ws->idle_ib_bytes) {
+         /* Only completed fences reach this pool, including decoder fences. */
+         list_addtail(&ib->list, &ws->idle_ibs);
+         ws->idle_ib_count++;
+         ws->idle_ib_bytes += ib->size;
+      } else {
+         if (ws->dev->alloc_command)
+            ws->dev->free(ws->dev, ib->offset);
+         else
+            rdn_cache_put(ws, ib->offset, ib->size, RDN_VISIBLE, &ib->busy);
+         FREE(ib);
+      }
    }
 }
 
@@ -1456,8 +1497,18 @@ static int rdn_ib_alloc(struct radeon_drm_winsys *ws, uint64_t size, uint64_t *o
    if (r)
       return r;
    if (ws->dev->alloc_command) {
+      if (rdn_idle_ib_get(ws, size, offset))
+         return 0;
+      ws->ib_pool_allocs++;
       r = ws->dev->alloc_command(ws->dev, size, 4096, offset);
-      if (r) { rdn_reap_ibs(ws, true); r = ws->dev->alloc_command(ws->dev, size, 4096, offset); }
+      if (r) {
+         rdn_reap_ibs(ws, true);
+         if (rdn_idle_ib_get(ws, size, offset))
+            return 0;
+         rdn_idle_ibs_clear(ws);
+         ws->ib_pool_allocs++;
+         r = ws->dev->alloc_command(ws->dev, size, 4096, offset);
+      }
       return r;
    }
    r = rdn_cache_get(ws, size, 4096, RDN_VISIBLE, false, offset) ? 0 :
@@ -2274,6 +2325,11 @@ static void rdn_winsys_destroy(struct radeon_winsys *rws)
    struct radeon_drm_winsys *ws = rdn_winsys(rws);
 
    rdn_reap_ibs(ws, true);
+   rdn_idle_ibs_clear(ws);
+   if (getenv("RDN_STATS"))
+      fprintf(stderr, "rdn: command pool hits=%llu allocations=%llu\n",
+              (unsigned long long)ws->ib_pool_hits,
+              (unsigned long long)ws->ib_pool_allocs);
    rdn_cache_trim(ws, true);
    if (ws->surf_man)
       radeon_surface_manager_free(ws->surf_man);
@@ -2388,6 +2444,7 @@ struct radeon_winsys *rdn_winsys_create(struct rdn_device *dev,
    pipe_reference_init(&ws->reference, 1);
    simple_mtx_init(&ws->lock, mtx_plain);
    list_inithead(&ws->pending_ibs);
+   list_inithead(&ws->idle_ibs);
    list_inithead(&ws->managed_buffers);
    const char *budget = getenv("RDN_VRAM_BUDGET_MB");
    if (budget) ws->managed_budget = strtoull(budget, NULL, 10) << 20;

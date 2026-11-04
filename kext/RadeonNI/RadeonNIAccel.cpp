@@ -308,6 +308,15 @@ bool RadeonNIAccel::startEngine(void)
 		IOLog("RadeonNI: no microcode in the personality; no 3D engine\n");
 		return false;
 	}
+	fPfpSize = pfpSize;
+	fMeSize = meSize;
+	fHangSince = 0;
+	fHangMs = 5000;
+	{
+		int hangMs;
+		if (PE_parse_boot_arg("rdn_hang_ms", &hangMs) && hangMs >= 0)
+			fHangMs = (UInt32)hangMs;
+	}
 	fw.pfp = (const uint8_t *)fPfp;
 	fw.pfp_size = pfpSize;
 	fw.me = (const uint8_t *)fMe;
@@ -414,6 +423,9 @@ bool RadeonNIAccel::startEngine(void)
 			IOLog("RadeonNI: drawing self-test needs a 32-bit mode\n");
 		}
 	}
+	/* The hang watchdog runs on the power timer; start it if power management did not. */
+	if (fAccel.card->family == RDN_FAMILY_CAYMAN && fHangMs && !ensurePowerTimer())
+		IOLog("RadeonNI: no timer for the GPU hang watchdog\n");
 	return true;
 }
 
@@ -3052,8 +3064,82 @@ void RadeonNIAccel::powerTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		    rdn_fence_done(&self->fAccel, self->fAccel.fence_emitted))
 			self->applyGovernorPower(&self->fIdlePower);
 	}
+	if (self->fEngineUp && !self->fRetiring && !self->fSurfaceGpuStalled && self->fHangMs)
+		self->checkGpuHang();
 	IOLockUnlock(self->fLock);
 	sender->setTimeoutMS(250);
+}
+
+/*
+ * Called with fLock held from the power timer. A hang is a pending fence with
+ * no movement of the completed fence or the ring's read pointer for fHangMs
+ * while the graphics engine or CP reports work in progress. A long wait
+ * alone is not a hang: progress resets the clock.
+ */
+void RadeonNIAccel::checkGpuHang(void)
+{
+	struct rdn_hang_regs regs;
+	UInt64 now;
+	uint32_t mask;
+
+	if (fAccel.card->family != RDN_FAMILY_CAYMAN || rdn_fence_done(&fAccel, fAccel.fence_emitted)) {
+		fHangSince = 0;
+		return;
+	}
+	now = fAccel.card->os->time_ms(fAccel.card->os->cookie);
+	mask = rdn_cayman_hang_mask(&fAccel, &regs);
+	if (!fHangSince || regs.fence != fHangFence || regs.cp_rptr != fHangRptr) {
+		fHangSince = now;
+		fHangFence = regs.fence;
+		fHangRptr = regs.cp_rptr;
+		return;
+	}
+	if (now - fHangSince < fHangMs)
+		return;
+	if (!(mask & (RDN_HANG_GFX | RDN_HANG_CP))) {
+		fHangSince = now;
+		return;
+	}
+	IOLog("RadeonNI: GPU hang: no progress for %lu ms; fence %lu of %lu, CP rptr 0x%lx wptr 0x%lx, "
+	      "GRBM 0x%08lx SE0 0x%08lx SE1 0x%08lx SRBM 0x%08lx\n",
+	      (unsigned long)(now - fHangSince), (unsigned long)regs.fence,
+	      (unsigned long)fAccel.fence_emitted, (unsigned long)regs.cp_rptr,
+	      (unsigned long)regs.cp_wptr, (unsigned long)regs.grbm_status,
+	      (unsigned long)regs.grbm_se0, (unsigned long)regs.grbm_se1,
+	      (unsigned long)regs.srbm_status);
+	recoverGpu(now - fHangSince);
+}
+
+/*
+ * Soft-reset the graphics engine and restart the CP (rdn_accel_recover).
+ * Work in flight is lost; its fences are completed so that no client stays
+ * blocked. If the ring does not come back, GPU work stays refused as before.
+ */
+void RadeonNIAccel::recoverGpu(UInt64 stalledMs)
+{
+	struct rdn_accel_fw fw;
+	uint32_t before = 0, after = 0;
+	int r;
+
+	fw.pfp = (const uint8_t *)fPfp;
+	fw.pfp_size = fPfpSize;
+	fw.me = (const uint8_t *)fMe;
+	fw.me_size = fMeSize;
+	r = rdn_accel_recover(&fAccel, &fw, &before, &after);
+	fGpuResets++;
+	fHangSince = 0;
+	setProperty("RadeonNIGPUResets", (UInt64)fGpuResets, 32);
+	fFenceEvents++;
+	IOLockWakeup(fLock, &fFenceEvents, false);
+	if (r) {
+		IOLog("RadeonNI: GPU reset %lu failed (%d; busy 0x%lx before, 0x%lx after); GPU work refused\n",
+		      (unsigned long)fGpuResets, r, (unsigned long)before, (unsigned long)after);
+		fSurfaceGpuStalled = true;
+		setProperty("RadeonNIGPURecoveryFailed", kOSBooleanTrue);
+		return;
+	}
+	IOLog("RadeonNI: GPU reset %lu after %lu ms without progress: busy 0x%lx before, 0x%lx after; ring restarted\n",
+	      (unsigned long)fGpuResets, (unsigned long)stalledMs, (unsigned long)before, (unsigned long)after);
 }
 
 void RadeonNIAccel::startIdleGovernor()

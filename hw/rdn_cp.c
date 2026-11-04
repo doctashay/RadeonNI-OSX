@@ -709,3 +709,32 @@ int rdn_rlc_start(struct rdn_accel *accel, const uint8_t *firmware, size_t size)
 	rdn_wreg(card, 0x3f00, 1);
 	return (rdn_rreg(card, 0x3f00) & 1) ? 0 : -5;
 }
+
+/*
+ * Recover the graphics ring after a hang: reset the busy blocks, complete
+ * every emitted fence (their work is lost; waiters must not block), then
+ * bring the CP back the way rdn_accel_init_hook does.
+ */
+int rdn_accel_recover(struct rdn_accel *accel, const struct rdn_accel_fw *fw,
+		      uint32_t *mask_before, uint32_t *mask_after)
+{
+	uint32_t mask;
+	int r;
+
+	if (rdn_family_engine(accel->card->family) != RDN_ENGINE_CAYMAN)
+		return -EINVAL;
+	mask = rdn_cayman_hang_mask(accel, NULL);
+	if (mask_before)
+		*mask_before = mask;
+	rdn_cp_stop(accel);
+	rdn_cayman_soft_reset(accel, mask | RDN_HANG_CP);
+	if (accel->fence_memory)
+		rdn_vram_write32(accel, accel->fence_offset, accel->fence_emitted);
+	rdn_gpu_init(accel);
+	r = rdn_cp_load_microcode(accel, fw);
+	if (!r)
+		r = rdn_cp_resume(accel);
+	if (mask_after)
+		*mask_after = rdn_cayman_hang_mask(accel, NULL);
+	return r;
+}

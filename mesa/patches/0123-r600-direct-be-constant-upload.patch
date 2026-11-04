@@ -1,0 +1,37 @@
+--- a/src/gallium/drivers/r600/r600_state_common.c
++++ b/src/gallium/drivers/r600/r600_state_common.c
+@@ -1236,21 +1236,24 @@
+ 	if (ptr) {
+ 		/* Upload the user buffer. */
+ 		if (UTIL_ARCH_BIG_ENDIAN) {
+-			uint32_t *tmpPtr;
++			void *map;
+ 			unsigned i, size = input->buffer_size;
+ 
+-			if (!(tmpPtr = malloc(size))) {
+-				R600_ERR("Failed to allocate BE swap buffer.\n");
++			u_upload_alloc_ref(ctx->stream_uploader, 0, size, 256,
++			                   &cb->buffer_offset, &cb->buffer, &map);
++			if (!map) {
++				R600_ERR("Failed to allocate constant upload.\n");
+ 				return;
+ 			}
+ 
+-			for (i = 0; i < size / 4; ++i) {
+-				tmpPtr[i] = util_cpu_to_le32(((uint32_t *)ptr)[i]);
+-			}
+-
+-			u_upload_data_ref(ctx->stream_uploader, 0, size, 256,
+-                                      tmpPtr, &cb->buffer_offset, &cb->buffer);
+-			free(tmpPtr);
++			/* Swap directly into the upload; user pointers need not be aligned. */
++			for (i = 0; i + 4 <= size; i += 4) {
++				uint32_t word;
++				memcpy(&word, ptr + i, sizeof(word));
++				((uint32_t *)map)[i / 4] = util_cpu_to_le32(word);
++			}
++			if (i < size)
++				memcpy((uint8_t *)map + i, ptr + i, size - i);
+ 		} else {
+ 			u_upload_data_ref(ctx->stream_uploader, 0,
+                                       input->buffer_size, 256, ptr,

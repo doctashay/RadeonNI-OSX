@@ -447,3 +447,72 @@ void rdn_cayman_gart_disable(struct rdn_gart *gart)
 	WREG32(VM_L2_CNTL3, L2_CACHE_BIGK_ASSOCIATIVITY | BANK_SELECT(6) |
 		L2_CACHE_BIGK_FRAGMENT_SIZE(6));
 }
+
+/*
+ * Hang detection and soft reset, from Linux cayman_gpu_check_soft_reset()
+ * and cayman_gpu_soft_reset() (ni.c, MIT). Only the graphics, CP, GRBM and
+ * DMA engines are considered: the memory controller is usually only busy,
+ * and resetting it would also stop scanout.
+ */
+uint32_t rdn_cayman_hang_mask(struct rdn_accel *accel, struct rdn_hang_regs *regs)
+{
+	struct rdn_card *card = accel->card;
+	uint32_t mask = 0, grbm = RREG32(GRBM_STATUS), srbm = RREG32(SRBM_STATUS);
+
+	if (grbm & (PA_BUSY | SC_BUSY | SH_BUSY | SX_BUSY | TA_BUSY | VGT_BUSY |
+		    DB_BUSY | CB_BUSY | GDS_BUSY | SPI_BUSY | IA_BUSY | IA_BUSY_NO_DMA))
+		mask |= RDN_HANG_GFX;
+	if (grbm & (CF_RQ_PENDING | PF_RQ_PENDING | CP_BUSY | CP_COHERENCY_BUSY))
+		mask |= RDN_HANG_CP;
+	if (grbm & GRBM_EE_BUSY)
+		mask |= RDN_HANG_GRBM | RDN_HANG_GFX | RDN_HANG_CP;
+	if (srbm & GRBM_RQ_PENDING)
+		mask |= RDN_HANG_GRBM;
+	if (regs) {
+		regs->grbm_status = grbm;
+		regs->grbm_se0 = RREG32(GRBM_STATUS_SE0);
+		regs->grbm_se1 = RREG32(GRBM_STATUS_SE1);
+		regs->srbm_status = srbm;
+		regs->cp_rptr = RREG32(CP_RB0_RPTR);
+		regs->cp_wptr = RREG32(CP_RB0_WPTR);
+		regs->fence = accel->fence_memory ? rdn_vram_read32(accel, accel->fence_offset) : 0;
+	}
+	return mask;
+}
+
+void rdn_cayman_soft_reset(struct rdn_accel *accel, uint32_t mask)
+{
+	struct rdn_card *card = accel->card;
+	uint32_t grbm = 0, srbm = 0, tmp;
+
+	/* Disable CP parsing and prefetching before resetting anything. */
+	WREG32(CP_ME_CNTL, CP_ME_HALT | CP_PFP_HALT);
+	card->os->delay_us(card->os->cookie, 50);
+	if (mask & (RDN_HANG_GFX | RDN_HANG_CP))
+		grbm = SOFT_RESET_CB | SOFT_RESET_DB | SOFT_RESET_GDS | SOFT_RESET_PA |
+		       SOFT_RESET_SC | SOFT_RESET_SPI | SOFT_RESET_SH | SOFT_RESET_SX |
+		       SOFT_RESET_TC | SOFT_RESET_TA | SOFT_RESET_VGT | SOFT_RESET_IA;
+	if (mask & RDN_HANG_CP) {
+		grbm |= SOFT_RESET_CP | SOFT_RESET_VGT;
+		srbm |= SOFT_RESET_GRBM;
+	}
+	if (mask & RDN_HANG_GRBM)
+		srbm |= SOFT_RESET_GRBM;
+	if (grbm) {
+		tmp = RREG32(GRBM_SOFT_RESET) | grbm;
+		WREG32(GRBM_SOFT_RESET, tmp);
+		RREG32(GRBM_SOFT_RESET);
+		card->os->delay_us(card->os->cookie, 50);
+		WREG32(GRBM_SOFT_RESET, tmp & ~grbm);
+		RREG32(GRBM_SOFT_RESET);
+	}
+	if (srbm) {
+		tmp = RREG32(SRBM_SOFT_RESET) | srbm;
+		WREG32(SRBM_SOFT_RESET, tmp);
+		RREG32(SRBM_SOFT_RESET);
+		card->os->delay_us(card->os->cookie, 50);
+		WREG32(SRBM_SOFT_RESET, tmp & ~srbm);
+		RREG32(SRBM_SOFT_RESET);
+	}
+	card->os->delay_us(card->os->cookie, 50);
+}

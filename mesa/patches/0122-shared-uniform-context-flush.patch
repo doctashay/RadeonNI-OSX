@@ -1,0 +1,59 @@
+mesa: invalidate shared uniforms before checking for redundant values
+
+A second context can repeat a shared program uniform value while its own
+constant buffer still contains the previous value. Check the writer context
+before the redundant-update fast paths for scalar, matrix and handle uploads.
+
+--- a/src/mesa/main/uniform_query.cpp
++++ b/src/mesa/main/uniform_query.cpp
+@@ -1296,6 +1296,14 @@
+ }
+ 
+ static bool
++uniform_used_by_other_context(const struct gl_context *ctx,
++                              const struct gl_uniform_storage *uni)
++{
++   return uni->unknown_src_ctx ||
++          (uni->first_set_by && uni->first_set_by != ctx);
++}
++
++static bool
+ copy_uniforms_to_storage(gl_constant_value *storage,
+                          struct gl_uniform_storage *uni,
+                          struct gl_context *ctx, GLsizei count,
+@@ -1308,7 +1316,7 @@
+                          (glsl_type_is_sampler(uni->type) || glsl_type_is_image(uni->type));
+    bool copy_to_float16 = uni->type->base_type == GLSL_TYPE_FLOAT16;
+ 
+-   if (flush && uni->unknown_src_ctx) {
++   if (flush && uniform_used_by_other_context(ctx, uni)) {
+       _mesa_flush_vertices_for_uniforms(ctx, uni);
+       flush = false;
+    }
+@@ -1653,7 +1661,7 @@
+    const unsigned elements = components * vectors;
+    const unsigned size = sizeof(storage[0]) * elements * count * size_mul;
+ 
+-   if (flush && uni->unknown_src_ctx) {
++   if (flush && uniform_used_by_other_context(ctx, uni)) {
+       _mesa_flush_vertices_for_uniforms(ctx, uni);
+       flush = false;
+    }
+@@ -2114,7 +2122,7 @@
+             uni->driver_storage[s].data + (size_mul * offset * components);
+          unsigned size = sizeof(uni->storage[0]) * components * count * size_mul;
+ 
+-         if (!uni->unknown_src_ctx && !memcmp(storage, values, size))
++         if (!uniform_used_by_other_context(ctx, uni) && !memcmp(storage, values, size))
+             continue;
+ 
+          if (!flushed) {
+@@ -2129,7 +2137,7 @@
+       void *storage = &uni->storage[size_mul * components * offset];
+       unsigned size = sizeof(uni->storage[0]) * components * count * size_mul;
+ 
+-      if (!uni->unknown_src_ctx && !memcmp(storage, values, size))
++      if (!uniform_used_by_other_context(ctx, uni) && !memcmp(storage, values, size))
+          return;
+ 
+       _mesa_flush_vertices_for_uniforms(ctx, uni);

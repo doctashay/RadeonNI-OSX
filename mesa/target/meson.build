@@ -37,7 +37,7 @@ rdn_inc = [
 rdn_sources = [files('rdn_target.c'), rdn_device]
 rdn_link_whole = [librdn_st, libglapi]
 rdn_link_with = [libr600, libmesa, libgallium, libgalliumvl, librdnwinsys]
-rdn_deps = [dep_thread, idep_mesautil, idep_nir]
+rdn_deps = [dep_thread, idep_xmlconfig, idep_mesautil, idep_nir]
 
 librdngl = shared_library(
   'rdngl',

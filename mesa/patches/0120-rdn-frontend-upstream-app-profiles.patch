@@ -1,0 +1,93 @@
+rdn frontend: apply upstream per-application profiles (static 00-mesa-defaults.conf) to st options; log the options a profile changes (RDN_PROFILE_QUIET silences it).
+
+--- a/src/gallium/frontends/rdn/osmesa.c
++++ b/src/gallium/frontends/rdn/osmesa.c
+@@ -92,6 +92,9 @@
+ #include "util/u_inlines.h"
+ #include "util/u_memory.h"
+ #include "util/u_process.h"
++#include "util/xmlconfig.h"
++#include "util/driconf.h"
++#include "util/u_driconf.h"
+ 
+ 
+ #include "frontend/api.h"
+@@ -1354,7 +1357,69 @@
+  *
+  * Create context with attribute list.
+  */
+-GLAPI OSMesaContext GLAPIENTRY
++GLAPI static const driOptionDescription osmesa_driconf[] = {
++#include "pipe-loader/driinfo_gallium.h"
++};
++
++/*
++ * Apply upstream's per-application profiles (the static 00-mesa-defaults.conf
++ * table) to the state-tracker options. Matching uses the executable name;
++ * MESA_DRICONF_EXECUTABLE_OVERRIDE selects another profile for testing.
++ * Options that differ from the defaults are logged once per process.
++ */
++static void
++osmesa_apply_app_profile(struct st_config_options *options)
++{
++   static bool logged;
++   driOptionCache defaults, cache;
++
++   driParseOptionInfo(&defaults, osmesa_driconf, ARRAY_SIZE(osmesa_driconf));
++   const driConfigFileParseParams params = { .screenNum = 0, .driverName = "r600" };
++   driParseConfigFiles(&cache, &defaults, &params);
++   u_driconf_fill_st_options(options, &cache);
++
++   if (!logged && !getenv("RDN_PROFILE_QUIET")) {
++      const unsigned size = 1u << defaults.tableSize;
++      unsigned changed = 0;
++      logged = true;
++      for (unsigned i = 0; i < size; ++i) {
++         const driOptionInfo *info = &defaults.info[i];
++         const driOptionValue *before = &defaults.values[i];
++         const driOptionValue *after = &cache.values[i];
++         if (!info->name)
++            continue;
++         bool differs;
++         switch (info->type) {
++         case DRI_BOOL: differs = before->_bool != after->_bool; break;
++         case DRI_ENUM:
++         case DRI_INT: differs = before->_int != after->_int; break;
++         case DRI_FLOAT: differs = before->_float != after->_float; break;
++         case DRI_STRING:
++            differs = strcmp(before->_string ? before->_string : "",
++                             after->_string ? after->_string : "") != 0;
++            break;
++         default: differs = false; break;
++         }
++         if (!differs)
++            continue;
++         if (!changed++)
++            fprintf(stderr, "RadeonNI profile for %s:", util_get_process_name());
++         switch (info->type) {
++         case DRI_BOOL: fprintf(stderr, " %s=%s", info->name, after->_bool ? "true" : "false"); break;
++         case DRI_FLOAT: fprintf(stderr, " %s=%g", info->name, after->_float); break;
++         case DRI_STRING: fprintf(stderr, " %s=\"%s\"", info->name, after->_string ? after->_string : ""); break;
++         default: fprintf(stderr, " %s=%d", info->name, after->_int); break;
++         }
++      }
++      if (changed)
++         fputc('\n', stderr);
++   }
++
++   driDestroyOptionCache(&cache);
++   driDestroyOptionInfo(&defaults);
++}
++
++OSMesaContext GLAPIENTRY
+ OSMesaCreateContextAttribs(const int *attribList, OSMesaContext sharelist)
+ {
+    OSMesaContext osmesa;
+@@ -1480,6 +1545,7 @@
+    attribs.options.disable_blend_func_extended = false;
+    attribs.options.disable_glsl_line_continuations = false;
+    attribs.options.force_glsl_version = 0;
++   osmesa_apply_app_profile(&attribs.options);
+ 
+    osmesa->double_buffer = osmesa_double;
+    osmesa_init_st_visual(&attribs.visual,

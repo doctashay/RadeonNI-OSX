@@ -77,6 +77,10 @@ struct radeon_drm_winsys {
    struct list_head managed_buffers;
    uint64_t managed_resident, managed_budget, evictions, promotions;
    uint64_t num_flushes;
+   /* Completed dedicated command allocations, protected by lock. */
+   struct list_head idle_ibs;
+   unsigned idle_ib_count;
+   uint64_t idle_ib_bytes, ib_pool_hits, ib_pool_allocs;
 };
 
 void radeon_surface_init_functions(struct radeon_drm_winsys *ws);

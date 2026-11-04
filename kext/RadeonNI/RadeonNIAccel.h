@@ -277,6 +277,12 @@ private:
 	struct rdn_mem fHidden;
 	UInt32 fHiddenOffset, fHiddenSize;
 	void *fPfp, *fMe;
+	UInt32 fPfpSize, fMeSize;
+	/* Hang watchdog: last observed progress and how long it has stalled. */
+	UInt32 fHangFence, fHangRptr, fHangMs, fGpuResets;
+	UInt64 fHangSince;
+	void checkGpuHang(void);
+	void recoverGpu(UInt64 stalledMs);
 	bool fEngineUp;
 	/* UVD: set up by the first RDN_UC_UVD_INIT, never at start. */
 	struct rdn_uvd fUvd;

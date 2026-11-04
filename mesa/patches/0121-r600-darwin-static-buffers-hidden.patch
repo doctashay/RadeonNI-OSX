@@ -1,0 +1,92 @@
+r600 (Darwin/PowerPC, opt-in RDN_STATIC_HIDDEN=1): GL vertex/index buffers with default or immutable usage become GPU-only (hidden VRAM, evictable); writes go through staging copies. Narrow successor to the rejected 0119: no internal, shared, persistent, constant or query buffers, and only processes that opt in.
+
+--- a/src/gallium/drivers/r600/r600_buffer_common.c
++++ b/src/gallium/drivers/r600/r600_buffer_common.c
+@@ -357,17 +357,22 @@
+ 		}
+ 	}
+ 
+-	if ((usage & PIPE_MAP_DISCARD_RANGE) &&
+-	    !(rscreen->debug_flags & DBG_NO_DISCARD_RANGE) &&
+-	    ((!(usage & (PIPE_MAP_UNSYNCHRONIZED |
+-			 PIPE_MAP_PERSISTENT)) &&
+-	      r600_can_dma_copy_buffer(rctx, box->x, 0, box->width)) ||
+-	     (rbuffer->flags & RADEON_FLAG_SPARSE))) {
++	/* GPU-only buffers (see r600_darwin_static_hidden) take every write through
++	 * a staging copy. */
++	bool unmappable = rbuffer->flags & RADEON_FLAG_NO_CPU_ACCESS;
++	if ((unmappable && (usage & PIPE_MAP_WRITE) &&
++	     !(usage & (PIPE_MAP_READ | PIPE_MAP_PERSISTENT))) ||
++	    ((usage & PIPE_MAP_DISCARD_RANGE) &&
++	     !(rscreen->debug_flags & DBG_NO_DISCARD_RANGE) &&
++	     ((!(usage & (PIPE_MAP_UNSYNCHRONIZED |
++			  PIPE_MAP_PERSISTENT)) &&
++	       r600_can_dma_copy_buffer(rctx, box->x, 0, box->width)) ||
++	      (rbuffer->flags & RADEON_FLAG_SPARSE)))) {
+ 		assert(usage & PIPE_MAP_WRITE);
+ 
+ 		/* Check if mapping this buffer would cause waiting for the GPU.
+ 		 */
+-		if (rbuffer->flags & RADEON_FLAG_SPARSE ||
++		if (unmappable || rbuffer->flags & RADEON_FLAG_SPARSE ||
+ 		    r600_rings_is_buffer_referenced(rctx, rbuffer->buf, RADEON_USAGE_READWRITE) ||
+ 		    !rctx->ws->buffer_wait(rctx->ws, rbuffer->buf, 0, RADEON_USAGE_READWRITE)) {
+ 			/* Do a wait-free write-only transfer using a temporary buffer. */
+@@ -384,7 +389,7 @@
+ 				data += box->x % R600_MAP_BUFFER_ALIGNMENT;
+ 				return r600_buffer_get_transfer(ctx, resource, usage, box,
+ 								ptransfer, data, staging, offset);
+-			} else if (rbuffer->flags & RADEON_FLAG_SPARSE) {
++			} else if (unmappable || rbuffer->flags & RADEON_FLAG_SPARSE) {
+ 				return NULL;
+ 			}
+ 		} else {
+@@ -551,6 +556,38 @@
+ 	return rbuffer;
+ }
+ 
++/*
++ * Darwin/PowerPC opt-in (RDN_STATIC_HIDDEN=1 in the program's environment):
++ * application vertex and index buffers with default or immutable usage are
++ * GPU-only, so the winsys places them in hidden video memory (where live
++ * eviction can move them) instead of the CPU-visible aperture or the pinned
++ * GART budget. Writes go through staging copies; buffers the CPU reads back,
++ * maps persistently, shares or uses for anything else keep normal placement.
++ */
++static bool r600_darwin_static_hidden(struct r600_common_screen *rscreen,
++				      const struct pipe_resource *templ)
++{
++#if defined(__APPLE__) && (defined(__ppc__) || defined(__ppc64__))
++	static int enabled = -1;
++	const unsigned allowed = PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_INDEX_BUFFER;
++
++	if (enabled < 0) {
++		const char *value = getenv("RDN_STATIC_HIDDEN");
++		enabled = value && atoi(value) != 0;
++		if (enabled)
++			fputs("RadeonNI: static vertex/index buffers in hidden VRAM\n", stderr);
++	}
++	return enabled && rscreen->info.has_cp_dma &&
++	       (templ->usage == PIPE_USAGE_DEFAULT || templ->usage == PIPE_USAGE_IMMUTABLE) &&
++	       (templ->bind & allowed) && !(templ->bind & ~allowed) &&
++	       !(templ->flags & (PIPE_RESOURCE_FLAG_MAP_PERSISTENT |
++				 PIPE_RESOURCE_FLAG_MAP_COHERENT |
++				 PIPE_RESOURCE_FLAG_SPARSE));
++#else
++	return false;
++#endif
++}
++
+ struct pipe_resource *r600_buffer_create(struct pipe_screen *screen,
+ 					 const struct pipe_resource *templ,
+ 					 unsigned alignment)
+@@ -560,6 +597,9 @@
+ 
+ 	r600_init_resource_fields(rscreen, rbuffer, templ->width0, alignment);
+ 
++	if (r600_darwin_static_hidden(rscreen, templ))
++		rbuffer->flags |= RADEON_FLAG_NO_CPU_ACCESS;
++
+ 	if (templ->flags & PIPE_RESOURCE_FLAG_SPARSE)
+ 		rbuffer->flags |= RADEON_FLAG_SPARSE;
+ 
