@@ -1865,6 +1865,25 @@ static void ext_cap(char *list)
 		(unsigned)strlen(list));
 }
 
+/*
+ * Experiment: RDN_NO_ROWCOPY=1 drops the glCopyTexSubImage2D calls that copy
+ * one row of 512 pixels or more. The Sims 2 copies its 1024x1024 screen
+ * capture into a texture a row at a time, flipped (a row's yoffset up, its y
+ * down), 1024 calls a frame while its popups are up. What the texture is
+ * for is not known; this shows what the game does without it.
+ */
+static int rowcopy_skip(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = getenv("RDN_NO_ROWCOPY") != NULL;
+		if (on)
+			rdn_log("one-row glCopyTexSubImage2D calls of 512 pixels or more are dropped (RDN_NO_ROWCOPY)");
+	}
+	return on;
+}
+
 static int ext_ours(void)
 {
 	static int ours = -1;
@@ -2033,7 +2052,954 @@ static int draw_range_as_given(void)
 }
 """
 
-PROGRAM_STRING = """\tchar *own = weight_as_attrib(target, string, &len), *own2 = NULL;
+SHADOW_HELP = r"""
+/*
+ * What the program last told its context, for the questions that Mesa could
+ * only answer after glthread's thread has caught up (a glGet* is a full
+ * synchronisation: _mesa_marshal_GetBooleanv -> _mesa_glthread_finish_before).
+ * The Sims 2 asks for GL_DEPTH_WRITEMASK about once a frame, to put it back
+ * after its own drawing; with the answer here the main thread goes on.
+ *
+ * One record a context (they are not shared), found by the engine context
+ * every entry gets. Everything that sets the value is followed:
+ *   - glDepthMask,
+ *   - glPushAttrib/glPopAttrib (GL_DEPTH_BUFFER_BIT 0x100, GL_ALL_ATTRIB_BITS),
+ *     with a stack of the same depth as Mesa's (16),
+ * and what we cannot follow makes the record unknown (the real query
+ * answers) until the next glDepthMask: glCallList and glCallLists (a list may
+ * hold any of the above), and an attribute pop for which we have no push or
+ * whose push came before a list was called.
+ *
+ * The same for what the row coalescer below needs to know: whether
+ * GL_SCISSOR_TEST is enabled (glEnable/glDisable, and the attribute stack:
+ * GL_ENABLE_BIT 0x2000, GL_SCISSOR_BIT 0x80000) and which framebuffer is bound
+ * for reading (glBindFramebufferEXT, glDeleteFramebuffersEXT; not part of
+ * any attribute group, and not compiled into display lists). Between glNewList(GL_COMPILE)
+ * and glEndList the calls are recorded, not executed, and are not followed.
+ * Not followed: aglCopyContext/CGLCopyContext (the whole state of another
+ * context comes over).
+ *
+ * On for The Sims 2; RDN_STATE_SHADOW=1 in a program's environment turns it
+ * on for any (not the window server), RDN_STATE_SHADOW=0 off.
+ */
+#include <pthread.h>
+
+#define SHADOW_MAX 8
+
+/* The client arrays followed (glEnableClientState), as bits; texture coordinates one per unit. */
+#define CS_VERTEX 0x1
+#define CS_NORMAL 0x2
+#define CS_COLOR 0x4
+#define CS_SECONDARY 0x8
+#define CS_FOG 0x10
+#define CS_TEX(unit) (0x100u << (unit))
+#define CS_UNITS 8
+#define CS_ALL (0x1fu | (0xffu << 8))
+#define SHADOW_STACK 16
+
+struct shadow_saved {
+	unsigned mask, epoch;
+	unsigned char depth_mask, depth_ok;
+	unsigned char scissor, scissor_ok;
+};
+
+struct shadow {
+	void *rend;
+	unsigned char depth_mask, depth_ok;	/* GL_DEPTH_WRITEMASK; ok: it is known */
+	unsigned char scissor, scissor_ok;	/* GL_SCISSOR_TEST */
+	unsigned char read_fb_ok;		/* read_fb is known */
+	GLuint read_fb;				/* GL_READ_FRAMEBUFFER_BINDING */
+	unsigned char compiling;		/* inside glNewList(GL_COMPILE) */
+	/* Client-state elision (below). */
+	unsigned char listing;			/* inside glNewList, either mode: calls are recorded too */
+	unsigned char in_begin;			/* between glBegin and glEnd (or a glBegin that failed) */
+	unsigned char cs_unit_ok, cs_unit;	/* glClientActiveTexture's unit, if known */
+	unsigned char at_ok, at_unit;		/* glActiveTexture's unit, if known */
+	/* The units Mesa was last told (lazy switches below), when known; mm_tex: the matrix mode may be GL_TEXTURE. */
+	unsigned char cs_real_ok, cs_real, at_real_ok, at_real, mm_tex;
+	unsigned arr_known, arr_val;		/* CS_* bits: which arrays' enables are known, and on */
+	unsigned epoch;				/* counts the display lists called */
+	unsigned sp;
+	struct shadow_saved stack[SHADOW_STACK];
+	/* The row coalescer's (below): a framebuffer of ours to flip rows through. */
+	unsigned char rr_off;
+	unsigned rr_checked;
+	GLuint fbo, rb;
+	GLsizei rb_w, rb_h;
+};
+
+static struct shadow shadows[SHADOW_MAX];
+static volatile int lazy_pending;
+static void *lazy_rend;
+static struct shadow *volatile shadow_last;
+static pthread_mutex_t shadow_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int shadow_enabled(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *name = getprogname(), *env = getenv("RDN_STATE_SHADOW");
+
+		on = name && strcmp(name, "WindowServer") &&
+		     (env ? *env != '0' : !strcmp(name, "The Sims 2"));
+		if (on)
+			rdn_log("the program's depth write mask is followed here (RDN_STATE_SHADOW=0: off)");
+	}
+	return on;
+}
+
+/* The context's record, made on the first call; NULL when there is no room. */
+static struct shadow *shadow_for(void *rend)
+{
+	struct shadow *s = shadow_last;
+	unsigned i;
+
+	if (__builtin_expect(s != NULL && s->rend == rend, 1))
+		return s;
+	if (!rend)
+		return NULL;
+	pthread_mutex_lock(&shadow_lock);
+	for (i = 0; i < SHADOW_MAX; i++)
+		if (shadows[i].rend == rend)
+			break;
+	if (i == SHADOW_MAX)
+		for (i = 0; i < SHADOW_MAX; i++)
+			if (!shadows[i].rend) {
+				memset(&shadows[i], 0, sizeof(shadows[i]));
+				/* A new context: GL_TRUE, GL_FALSE, the default framebuffer. */
+				shadows[i].depth_mask = shadows[i].depth_ok = 1;
+				shadows[i].scissor_ok = shadows[i].read_fb_ok = 1;
+				/* Unit 0 is active, every client array is off. */
+				shadows[i].cs_unit_ok = shadows[i].at_ok = 1;
+				shadows[i].cs_real_ok = shadows[i].at_real_ok = 1;
+				shadows[i].arr_known = CS_ALL;
+				shadows[i].rend = rend;
+				break;
+			}
+	s = i < SHADOW_MAX ? &shadows[i] : NULL;
+	if (s)
+		shadow_last = s;
+	pthread_mutex_unlock(&shadow_lock);
+	return s;
+}
+
+static struct shadow *shadow_on(void *rend)
+{
+	return shadow_enabled() ? shadow_for(rend) : NULL;
+}
+
+static void shadow_forget(void *rend)
+{
+	unsigned i;
+
+	pthread_mutex_lock(&shadow_lock);
+	for (i = 0; i < SHADOW_MAX; i++)
+		if (rend && shadows[i].rend == rend) {
+			if (shadow_last == &shadows[i])
+				shadow_last = NULL;
+			if (lazy_rend == rend)
+				lazy_pending = 0;
+			memset(&shadows[i], 0, sizeof(shadows[i]));
+		}
+	pthread_mutex_unlock(&shadow_lock);
+}
+
+static void shadow_depth_mask(void *ctx, GLboolean flag)
+{
+	struct shadow *s = shadow_on(ctx);
+
+	if (s && !s->compiling) {
+		s->depth_mask = flag != 0;
+		s->depth_ok = 1;
+	}
+}
+
+static void shadow_push(void *ctx, GLbitfield mask)
+{
+	struct shadow *s = shadow_on(ctx);
+	struct shadow_saved *e;
+
+	/* Mesa's stack is 16 deep; a push beyond that is an error and no push. */
+	if (!s || s->compiling || s->sp >= SHADOW_STACK)
+		return;
+	e = &s->stack[s->sp++];
+	e->mask = mask;
+	e->epoch = s->epoch;
+	e->depth_mask = s->depth_mask;
+	e->depth_ok = s->depth_ok;
+	e->scissor = s->scissor;
+	e->scissor_ok = s->scissor_ok;
+}
+
+static void shadow_pop(void *ctx)
+{
+	struct shadow *s = shadow_on(ctx);
+	struct shadow_saved *e;
+
+	if (s)
+		s->at_ok = s->at_real_ok = 0, s->mm_tex = 1;	/* GL_TEXTURE_BIT holds the active unit */
+	if (!s || s->compiling)
+		return;
+	if (!s->sp) {
+		/* Not ours to say what an entry a list pushed held. */
+		s->depth_ok = s->scissor_ok = 0;
+		return;
+	}
+	e = &s->stack[--s->sp];
+	if (e->mask & 0x100) {		/* GL_DEPTH_BUFFER_BIT, and all bits */
+		if (e->epoch == s->epoch && e->depth_ok) {
+			s->depth_mask = e->depth_mask;
+			s->depth_ok = 1;
+		} else
+			s->depth_ok = 0;
+	}
+	if (e->mask & (0x2000 | 0x80000)) {	/* GL_ENABLE_BIT, GL_SCISSOR_BIT */
+		if (e->epoch == s->epoch && e->scissor_ok) {
+			s->scissor = e->scissor;
+			s->scissor_ok = 1;
+		} else
+			s->scissor_ok = 0;
+	}
+}
+
+/* glCallList, glCallLists: whatever the lists hold has happened. */
+static void shadow_lists(void *ctx)
+{
+	struct shadow *s = shadow_on(ctx);
+
+	if (s) {
+		s->epoch++;
+		s->depth_ok = s->scissor_ok = 0;
+		/* The lists may change any of the client state. */
+		s->cs_unit_ok = s->cs_real_ok = s->at_ok = s->at_real_ok = 0, s->mm_tex = 1;
+		s->arr_known = 0;
+	}
+}
+
+static void shadow_new_list(void *ctx, GLenum mode)
+{
+	struct shadow *s = shadow_on(ctx);
+
+	if (s) {
+		s->compiling = mode == 0x1300;	/* GL_COMPILE; GL_COMPILE_AND_EXECUTE executes */
+		s->listing = 1;
+		/* GL_COMPILE_AND_EXECUTE changes the client state without our seeing it. */
+		s->cs_unit_ok = s->cs_real_ok = s->at_ok = s->at_real_ok = 0, s->mm_tex = 1;
+		s->arr_known = 0;
+	}
+}
+
+static void shadow_end_list(void *ctx)
+{
+	struct shadow *s = shadow_on(ctx);
+
+	if (s) {
+		s->compiling = 0;
+		s->listing = 0;
+		s->cs_unit_ok = s->cs_real_ok = s->at_ok = s->at_real_ok = 0, s->mm_tex = 1;
+		s->arr_known = 0;
+	}
+}
+
+/*
+ * Client state: glClientActiveTexture, glActiveTexture, and
+ * glEnableClientState/glDisableClientState of the arrays above. The Sims 2
+ * sets them for every draw, mostly to what they already are, and each call
+ * costs the program's thread a dispatch, three thread-local lookups and a
+ * glthread message (a fifth of that thread's time in its profile). A call
+ * that would set what the context has is not made.
+ *
+ * Exact when: every way the values change is followed or makes them unknown
+ * (glCallList(s) and display list building; glPopAttrib for the active
+ * unit; glPopClientAttrib and the binding or deletion of vertex array
+ * objects for the array enables, which a vertex array object holds; the
+ * generic attribute enables, to be safe); nothing is skipped or followed
+ * while a display list is being built (the call must be recorded) or between
+ * glBegin and glEnd (an error there, which Mesa must record); only values
+ * Mesa accepts are followed (units below 8, the six arrays above), anything
+ * else goes to Mesa, which reports the error. A new context has unit 0 and
+ * no array on.
+ *
+ * Not followed: aglCopyContext/CGLCopyContext, as above.
+ * RDN_NO_STATE_ELIDE=1 turns it off.
+ */
+static int elide_on = -1;
+
+static int elide_init(void)
+{
+	elide_on = shadow_enabled() && !getenv("RDN_NO_STATE_ELIDE");
+	if (elide_on)
+		rdn_log("redundant glActiveTexture, glClientActiveTexture and glEnable/DisableClientState calls are left out (RDN_NO_STATE_ELIDE=1: not)");
+	return elide_on;
+}
+
+#define elide_enabled() (__builtin_expect(elide_on >= 0, 1) ? elide_on : elide_init())
+
+/* Calls seen and left out, per kind (0 ClientActiveTexture, 1 ActiveTexture, 2 Enable, 3 Disable...ClientState); RDN_ELIDE_STATS=1 prints them at exit. */
+static unsigned long elide_seen[4], elide_hit[4];
+
+static void elide_report(void) __attribute__((destructor));
+
+static void elide_report(void)
+{
+	static const char *const what[4] = { "glClientActiveTexture", "glActiveTexture",
+					     "glEnableClientState", "glDisableClientState" };
+	int i;
+
+	if (!getenv("RDN_ELIDE_STATS"))
+		return;
+	for (i = 0; i < 4; i++)
+		fprintf(stderr, "elide: %s: %lu calls, %lu left out\n", what[i], elide_seen[i], elide_hit[i]);
+}
+
+static struct shadow *elide_for(void *ctx)
+{
+	struct shadow *s = elide_enabled() ? shadow_for(ctx) : NULL;
+
+	return s && !s->listing && !s->in_begin ? s : NULL;
+}
+
+/*
+ * Lazy unit switches. The Sims 2 switches the active and the client active texture unit
+ * back and forth (a quarter of its calls each, hardly any of them redundant); most
+ * switches are followed by another before anything that depends on the unit. A switch is
+ * kept in the shadow state and made when a call that depends on the unit comes (every entry
+ * not known to be independent of both units: lazy_flush in the entry's start). The
+ * switches Mesa has been told are cs_real and at_real. RDN_LAZY_UNIT=0 turns it off.
+ */
+static pthread_t lazy_thread;
+static unsigned long lazy_sent[2];
+
+static int lazy_enabled = -1;
+
+static int lazy_init(void)
+{
+	const char *e = getenv("RDN_LAZY_UNIT");
+
+	lazy_enabled = elide_enabled() && !(e && *e == '0');
+	if (lazy_enabled)
+		rdn_log("glActiveTexture and glClientActiveTexture are held back until a call depends on them (RDN_LAZY_UNIT=0: not)");
+	return lazy_enabled;
+}
+
+#define lazy_on() (__builtin_expect(lazy_enabled >= 0, 1) ? lazy_enabled : lazy_init())
+
+static void lazy_flush(void *ctx)
+{
+	struct shadow *s;
+
+	lazy_pending = 0;
+	s = shadow_for(lazy_rend ? lazy_rend : ctx);
+	if (!s)
+		return;
+	if (s->at_ok && s->at_real_ok && s->at_unit != s->at_real) {
+		s->at_real = s->at_unit;
+		lazy_sent[1]++;
+		m_active_texture(0x84C0 + s->at_unit);
+	}
+	if (s->cs_unit_ok && s->cs_real_ok && s->cs_unit != s->cs_real) {
+		s->cs_real = s->cs_unit;
+		lazy_sent[0]++;
+		m_client_active_texture(0x84C0 + s->cs_unit);
+	}
+}
+
+/* Before the context or the thread changes hands (rdn_glue.h). */
+void rdn_lazy_flush(void)
+{
+	if (lazy_pending && pthread_equal(lazy_thread, pthread_self()))
+		lazy_flush(NULL);
+}
+
+/* A matrix call: it depends on the active unit when the matrix mode may be GL_TEXTURE. */
+static void lazy_matrix(void *ctx)
+{
+	struct shadow *s = shadow_for(ctx);
+
+	if (!s || s->mm_tex)
+		lazy_flush(ctx);
+}
+
+static void lazy_matrix_mode(void *ctx, GLenum mode)
+{
+	struct shadow *s = lazy_on() ? shadow_for(ctx) : NULL;
+
+	if (!s)
+		return;
+	if (!(mode == 0x1700 || mode == 0x1701 || mode == 0x1800 || (mode >= 0x8630 && mode < 0x8650)))
+		s->mm_tex = 1;		/* GL_TEXTURE, or an error: it may be */
+	else if (!s->listing)
+		s->mm_tex = 0;
+}
+
+/* Capabilities that do not depend on the unit. */
+static int lazy_cap_free(GLenum cap)
+{
+	switch (cap) {
+	case 0x0BE2: case 0x0B71: case 0x0B44: case 0x0BC0: case 0x0B50: case 0x0B60:
+	case 0x0C11: case 0x0B90: case 0x0BA1: case 0x0B57: case 0x8037: case 0x8620:
+	case 0x8804: case 0x0B20: case 0x0B10: case 0x0B11: case 0x0BE3: case 0x0BD0:
+		return 1;
+	}
+	return (cap >= 0x4000 && cap < 0x4008) || (cap >= 0x3000 && cap < 0x3006);
+}
+
+/* True: the unit is the one already set, or will be set when something needs it. */
+static int elide_client_active_texture(void *ctx, GLenum texture)
+{
+	struct shadow *s = elide_for(ctx);
+	GLuint unit = texture - 0x84C0;	/* GL_TEXTURE0 */
+
+	elide_seen[0]++;
+	if (!s || unit >= CS_UNITS)
+		return 0;
+	if (s->cs_unit_ok && s->cs_unit == unit) {
+		elide_hit[0]++;
+		return 1;
+	}
+	if (s->cs_unit_ok && s->cs_real_ok && lazy_on()) {
+		s->cs_unit = unit;
+		lazy_pending = 1;
+		lazy_rend = ctx;
+		lazy_thread = pthread_self();
+		elide_hit[0]++;
+		return 1;
+	}
+	s->cs_unit = unit;
+	s->cs_unit_ok = 1;
+	s->cs_real = unit;
+	s->cs_real_ok = 1;
+	return 0;
+}
+
+static int elide_active_texture(void *ctx, GLenum texture)
+{
+	struct shadow *s = elide_for(ctx);
+	GLuint unit = texture - 0x84C0;
+
+	elide_seen[1]++;
+	if (!s || unit >= CS_UNITS)
+		return 0;
+	if (s->at_ok && s->at_unit == unit) {
+		elide_hit[1]++;
+		return 1;
+	}
+	if (s->at_ok && s->at_real_ok && lazy_on()) {
+		s->at_unit = unit;
+		lazy_pending = 1;
+		lazy_rend = ctx;
+		lazy_thread = pthread_self();
+		elide_hit[1]++;
+		return 1;
+	}
+	s->at_unit = unit;
+	s->at_ok = 1;
+	s->at_real = unit;
+	s->at_real_ok = 1;
+	return 0;
+}
+
+static unsigned elide_array_bit(struct shadow *s, GLenum array)
+{
+	switch (array) {
+	case 0x8074: return CS_VERTEX;		/* GL_VERTEX_ARRAY */
+	case 0x8075: return CS_NORMAL;
+	case 0x8076: return CS_COLOR;
+	case 0x845E: return CS_SECONDARY;	/* GL_SECONDARY_COLOR_ARRAY */
+	case 0x8457: return CS_FOG;		/* GL_FOG_COORD_ARRAY */
+	case 0x8078:				/* GL_TEXTURE_COORD_ARRAY, of the client unit */
+		return s->cs_unit_ok ? CS_TEX(s->cs_unit) : 0;
+	}
+	return 0;
+}
+
+static int elide_client_state(void *ctx, GLenum array, int on)
+{
+	struct shadow *s = elide_for(ctx);
+	unsigned bit;
+
+	elide_seen[2 + !on]++;
+	if (!s)
+		return 0;
+	bit = elide_array_bit(s, array);
+	if (!bit) {
+		/* The unit is not known: what is known of the texture arrays goes. */
+		if (array == 0x8078)
+			s->arr_known &= ~0xff00u;
+		return 0;
+	}
+	if ((s->arr_known & bit) && !(s->arr_val & bit) == !on) {
+		elide_hit[2 + !on]++;
+		return 1;
+	}
+	s->arr_known |= bit;
+	if (on)
+		s->arr_val |= bit;
+	else
+		s->arr_val &= ~bit;
+	return 0;
+}
+
+static void elide_begin(void *ctx)
+{
+	struct shadow *s = elide_enabled() ? shadow_for(ctx) : NULL;
+
+	if (s)
+		s->in_begin = 1;
+}
+
+static void elide_end(void *ctx)
+{
+	struct shadow *s = elide_enabled() ? shadow_for(ctx) : NULL;
+
+	if (s)
+		s->in_begin = 0;
+}
+
+/* The array enables are not known (vertex array objects, glPopClientAttrib, generic attributes). */
+static void elide_arrays_unknown(void *ctx, int unit_too)
+{
+	struct shadow *s = elide_enabled() ? shadow_for(ctx) : NULL;
+
+	if (s) {
+		s->arr_known = 0;
+		if (unit_too)
+			s->cs_unit_ok = s->cs_real_ok = 0;
+	}
+}
+
+static void shadow_enable(void *ctx, GLenum cap, int on)
+{
+	struct shadow *s = cap == 0x0C11 ? shadow_on(ctx) : NULL;	/* GL_SCISSOR_TEST */
+
+	if (s && !s->compiling) {
+		s->scissor = on;
+		s->scissor_ok = 1;
+	}
+}
+
+static void shadow_bind_framebuffer(void *ctx, GLenum target, GLuint framebuffer)
+{
+	struct shadow *s = target == 0x8D40 || target == 0x8CA8 ? shadow_on(ctx) : NULL;
+
+	if (s) {	/* GL_FRAMEBUFFER_EXT, GL_READ_FRAMEBUFFER */
+		s->read_fb = framebuffer;
+		s->read_fb_ok = 1;
+	}
+}
+
+static void shadow_delete_framebuffers(void *ctx, GLsizei n, const GLuint *framebuffers)
+{
+	struct shadow *s = shadow_on(ctx);
+	GLsizei i;
+
+	/* A framebuffer deleted while bound is unbound: the default one is. */
+	for (i = 0; s && framebuffers && i < n; i++)
+		if (framebuffers[i] && framebuffers[i] == s->read_fb)
+			s->read_fb = 0;
+}
+
+/* The mask if it is known. */
+static int shadow_depth_get(void *ctx, GLint *value)
+{
+	struct shadow *s = shadow_on(ctx);
+
+	if (!s || !s->depth_ok)
+		return 0;
+	*value = s->depth_mask;
+	return 1;
+}
+"""
+
+ROWRUN_HELP = r"""
+/*
+ * Runs of one-row glCopyTexSubImage2D calls.
+ *
+ * The Sims 2 copies its screen into a texture flipped, a row at a time:
+ *
+ *	for (row = 0; row < 1024; row++)
+ *		glCopyTexSubImage2D(target, 0, 0, row, 0, 1023 - row, 1024, 1);
+ *
+ * (yoffset up by one, y down by one) 1024 calls a frame while water is on
+ * screen. Each one is a call through the dispatch, a glthread message and a
+ * blit. A run of such calls is held back here, and applied in one go when
+ * the next call of any other kind comes (every entry looks first), or the
+ * frame is swapped, or the context is let go of, or the run has 2048 rows:
+ *
+ *   1. one glBlitNamedFramebuffer from the default framebuffer into a
+ *      renderbuffer of ours (RGBA8), the rows in reverse order (the
+ *      destination rectangle is upside down);
+ *   2. one glCopyTexSubImage2D of the block from that renderbuffer, with our
+ *      framebuffer bound for reading for as long as it takes,
+ *
+ * which leaves the texture as the rows would have, one by one, from the
+ * default framebuffer (a window of 8 bits a channel). The named
+ * entry points change no binding: the program's draw framebuffer, textures,
+ * renderbuffer and the read buffer are as they were. What is changed is the
+ * read framebuffer binding, put back to 0 (the only case taken, known from
+ * glBindFramebufferEXT, see the shadow above), and GL's error flag if the
+ * hardware refuses (below).
+ *
+ * Taken only when everything it needs to be sure of is known: the read
+ * framebuffer is the default one, the scissor test is off (a blit is cut
+ * by it, a copy is not), the target is GL_TEXTURE_2D or GL_TEXTURE_RECTANGLE
+ * and the rows are 256 pixels or more. Otherwise, or when the blit is not
+ * possible, the rows are made one by one, at the end of the run, as the
+ * program asked. Rows or columns outside the framebuffer are left out, as
+ * glCopyTexSubImage2D does; the size is Mesa's own (OSMesaGetIntegerv).
+ *
+ * The first ROWRUN_CHECKS runs are checked with glGetError (a round trip to
+ * glthread's thread, and the error flag the program had is lost); a run
+ * that makes an error is made again row by row and the coalescing is off
+ * for the context from then on. Multisampled framebuffers (blits cannot flip
+ * them) and a Mesa without GL_ARB_direct_state_access end up that way.
+ *
+ * Not seen by the program: the run is applied before anything else it
+ * calls, so what it can see is what it would have seen. Not true of what
+ * does not go through the dispatch (the engine's own entries for Apple's
+ * extensions, other contexts sharing the texture without a glFlush).
+ *
+ * On where the shadow is on (The Sims 2); RDN_NO_ROWCOALESCE=1 turns it off.
+ */
+void OSMesaGetIntegerv(GLint pname, GLint *value);
+
+#define ROWRUN_MAX 2048
+#define ROWRUN_MIN 4
+#define ROWRUN_CHECKS 4
+
+static void (*x_create_framebuffers)(GLsizei n, GLuint *ids);
+static void (*x_create_renderbuffers)(GLsizei n, GLuint *ids);
+static void (*x_named_renderbuffer_storage)(GLuint rb, GLenum format, GLsizei width, GLsizei height);
+static void (*x_named_framebuffer_renderbuffer)(GLuint fb, GLenum attachment, GLenum target, GLuint rb);
+static void (*x_blit_named_framebuffer)(GLuint read, GLuint draw, GLint sx0, GLint sy0, GLint sx1,
+					GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1,
+					GLbitfield mask, GLenum filter);
+static void (*x_bind_framebuffer)(GLenum target, GLuint framebuffer);
+
+/* The run held back. rend is NULL and count 0 when there is none. */
+static struct {
+	void *rend;
+	GLenum target;
+	GLint level, xoffset;
+	GLint yoffset0;		/* of the first row */
+	GLint x_raw, y_raw0;	/* its x and y as the program gave them */
+	GLint x, y0;		/* and with the window's place added */
+	GLsizei width;
+	GLint count;
+} rowrun;
+
+/* The engine context is gone (rdn_mesa_context_destroyed): its address may come back. */
+void rdn_dispatch_forget(void *rend)
+{
+	if (rend && rowrun.rend == rend)
+		rowrun.count = 0;
+	shadow_forget(rend);
+}
+
+static int rowrun_enabled(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = shadow_enabled() && !getenv("RDN_NO_ROWCOALESCE") &&
+		     x_create_framebuffers && x_create_renderbuffers && x_named_renderbuffer_storage &&
+		     x_named_framebuffer_renderbuffer && x_blit_named_framebuffer && x_bind_framebuffer &&
+		     m_copy_tex_sub_image2D && m_get_error;
+		if (on)
+			rdn_log("runs of one-row glCopyTexSubImage2D calls are coalesced (RDN_NO_ROWCOALESCE=1: not)");
+	}
+	return on;
+}
+
+/* The rows [from, to) of the run, one call each, as the program made them. */
+static void rowrun_replay(GLenum target, GLint level, GLint xoffset, GLint yoffset0, GLint x, GLint y0,
+			  GLsizei width, GLint from, GLint to)
+{
+	GLint i;
+
+	for (i = from; i < to; i++)
+		m_copy_tex_sub_image2D(target, level, xoffset, yoffset0 + i, x, y0 - i, width, 1);
+}
+
+/* The renderbuffer of ours is made, or made larger, for w by h. */
+static int rowrun_scratch(struct shadow *s, GLsizei w, GLsizei h)
+{
+	if (!s->fbo) {
+		x_create_framebuffers(1, &s->fbo);
+		x_create_renderbuffers(1, &s->rb);
+		if (!s->fbo || !s->rb) {
+			s->fbo = s->rb = 0;
+			return 0;
+		}
+	}
+	if (w > s->rb_w || h > s->rb_h) {
+		GLsizei nw = w > s->rb_w ? w : s->rb_w, nh = h > s->rb_h ? h : s->rb_h;
+
+		if (nw < 1024)
+			nw = 1024;
+		if (nh < 1024)
+			nh = 1024;
+		x_named_renderbuffer_storage(s->rb, 0x8058, nw, nh);		/* GL_RGBA8 */
+		x_named_framebuffer_renderbuffer(s->fbo, 0x8CE0, 0x8D41, s->rb);	/* COLOR_ATTACHMENT0, RENDERBUFFER */
+		s->rb_w = nw;
+		s->rb_h = nh;
+	}
+	return 1;
+}
+
+/* The run as one blit and one copy; 0 if that can not be done (nothing was changed). */
+static int rowrun_blit(struct shadow *s, void *rend, GLenum target, GLint level, GLint xoffset,
+		       GLint yoffset0, GLint x, GLint y0, GLsizei width, GLint count)
+{
+	GLint fb_w = 0, fb_h = 0, i0, i1, rows, cx0, cx1, cw, ytop, ybot;
+	int check = s->rr_checked < ROWRUN_CHECKS;
+
+	if (s->rr_off)
+		return 0;
+	OSMesaGetIntegerv(0x20, &fb_w);		/* OSMESA_WIDTH */
+	OSMesaGetIntegerv(0x21, &fb_h);		/* OSMESA_HEIGHT */
+	if (fb_w <= 0 || fb_h <= 0)
+		return 0;
+	/* Row i reads y0 - i; the rows inside the framebuffer are i0 to i1. */
+	i0 = y0 - (fb_h - 1) > 0 ? y0 - (fb_h - 1) : 0;
+	i1 = y0 < count - 1 ? y0 : count - 1;
+	cx0 = x > 0 ? x : 0;
+	cx1 = x + width < fb_w ? x + width : fb_w;
+	if (i1 < i0 || cx1 <= cx0)
+		return 1;		/* all of it outside: the copies would have changed nothing */
+	rows = i1 - i0 + 1;
+	cw = cx1 - cx0;
+	if (!rowrun_scratch(s, cw, rows)) {
+		s->rr_off = 1;
+		return 0;
+	}
+	ytop = y0 - i0;
+	ybot = y0 - i1;
+	if (check)
+		m_get_error();
+	/* Our row j is the framebuffer's ytop - j: the destination's y runs from rows down to 0. */
+	x_blit_named_framebuffer(0, s->fbo, cx0, ybot, cx0 + cw, ytop + 1, 0, rows, cw, 0,
+				 0x4000, 0x2600);	/* GL_COLOR_BUFFER_BIT, GL_NEAREST */
+	x_bind_framebuffer(0x8CA8, s->fbo);	/* GL_READ_FRAMEBUFFER */
+	m_copy_tex_sub_image2D(target, level, xoffset + (cx0 - x), yoffset0 + i0, 0, 0, cw, rows);
+	x_bind_framebuffer(0x8CA8, 0);
+	if (check) {
+		s->rr_checked++;
+		if (m_get_error()) {
+			s->rr_off = 1;
+			rdn_log("row coalescing: the blit is refused (%d rows of %d); off for this context", rows, cw);
+			return 0;
+		}
+		if (s->rr_checked == ROWRUN_CHECKS)
+			rdn_log("row coalescing: %d runs went through without an error", ROWRUN_CHECKS);
+	}
+	return 1;
+}
+
+/* Make the run held back; the context must be the thread's current one. */
+static void rowrun_flush(void)
+{
+	void *rend = rowrun.rend;
+	GLenum target = rowrun.target;
+	GLint level = rowrun.level, xoffset = rowrun.xoffset, yoffset0 = rowrun.yoffset0;
+	GLint x = rowrun.x, y0 = rowrun.y0, count = rowrun.count;
+	GLsizei width = rowrun.width;
+	struct shadow *s;
+
+	rowrun.count = 0;
+	rowrun.rend = NULL;
+	s = count >= ROWRUN_MIN ? shadow_for(rend) : NULL;
+	if (!s || !rowrun_blit(s, rend, target, level, xoffset, yoffset0, x, y0, width, count))
+		rowrun_replay(target, level, xoffset, yoffset0, x, y0, width, 0, count);
+}
+
+/* The context's turn with a run of its own held: it is made first of all. */
+static void rowrun_flush_for(void *ctx)
+{
+	if (rowrun.rend != ctx)
+		return;
+	RDN_ENTER(ctx);
+	rowrun_flush();
+}
+
+/* Before the context is let go of, or another made current in the thread. */
+void rdn_dispatch_flush_pending(void)
+{
+	if (rowrun.count && rowrun.rend == rdn_current_rend)
+		rowrun_flush();
+}
+
+/*
+ * glCopyTexSubImage2D, before anything is done with it (x and y as the
+ * program gave them): true if the call is held back, and so done with.
+ * Anything that is not the next row of the run held back first makes it.
+ */
+static int rowrun_try(void *ctx, GLenum target, GLint level, GLint xoffset, GLint yoffset,
+		      GLint x, GLint y, GLsizei width, GLsizei height)
+{
+	struct shadow *s;
+
+	if (rowrun.count) {
+		if (rowrun.rend != ctx)
+			return 0;	/* another context's run is held: no second one */
+		if (height == 1 && rowrun.target == target && rowrun.level == level &&
+		    rowrun.xoffset == xoffset && rowrun.x_raw == x && rowrun.width == width &&
+		    rowrun.yoffset0 + rowrun.count == yoffset && rowrun.y_raw0 - rowrun.count == y &&
+		    rowrun.count < ROWRUN_MAX) {
+			rowrun.count++;
+			return 1;
+		}
+		rowrun_flush();
+	}
+	if (height != 1 || width < 256 || (target != 0x0DE1 && target != 0x84F5) || !rowrun_enabled())
+		return 0;
+	s = shadow_for(ctx);
+	if (!s || s->compiling || s->rr_off || !s->read_fb_ok || s->read_fb || !s->scissor_ok || s->scissor)
+		return 0;
+	rowrun.target = target;
+	rowrun.level = level;
+	rowrun.xoffset = xoffset;
+	rowrun.yoffset0 = yoffset;
+	rowrun.x_raw = x;
+	rowrun.y_raw0 = y;
+	/* The default framebuffer is the read one: the window's place is added (drawable_origin). */
+	rowrun.x = x + rdn_origin_x;
+	rowrun.y0 = y + rdn_origin_y;
+	rowrun.width = width;
+	rowrun.rend = ctx;
+	rowrun.count = 1;
+	return 1;
+}
+"""
+
+
+
+def shadow_hook(name, names):
+    """Lines that follow the program's depth write mask (SHADOW_HELP): the
+    entries that set it, and the queries answered from it."""
+    if name in ('enable', 'disable'):
+        return ['\tshadow_enable(ctx, %s, %d);' % (names[0], name == 'enable')]
+    if name == 'bind_framebuffer_EXT':
+        return ['\tshadow_bind_framebuffer(ctx, %s, %s);' % (names[0], names[1])]
+    if name == 'delete_framebuffers_EXT':
+        return ['\tshadow_delete_framebuffers(ctx, %s, %s);' % (names[0], names[1])]
+    if name == 'depth_mask':
+        return ['\tshadow_depth_mask(ctx, %s);' % names[0]]
+    if name == 'push_attrib':
+        return ['\tshadow_push(ctx, %s);' % names[0]]
+    if name == 'pop_attrib':
+        return ['\tshadow_pop(ctx);']
+    if name in ('call_list', 'call_lists'):
+        return ['\tshadow_lists(ctx);']
+    if name == 'begin':
+        return ['\telide_begin(ctx);']
+    if name == 'end':
+        return ['\telide_end(ctx);']
+    if name == 'pop_client_attrib':
+        return ['\telide_arrays_unknown(ctx, 1);']
+    if name in ('bind_vertex_array_EXT', 'delete_vertex_arrays_EXT',
+                'enable_vertex_attrib_ARB', 'disable_vertex_attrib_ARB', 'interleaved_arrays'):
+        return ['\telide_arrays_unknown(ctx, 0);']
+    if name == 'new_list':
+        return ['\tshadow_new_list(ctx, %s);' % names[1]]
+    if name == 'end_list':
+        return ['\tshadow_end_list(ctx);']
+    if name in SHADOW_GETS:
+        if names[:2] != ['pname', 'params']:
+            sys.exit('%s: unexpected arguments %s' % (name, names))
+        return ['\tif (pname == 0x0B72) {\t/* GL_DEPTH_WRITEMASK */',
+                '\t\tGLint known;',
+                '',
+                '\t\tif (shadow_depth_get(ctx, &known)) {',
+                '\t\t\t*params = %sknown;' % SHADOW_GETS[name],
+                '\t\t\treturn;',
+                '\t\t}',
+                '\t}']
+    return []
+
+
+SHADOW_GETS = {
+    'get_booleanv': '(GLboolean)',
+    'get_integerv': '',
+    'get_floatv': '(GLfloat)',
+    'get_doublev': '(GLdouble)',
+}
+
+
+LAZY_FREE_PREFIX = ('glColor', 'glSecondaryColor', 'glNormal', 'glVertex', 'glTexCoord', 'glMultiTexCoord', 'glFogCoord',
+                    'glMaterial', 'glLight', 'glProgramEnvParameter', 'glProgramLocalParameter', 'glStencil',
+                    'glClear', 'glBlend', 'glDraw', 'glMultiDraw', 'glFog', 'glDepth', 'glPolygon', 'glLineW',
+                    'glPointS')
+LAZY_FREE_EXACT = ('glBindProgramARB', 'glAlphaFunc', 'glCullFace', 'glFrontFace', 'glShadeModel', 'glScissor',
+                   'glViewport', 'glEnableVertexAttribArrayARB', 'glDisableVertexAttribArrayARB')
+LAZY_UNIT_DEPENDENT = ('glTexCoordPointer', 'glTexCoordPointerEXT')
+LAZY_MATRIX = ('glLoadMatrixf', 'glLoadMatrixd', 'glMultMatrixf', 'glMultMatrixd', 'glLoadIdentity', 'glPushMatrix',
+               'glPopMatrix', 'glTranslatef', 'glTranslated', 'glRotatef', 'glRotated', 'glScalef', 'glScaled',
+               'glFrustum', 'glOrtho', 'glLoadTransposeMatrixf', 'glLoadTransposeMatrixd',
+               'glMultTransposeMatrixf', 'glMultTransposeMatrixd')
+
+
+def lazy_prologue(gl):
+    """Lines that make the held-back unit switches before a call that depends on a unit."""
+    if gl in ('glActiveTexture', 'glClientActiveTexture', 'glActiveTextureARB', 'glClientActiveTextureARB'):
+        return []
+    if gl in ('glEnable', 'glDisable'):
+        return ['\tif (__builtin_expect(lazy_pending, 0) && !lazy_cap_free(cap))', '\t\tlazy_flush(ctx);']
+    if gl in ('glEnableClientState', 'glDisableClientState'):
+        return ['\tif (__builtin_expect(lazy_pending, 0) && array == 0x8078)', '\t\tlazy_flush(ctx);']
+    if gl == 'glMatrixMode':
+        return ['\tlazy_matrix_mode(ctx, mode);']
+    if gl in LAZY_MATRIX:
+        return ['\tif (__builtin_expect(lazy_pending, 0))', '\t\tlazy_matrix(ctx);']
+    if gl not in LAZY_UNIT_DEPENDENT and (gl in LAZY_FREE_EXACT or gl.startswith(LAZY_FREE_PREFIX)):
+        return []
+    return ['\tif (__builtin_expect(lazy_pending, 0))', '\t\tlazy_flush(ctx);']
+
+CALL_STATS_HELP = """/*
+ * RDN_CALL_STATS=1: counts the calls the program makes to each entry and rewrites
+ * /tmp/rdn-callstats.txt every 2^21 calls (a game is stopped by a signal: no exit hook runs).
+ */
+static int call_stats = -1;
+static unsigned long call_total;
+
+static void call_dump(void)
+{
+	FILE *f = fopen("/tmp/rdn-callstats.txt", "w");
+	int top[40], n = 0, i, j;
+
+	if (!f)
+		return;
+	for (i = 0; i < (int)(sizeof call_count / sizeof call_count[0]); i++) {
+		if (!call_count[i])
+			continue;
+		for (j = n < 40 ? n++ : 39; j > 0 && call_count[top[j - 1]] < call_count[i]; j--)
+			top[j] = top[j - 1];
+		if (j < 40)
+			top[j] = i;
+	}
+	fprintf(f, "total %lu\\n", call_total);
+	for (i = 0; i < n; i++)
+		fprintf(f, "%10lu %5.1f%%  %s\\n", call_count[top[i]], 100.0 * call_count[top[i]] / call_total, call_names[top[i]]);
+	for (i = 0; i < 4; i++)
+		fprintf(f, "elide kind %d: %lu seen, %lu left out\\n", i, elide_seen[i], elide_hit[i]);
+	fprintf(f, "lazy: %lu client and %lu active switches sent\\n", lazy_sent[0], lazy_sent[1]);
+	fclose(f);
+}
+
+static void call_note(int i)
+{
+	call_count[i]++;
+	if (!(++call_total & 0x1fffff))
+		call_dump();
+}
+
+__attribute__((constructor)) static void call_stats_init(void)
+{
+	call_stats = getenv("RDN_CALL_STATS") != NULL;
+}"""
+
+PROGRAM_STRING = """\tchar *own = weight_as_attrib(target, string, &len), *own2 = NULL, *own3 = NULL;
 
 \tif (own)
 \t\tstring = own;
@@ -2050,6 +3016,20 @@ PROGRAM_STRING = """\tchar *own = weight_as_attrib(target, string, &len), *own2 
 \t\t\t\trdn_log("program: ALIAS of a binding or a component rewritten, %d bytes now", n);
 \t\t}
 \t}
+\t/* The Sims 2 hands Direct3D pixel shader byte code (0xFFFF01nn...) here
+\t * as if it were text: translate it (rdn_arbtext.h). */
+\tif (target == 0x8804 && string && ((const unsigned char *)string)[0] == 0xff &&
+\t    ((const unsigned char *)string)[1] == 0xff) {
+\t\tint n = 0;
+
+\t\town3 = rdn_d3d_ps_to_arb(string, &n);
+\t\tif (own3) {
+\t\t\tstring = own3;
+\t\t\tlen = (GLsizei)n;
+\t\t} else if (__builtin_expect(rdn_logging, 0)) {
+\t\t\trdn_log("program: Direct3D pixel shader byte code not translated");
+\t\t}
+\t}
 \tm_program_string_ARB(target, format, len, string);
 \tif (__builtin_expect(rdn_logging, 0)) {
 \t\tGLint at = -1;
@@ -2061,7 +3041,8 @@ PROGRAM_STRING = """\tchar *own = weight_as_attrib(target, string, &len), *own2 
 \t\t\t(int)len, (const char *)string);
 \t}
 \tfree(own);
-\tfree(own2);"""
+\tfree(own2);
+\tfree(own3);"""
 
 APPLE_ONLY = {
     'pixel_storei': ('pname', (0x85B2,), 'apple_ctx(ctx)->client_storage = param != 0;'),
@@ -2261,13 +3242,21 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
     out.append(VAR_HELP)
     out.append(APPLE_HELP.replace('@DEFAULTS@', ''.join('\t"%s",\n' % n for n in EXT_DEFAULT)))
     out.append(DRAW_RANGE_HELP)
+    out.append(SHADOW_HELP)
+    out.append(ROWRUN_HELP)
     bodies = dict(OWN)
     for more in (VAR_OWN, FENCE_OWN, APPLE_OWN):
         bodies.update(more)
     for name in list(bodies) + list(APPLE_ONLY) + list(APPLE_GETS) + list(APPLE_TEX_GETS):
         if name not in index:
             sys.exit('no entry %s' % name)
-    for ret, name, params, names in entries:
+    out.append('static unsigned long call_count[%d];' % len(entries))
+    out.append('static const char *const call_names[%d] = {' % len(entries))
+    for e in entries:
+        out.append('\t"%s",' % gl_name(e[1]))
+    out.append('};')
+    out.append(CALL_STATS_HELP)
+    for entry_index, (ret, name, params, names) in enumerate(entries):
         full = 'GLIContext ctx' + (', ' + params if params else '')
         call = 'm_%s(%s)' % (name, ', '.join(names))
         recordable = ret.strip() == 'void' and '*' not in params and '[' not in params and name not in ('new_list', 'end_list')
@@ -2281,6 +3270,10 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
             out.append('    fn(%s); return 1; }' % ', '.join('a->'+n for n in names))
         out.append('static %s t_%s(%s)' % (ret, name, full))
         out.append('{')
+        if name != 'copy_tex_sub_image2D':
+            # A run of one-row copies held back (ROWRUN_HELP) is made before anything else.
+            out.append('\tif (__builtin_expect(rowrun.count, 0))')
+            out.append('\t\trowrun_flush_for(ctx);')
         out.append('\tRDN_ENTER(ctx);')
         if name == 'new_list':
             out.append('    rdn_list_begin(list, mode);')
@@ -2292,6 +3285,8 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
             elif not name.startswith('get_'):
                 out.append('    if (rdn_list_recording()) rdn_list_record(NULL, NULL, 0);')
 
+        out.append('\tif (__builtin_expect(call_stats, 0))\n\t\tcall_note(%d);' % entry_index)
+        out.extend(lazy_prologue(gl_name(name)))
         if name in bodies:
             out.append('\tif (__builtin_expect(rdn_trace, 0) && rdn_trace_wanted("%s"))' % gl_name(name))
             out.append('\t\t%s;' % trace_call(name, params, names))
@@ -2315,6 +3310,7 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
             out.append('\t\t%s' % note)
             out.append('\t\treturn;')
             out.append('\t}')
+        out.extend(shadow_hook(name, names))
         if name in APPLE_GETS:
             out.append('\tif (pname == 0x8A16) { *params = rdn_mesa_unpack_row_bytes(ctx, -1); return; }')
             out.append('\tif (pname == 0x0BA2 || pname == 0x0C10) {')
@@ -2359,6 +3355,14 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
         if name == 'delete_vertex_arrays_EXT':
             out.append('\tif (var_on())')
             out.append('\t\tvar_delete(ctx, n, ids);')
+        if name == 'copy_tex_sub_image2D':
+            out.append('\tif (height == 1 && width >= 512 && __builtin_expect(rowcopy_skip(), 0))')
+            out.append('\t\treturn;')
+            if names != ['target', 'level', 'xoffset', 'yoffset', 'x', 'y', 'width', 'height']:
+                sys.exit('copy_tex_sub_image2D: unexpected arguments %s' % names)
+            out.append('\tif (__builtin_expect(rowrun.count != 0 || height == 1, 0) &&')
+            out.append('\t    rowrun_try(ctx, target, level, xoffset, yoffset, x, y, width, height))')
+            out.append('\t\treturn;')
         if name == 'get_string':
             out.append('\tif (name == 0x1F03 && ext_ours())\t/* GL_EXTENSIONS */')
             out.append('\t\treturn ext_list(m_get_string(name));')
@@ -2385,6 +3389,14 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
             out.append('\t\t%s(1);' % CLIENT_STATE[name])
             out.append('\t\treturn;')
             out.append('\t}')
+            out.append('\tif (elide_client_state(ctx, array, %d))' % (name == 'enable_client_state'))
+            out.append('\t\treturn;')
+        if name == 'client_active_texture':
+            out.append('\tif (elide_client_active_texture(ctx, target))')
+            out.append('\t\treturn;')
+        if name == 'active_texture':
+            out.append('\tif (elide_active_texture(ctx, target))')
+            out.append('\t\treturn;')
         if name == 'viewport':
             out.append('\t{')
             out.append('\t\tGLint framebuffer; m_get_integerv(0x8CA6, &framebuffer);')
@@ -2501,6 +3513,13 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
     out.append('\tx_fence_sync = lookup("glFenceSync");')
     out.append('\tx_client_wait_sync = lookup("glClientWaitSync");')
     out.append('\tx_delete_sync = lookup("glDeleteSync");')
+    for var, gl in (('create_framebuffers', 'glCreateFramebuffers'),
+                    ('create_renderbuffers', 'glCreateRenderbuffers'),
+                    ('named_renderbuffer_storage', 'glNamedRenderbufferStorage'),
+                    ('named_framebuffer_renderbuffer', 'glNamedFramebufferRenderbuffer'),
+                    ('blit_named_framebuffer', 'glBlitNamedFramebuffer'),
+                    ('bind_framebuffer', 'glBindFramebuffer')):
+        out.append('\tx_%s = lookup("%s");' % (var, gl))
     out.append('\tbyname = strcmp(getprogname(), "WindowServer") &&')
     out.append('\t\trdn_hook_function_lookup(byname_function, rdn_mesa_lookup_missing);')
     out.append('\tflushrange = byname && x_map_buffer_range && x_flush_mapped_buffer_range &&')
@@ -2547,6 +3566,8 @@ static void drawable_origin(int reading, GLint *x, GLint *y)
     out.append('')
     out.append('static void rdn_swap_entry(GLIContext ctx)')
     out.append('{')
+    out.append('\tif (__builtin_expect(rowrun.count, 0))')
+    out.append('\t\trowrun_flush_for(ctx);')
     out.append('\tswap_count();')
     out.append('\tvar_swaps++;')
     out.append('\tif (__builtin_expect(rdn_logging, 0))')

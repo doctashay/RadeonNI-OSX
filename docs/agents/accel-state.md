@@ -181,8 +181,57 @@ been planned in detail.
   page is `0x?38aa000`, the heap base moving 16 MB a run), with `RDN_NO_APPLE=1`, and with `RDN_SOFTWARE=1`
   (Mesa not used at all; the game shows a blue screen): so not ours. Without the three intro movies in
   `TSData/Res/Movies` the original build reaches its menu through our driver.
+  Profile and trace of the Sims 2 on Tiger (2026-10-23, Rev F, glthread on 15 fps, off 6 fps: glthread stays on):
+  the main thread stalls on `glGetBooleanv(GL_DEPTH_WRITEMASK)` (about 0.65 a frame, a glthread sync, 15 % of
+  its time), and in the frames where water is on screen it makes 1024 one-row `glCopyTexSubImage2D` calls (a
+  vertical flip done row by row: Direct3D port, `cDeviceDX`) that are the water reflection (without them the
+  reflections break: `RDN_NO_ROWCOPY=1`, an experiment switch). The game uses only ARB vertex programs
+  (7, no ARBfp, whatever `useShaders` says). Why "Programmable 1.1 / Pixel program 1.1" in its config log
+  (`~/Documents/EA Games/The Sims 2/Logs`): its startup probe (Rev F `0x1c15c..0x1c300`) fills a D3D caps
+  structure with constants, vertex shader `0xFFFE0101` if `GL_ARB_vertex_program` is there and pixel shader
+  `0xFFFF0101` always; nothing in GL, the PCI ID (`tools/g5/fake_device_id.c` fakes it per process) or the card
+  database changes it. The rules that the game reads are in the app bundle's `Contents/Resources/Config`
+  (`Graphics Rules.sgr` sets `useShaders false` for every non-software device), not in `TSData/Res`.
   `RDN_SOFTWARE=1` in a program's environment, or its name in `/Library/Application Support/RadeonNI/software`
   (the lines of `glversion21`), leaves that program to Apple's software renderer (`gld/rdn_mesa.c`).
+  Why the Sims 2 shaders fail to build (2026-10-23): of 809 materials validated, the tree and forest shadow
+  and `neighborhood_roundshadow` materials (60 of 145 shader creations) failed because the game's own D3D
+  assembler (Rev F `0x2a7a8` -> `0x58764`) returns null for any `ps_` text (`0x589c4`: a `bne` on the shader-type
+  byte, status `0x8876086A` = D3DERR_NOTAVAILABLE); its `vs_1_1` shaders all assemble. With that `bne` made a
+  nop (a patch of the game copy, file offset 30316996 of the ppc slice, `60 00 00 00`; backup
+  `sm2-binary-before-psnull`) the byte code comes out, and the engine then passes it (`0xFFFF0101`, `def`
+  `0x51`, `tex` `0x42`, `mul` `0x05`, ..., `0x0000FFFF`) to `glProgramStringARB(GL_FRAGMENT_PROGRAM_ARB)` as
+  text, its length a strlen of the tokens (4). The bundle translates ps_1_x byte code to ARB fragment text
+  (`rdn_d3d_ps_to_arb` in `gld/rdn_arbtext.c`, `tests/d3d_ps.c`; any program, valid text never starts with
+  `0xFF`); Mesa accepts it. Result with the patch: 800 of 809 validate, the one material left is
+  `nhoodterrainlightingmaterial` (its texture `nhoodlightmap` has no image when validated: the game's data,
+  not the driver) and the frame rate is unchanged (the shadow shader is a `tex` and a `mul`; 9.8 fps).
+  Constants not set with `def` are read as `program.env[n]`: not verified, the Sims 2 has none.
+  Sims 2 speed work (2026-10-23, Tiger, G5, `scripts/sims2-cpu.sh`: main-thread ms per frame, steady Pleasantview
+  view; run to run it varies by about 6 %, only paired runs mean something): `RDN_CALL_STATS=1` counts calls per
+  entry (`/tmp/rdn-callstats.txt`); half of the 67M counted calls were `glActiveTexture` and `glClientActiveTexture`
+  (25 % each, almost none redundant: it flips units). Holding the switches back until a unit-dependent call comes
+  (`lazy_flush` in `gld/gen_dispatch.py`, `RDN_LAZY_UNIT=0` off) sends 14 % of them and took the main thread from
+  74.2 to 66.4 ms a frame (+12 % fps); a removed call is worth about 270 ns. Still redundant and not elided:
+  `glDisableVertexAttribArrayARB`, `glBindTexture`, `glTexParameteri`, `glSecondaryColor3f`,
+  `glProgramEnvParameter4fvARB`, probably 5 % together. Caching the client-array uploads (88 % of the bytes
+  glthread copies are identical to the last copy from the same address; `mesa/experiments/`) does not pay: exact
+  comparison is 7-13 % slower, a sampled comparison (wrong when only other bytes change) is level; any check reads
+  the cold vertex data, and that read is the cost, not the copy. 30 fps is not reachable from the driver
+  side: the game's own work is a large part of the 66 ms.
+  Sims 2 crash in `_mesa_glthread_upload` (2026-10-23, original executable and the pre-round-2 bundle alike, so
+  not the speed work): loading a lot, pausing or moving the camera could end in `EXC_BAD_ACCESS` inside the
+  `memcpy` of a `glDrawElements` from client memory. The game passes a range longer than its array (a probe
+  logged one draw a frame asking 12424 bytes of which 5704 were mapped); real hardware reads the extra as
+  garbage, glthread copies it and faults when the array ends at the end of a mapping (heap luck, hence
+  "sometimes"). Patch `0029` runs a copy that crosses a page boundary under `sigsetjmp` and a SIGSEGV/SIGBUS
+  handler, stops the copy at the fault and copies the readable part again (`RDN_UPLOAD_GUARD=0` off; a short
+  copy is logged to `/tmp/rdn-upload-clamp.txt`, at most 20 lines). A first version asked the kernel
+  (`vm_region`) before each copy and cost 18 % of the frame rate; the guard costs about 3 % (12.4 to 12.6 fps
+  against 12.8 to 13.0, two pairs). Tested alone on the G5 (2000 forced faults, each survives, the readable part
+  is copied) and in the Broke lot (load, six pause toggles, ten camera moves, no crash); the guard has not
+  faulted inside the game yet. Open: a mirror's picture repeated elsewhere at a few camera angles (also with
+  the bundle from before the speed work), and one freeze of about two seconds.
 - Where the two games stand (2026-10-06, end of day, G5, 1920x1080):
   Doom 3 demo 48 and 51 fps on the saves `bench` and `bench2` (ARB2
   path, glthread; the GeForce 6600 LE 26 and 19), Quake 3 `four` 149.

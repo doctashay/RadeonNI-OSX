@@ -1,0 +1,20 @@
+name = "The Sims 2"
+publisher = "Electronic Arts / Aspyr (Mac)"
+year = 2005
+engine = "EA/Maxis in-house engine, Aspyr port of its Direct3D-style renderer (cDeviceDX, vs_1_1 and ps_1_x shaders)"
+api = ["OpenGL 1.x", "ARB vertex programs", "ARB fragment programs (translated from ps_1_x)"]
+
+[[report]]
+date = "2026-10-23"
+tier = "glitches"
+version = "The Sims 2 1.0 Rev F"
+driver = "bundle ea8e7309 (commit 1f3a6a9)"
+gpu = "HD 7570 (Turks PRO)"
+machine = "PowerMac11,2"
+resolution = "1920x1080"
+mode = "fullscreen"
+fps = 13
+settings = "the game's own defaults, Pleasantview and the Broke family's lot"
+issues = ["docs/agents/accel-state.md (Sims 2 profile, shaders, speed work and the lot-load crash)"]
+notes = """Runs and plays at about 13 to 14 fps in the neighborhood and in a lot; 30 fps is not reachable from the driver side (the game's own work is most of each 66 ms frame). Known problems: at a few camera angles the picture of a mirror is repeated elsewhere on the screen; the game freezes once in a while; The intro movies crash in Apple's QuickTime, not in our driver."""
+reporter = "kouta-kun"

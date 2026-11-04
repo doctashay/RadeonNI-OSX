@@ -30,10 +30,25 @@ extern const unsigned rdn_dispatch_entries;
  * reports apart.
  */
 void rdn_dispatch_kept_report(const char *when);
+/* rdn_mesa.c has destroyed the context whose engine context is `rend`: forget what the glue knows of it. */
+void rdn_dispatch_forget(void *rend);
+/*
+ * Run what the glue holds back for the thread's current context (a run of
+ * one-row glCopyTexSubImage2D calls) before the thread lets the context go.
+ */
+void rdn_dispatch_flush_pending(void);
 
 /* rdn_mesa.c: the engine context whose Mesa context is current. */
 /* Per thread: Mesa's current context is too. */
 extern __thread void *rdn_current_rend;
+/* Every write to rdn_current_rend is made by this (rdn_mesa.c, rdn_fast_rend). */
+void rdn_set_current_rend(void *rend);
+/* The drawing thread's stack range and context, for RDN_ENTER's short cut. */
+struct rdn_fast_rend {
+	uintptr_t low, len;
+	void *rend;
+};
+extern struct rdn_fast_rend rdn_fast_rend;
 extern int rdn_modern_contexts;
 void rdn_hook_modern_register(int (*ready)(void), int (*current)(void *), void *(*lookup)(const char *));
 int rdn_hook_modern_request(void);
@@ -158,6 +173,7 @@ extern int rdn_logging;
 extern int rdn_kept_now;
 /* Log every GL call that reaches Mesa (set when /tmp/rdngld.trace exists). */
 extern int rdn_trace;
+extern void rdn_lazy_flush(void);	/* the unit switches held back are made (gen_dispatch.py, lazy_flush) */
 
 /*
  * RDN_GLD_TRACE_ONLY in the environment limits the trace to the calls it

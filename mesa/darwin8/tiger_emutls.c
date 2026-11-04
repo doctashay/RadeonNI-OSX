@@ -16,8 +16,16 @@
  * through the C library, and asking it cost more than everything else
  * here), and the routine needs no stack frame of its own. A thread whose
  * stack pointer is found nowhere (more threads than slots, or code running
- * on a stack that is not the thread's own) takes the long way and is
- * still right.
+ * on a stack that is not the thread's own: a game that runs its code on
+ * stacks it made itself, as fibres) takes the long way and is still right.
+ * That is in two steps: a thread that has a slot is found by pthread_self()
+ * (emutls_mid, a few dozen instructions), and only a thread that has none
+ * goes through pthread_getspecific() (emutls_slow, with a lock on the first
+ * use of a variable).
+ *
+ * RDN_EMUTLS_STATS=1 in the environment prints, when the program ends, how
+ * many calls took each of the steps after the first (the first is the
+ * normal one and is not counted: counting would cost more than it tells).
  *
  * The control object's layout is libgcc's (emutls.c, struct
  * __emutls_object); the code is written for this project.
@@ -28,6 +36,7 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
@@ -78,6 +87,103 @@ static struct emutls_fast {
 	{ ~(uintptr_t)0, 0, 0, NULL, 0, NULL },
 };
 
+/*
+ * The program's GL thread, without a lookup (mesa/patches/0025).
+ *
+ * Mesa reads its current context and dispatch table on every call (twice
+ * with glthread). Here the first thread that makes a context current in
+ * Mesa (and has one of the short-cut slots above) keeps copies of both,
+ * with its stack's range. Mesa's reader (glapi.h) takes the copies when
+ * the stack pointer is in the range, which only that thread's can be, and
+ * the thread-local variable otherwise (the glthread worker, a second
+ * context's thread, code on stacks of its own). The owner is the only
+ * writer of ctx and disp, so the reader never sees a mix. Given up when
+ * the owner makes no context current, or ends.
+ *
+ * On for The Sims 2, and for any program with RDN_TLS_FAST=1 (not the
+ * window server); RDN_TLS_FAST=0 off.
+ */
+struct rdn_tls_primary {
+	uintptr_t low, len;
+	void *ctx, *disp;
+};
+struct rdn_tls_primary rdn_tls_primary __attribute__((visibility("hidden")));
+static int primary_slot = -1;		/* fast[] index of the owner, under emutls_lock */
+
+static int primary_enabled(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *name = getprogname(), *env = getenv("RDN_TLS_FAST");
+
+		on = name && strcmp(name, "WindowServer") &&
+		     (env ? *env != '0' : !strcmp(name, "The Sims 2"));
+	}
+	return on;
+}
+
+static int in_primary(void)
+{
+	uintptr_t sp;
+
+	__asm__("mr %0,r1" : "=r"(sp));
+	return sp - rdn_tls_primary.low < rdn_tls_primary.len;
+}
+
+/* The owner's own context changed (Mesa: _mesa_glapi_set_context). */
+void rdn_tls_set_context(void *ctx)
+{
+	if (in_primary()) {
+		if (ctx)
+			rdn_tls_primary.ctx = ctx;
+		else {
+			/* No context: given up, any thread may take it. */
+			rdn_tls_primary.len = 0;
+			__sync_synchronize();
+			pthread_mutex_lock(&emutls_lock);
+			primary_slot = -1;
+			pthread_mutex_unlock(&emutls_lock);
+		}
+	}
+}
+
+/* The same for the dispatch table (_mesa_glapi_set_dispatch). */
+void rdn_tls_set_dispatch(void *disp)
+{
+	if (in_primary())
+		rdn_tls_primary.disp = disp;
+}
+
+/*
+ * A context has been made current in this thread (_mesa_make_current),
+ * with the thread's variables `ctx` and `disp` as they are now. Takes the
+ * place of owner if there is none and the thread has a short-cut slot.
+ */
+void rdn_tls_claim(void *ctx, void *disp)
+{
+	pthread_t self;
+	uintptr_t i;
+
+	if (!ctx || rdn_tls_primary.len || !primary_enabled())
+		return;
+	self = pthread_self();
+	pthread_mutex_lock(&emutls_lock);
+	if (!rdn_tls_primary.len)
+		for (i = 0; i < FAST_THREADS; i++)
+			if (fast[i].array && fast[i].thread == self && fast[i].low < fast[i].high) {
+				primary_slot = (int)i;
+				rdn_tls_primary.ctx = ctx;
+				rdn_tls_primary.disp = disp;
+				rdn_tls_primary.low = fast[i].low;
+				__sync_synchronize();
+				/* Last: from here on the thread's lookups use the copies. */
+				rdn_tls_primary.len = fast[i].high - fast[i].low;
+				break;
+			}
+	pthread_mutex_unlock(&emutls_lock);
+}
+
 /* The largest stack the kernel gives the first thread (MAXSSIZ). */
 #define MAIN_STACK_MOST (64u << 20)
 
@@ -115,6 +221,14 @@ static void emutls_thread_exit(void *arg)
 
 	for (i = 0; i < FAST_THREADS; i++)
 		if (fast[i].array == a) {
+			pthread_mutex_lock(&emutls_lock);
+			if (primary_slot == (int)i) {
+				/* The owner ends: its stack may be another thread's next. */
+				rdn_tls_primary.len = 0;
+				__sync_synchronize();
+				primary_slot = -1;
+			}
+			pthread_mutex_unlock(&emutls_lock);
 			fast[i].low = ~(uintptr_t)0;
 			__sync_synchronize();
 			fast[i].high = 0;
@@ -154,6 +268,9 @@ static void *emutls_new_copy(struct emutls_object *obj)
 	return copy;
 }
 
+/* Calls that missed the short cut: found by thread identity, and the long way. */
+static unsigned long emutls_mid_calls, emutls_slow_calls;
+
 /* The long way: everything the short cut in __emutls_get_address() is not. */
 static void *emutls_slow(struct emutls_object *obj) __attribute__((noinline));
 
@@ -164,6 +281,7 @@ static void *emutls_slow(struct emutls_object *obj)
 	pthread_t self = pthread_self();
 	uintptr_t offset, i;
 
+	emutls_slow_calls++;
 	/* A thread with a slot that is not on its own stack just now. */
 	for (i = 0; i < FAST_THREADS; i++)
 		if (fast[i].array && fast[i].thread == self) {
@@ -233,6 +351,43 @@ static void *emutls_slow(struct emutls_object *obj)
 	return a->slot[offset - 1];
 }
 
+/*
+ * The second step: a thread that has a slot, found by who it is, for the
+ * times its stack pointer is outside the range noted for it. The slot's
+ * `thread` is its owner's alone to match: a slot is given up (array NULL)
+ * before its thread is gone, and one taken again has a new owner.
+ */
+static void *emutls_mid(struct emutls_object *obj) __attribute__((noinline));
+
+static void *emutls_mid(struct emutls_object *obj)
+{
+	uintptr_t index = obj->loc.offset - 1;
+	pthread_t self = pthread_self();
+	const struct emutls_fast *f;
+
+	emutls_mid_calls++;
+	for (f = fast; f < fast + FAST_THREADS; f++)
+		if (f->array && f->thread == self) {
+			if (index < f->count) {
+				void *copy = f->slot[index];
+
+				if (copy)
+					return copy;
+			}
+			break;
+		}
+	return emutls_slow(obj);
+}
+
+static void emutls_report(void) __attribute__((destructor));
+
+static void emutls_report(void)
+{
+	if (getenv("RDN_EMUTLS_STATS"))
+		fprintf(stderr, "emutls: %lu calls by thread identity, %lu the long way\n",
+			emutls_mid_calls, emutls_slow_calls);
+}
+
 void *__emutls_get_address(void *object)
 {
 	struct emutls_object *obj = object;
@@ -242,16 +397,26 @@ void *__emutls_get_address(void *object)
 	register uintptr_t sp __asm__("r1");
 	const struct emutls_fast *f;
 
-	for (f = fast; f < fast + FAST_THREADS; f++)
-		if (sp >= f->low && sp < f->high) {
-			if (index < f->count) {
-				void *copy = f->slot[index];
+	/*
+	 * The first two threads to come here are nearly always the ones that
+	 * count (the program's and glthread's), so they are tried without a loop.
+	 */
+	if (sp >= fast[0].low && sp < fast[0].high)
+		f = &fast[0];
+	else if (sp >= fast[1].low && sp < fast[1].high)
+		f = &fast[1];
+	else if (sp >= fast[2].low && sp < fast[2].high)
+		f = &fast[2];
+	else if (sp >= fast[3].low && sp < fast[3].high)
+		f = &fast[3];
+	else
+		return emutls_mid(obj);
+	if (index < f->count) {
+		void *copy = f->slot[index];
 
-				if (copy)
-					return copy;
-			}
-			break;
-		}
+		if (copy)
+			return copy;
+	}
 	return emutls_slow(obj);
 }
 

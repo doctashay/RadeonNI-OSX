@@ -17,6 +17,7 @@
  */
 
 #include <dlfcn.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,6 +99,23 @@ struct drawable {
 	void *base;
 };
 
+/*
+ * Everything rdn_make_current binds Mesa from, as it was when it last did, so
+ * that a call that would bind the same again can be left out (below).
+ */
+struct bind_sig {
+	struct drawable d;
+	OSMesaContext mesa;
+	const uint32_t *record;
+	long type;
+	unsigned long connection, window, surface;
+	int origin_x, origin_y, placed, direct, stored, backing_extent_set;
+	uint32_t screen_width, screen_height, screen_pitch, screen_rects, rect_hash;
+	uint32_t store_offset, store_row_bytes, store_width, store_height;
+	/* From here on what the binding left in the globals; not compared. */
+	int global_origin_x, global_origin_y, watch, flush_waits;
+};
+
 struct context {
 	void *gld_ctx;
 	/* The thread Mesa's context was last made current in. */
@@ -160,6 +178,10 @@ struct context {
 	uint64_t profile_stage[3];
 	/* The pixel format asked for a double-buffered context (OSMesaDoubleBuffer). */
 	int dbl;
+	/* What Mesa was last bound from, when it can be told again (rdn_make_current). */
+	struct bind_sig sig;
+	int sig_valid;
+	unsigned sig_age;
 };
 
 #define MAX_CONTEXTS 64
@@ -207,6 +229,104 @@ void rdn_mesa_pbuffer_layout(int window_server)
 }
 
 __thread void *rdn_current_rend;
+
+/*
+ * The thread that draws, found without the thread-local lookup (which on
+ * Tiger is a call to __emutls_get_address for every GL call of the program:
+ * rdn_current_rend is read by every entry, RDN_ENTER). The first thread to
+ * make a context current takes this, with the range of its stack; its
+ * entries compare the stack pointer to the range (no other thread's is in
+ * it) and the context to .rend, which is what the thread's variable holds:
+ * every write to rdn_current_rend goes through rdn_set_current_rend, which
+ * updates both. A thread that is not in the range, or a context that is not
+ * .rend, takes the variable. The owner gives the place up by making no
+ * context current. A thread that ends while it owns it leaves its range
+ * behind; a thread made later with the same stack sets its own contexts
+ * through the same function, and has the same answers as its variable.
+ * On for The Sims 2, or RDN_FAST_REND=1; RDN_FAST_REND=0 off.
+ */
+struct rdn_fast_rend rdn_fast_rend;
+static pthread_mutex_t fast_rend_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#if defined(__APPLE__) && defined(__ppc__)
+#include <sys/resource.h>
+
+static int fast_rend_enabled(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *name = getprogname(), *env = getenv("RDN_FAST_REND");
+
+		on = name && strcmp(name, "WindowServer") &&
+		     (env ? *env != '0' : !strcmp(name, "The Sims 2"));
+	}
+	return on;
+}
+
+static int fast_rend_mine(void)
+{
+	uintptr_t sp;
+
+	__asm__("mr %0,r1" : "=r"(sp));
+	return sp - rdn_fast_rend.low < rdn_fast_rend.len;
+}
+
+/* The calling thread's stack as [*low, *high); nothing if the stack pointer is not in what the C library says. */
+static int fast_rend_stack(uintptr_t *low, uintptr_t *high)
+{
+	pthread_t self = pthread_self();
+	uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(self);
+	uintptr_t size = pthread_get_stacksize_np(self);
+	uintptr_t sp;
+	struct rlimit limit;
+
+	__asm__("mr %0,r1" : "=r"(sp));
+	/* The first thread's real limit is the process's (at most 64 MB, the kernel's). */
+	if (pthread_main_np() && !getrlimit(RLIMIT_STACK, &limit) &&
+	    limit.rlim_cur > size && limit.rlim_cur <= (64u << 20))
+		size = (uintptr_t)limit.rlim_cur;
+	if (size > top || sp < top - size || sp >= top)
+		return 0;
+	*low = top - size;
+	*high = top;
+	return 1;
+}
+
+void rdn_set_current_rend(void *rend)
+{
+	rdn_lazy_flush();
+	uintptr_t low, high;
+
+	rdn_current_rend = rend;
+	if (fast_rend_mine()) {
+		if (rend)
+			rdn_fast_rend.rend = rend;
+		else {
+			rdn_fast_rend.len = 0;
+			rdn_fast_rend.rend = NULL;
+		}
+		return;
+	}
+	if (!rend || rdn_fast_rend.len || !fast_rend_enabled())
+		return;
+	pthread_mutex_lock(&fast_rend_lock);
+	if (!rdn_fast_rend.len && fast_rend_stack(&low, &high)) {
+		rdn_fast_rend.rend = rend;
+		rdn_fast_rend.low = low;
+		__sync_synchronize();
+		/* Last: from here on this thread's entries use it. */
+		rdn_fast_rend.len = high - low;
+	}
+	pthread_mutex_unlock(&fast_rend_lock);
+}
+#else
+void rdn_set_current_rend(void *rend)
+{
+	rdn_lazy_flush();
+	rdn_current_rend = rend;
+}
+#endif
 int rdn_origin_x, rdn_origin_y;
 long rdn_async_limit, rdn_async_piece;
 int rdn_flush_waits;
@@ -440,11 +560,12 @@ void rdn_mesa_context_destroyed(void *gld_ctx)
 		return;
 	if (c->rend && c->rend == rdn_current_rend) {
 		OSMesaMakeCurrent(NULL, NULL, GL_UNSIGNED_BYTE, 0, 0);
-		rdn_current_rend = NULL;
+		rdn_set_current_rend(NULL);
 	}
 	if (c->mesa)
 		OSMesaDestroyContext(c->mesa);
 	void *group = c->texture_group_key;
+	rdn_dispatch_forget(c->rend);
 	/* WindowServer owns the surface lifetime, independently of this context. */
 	memset(c, 0, sizeof(*c));
 	texture_group_destroyed(group);
@@ -468,7 +589,7 @@ void rdn_mesa_pbuffer_destroyed(void *record)
 			c->record = NULL;
 			c->bound = 0;
 			if (c->rend && c->rend == rdn_current_rend)
-				rdn_current_rend = NULL;
+				rdn_set_current_rend(NULL);
 		}
 	}
 	for (i = 0; i < MAX_PBUFFERS; i++) {
@@ -1408,7 +1529,7 @@ int rdn_mesa_attach(void *gld_ctx, long type, const void *drawable)
 	c->bound = 0;
 	/* The next GL call binds the new drawable. */
 	if (c->rend && c->rend == rdn_current_rend)
-		rdn_current_rend = NULL;
+		rdn_set_current_rend(NULL);
 	read_record(c, &d);
 	rdn_log("attach: context %p, type 0x%lx, %ux%u, rowbytes %u, base %p",
 		gld_ctx, type, (unsigned)d.width, (unsigned)d.height,
@@ -1471,7 +1592,7 @@ int rdn_mesa_attach_surface(void *gld_ctx, unsigned long connection,
 	c->record = NULL;
 	c->bound = 0;
 	if (c->rend && c->rend == rdn_current_rend)
-		rdn_current_rend = NULL;
+		rdn_set_current_rend(NULL);
 	rdn_log("attach: context %p draws on surface 0x%lx", gld_ctx, surface);
 	return 1;
 }
@@ -1508,7 +1629,7 @@ void rdn_mesa_detach(void *gld_ctx)
 		/* An imported pbuffer can outlive its producer's drawable binding. */
 		if (OSMesaAdoptContext(c->mesa)) {
 			OSMesaFlushRender(c->mesa, GL_TRUE);
-			rdn_current_rend = NULL;
+			rdn_set_current_rend(NULL);
 		}
 	}
 	if (c->type == DRAWABLE_SURFACE && c->stored) {
@@ -1520,7 +1641,7 @@ void rdn_mesa_detach(void *gld_ctx)
 	c->record = NULL;
 	c->bound = 0;
 	if (c->rend && c->rend == rdn_current_rend)
-		rdn_current_rend = NULL;
+		rdn_set_current_rend(NULL);
 }
 
 /*
@@ -1640,7 +1761,7 @@ void rdn_mesa_backing_viewport(void *rend, int x, int y, int width, int height)
 			c->screen_width = width;
 			c->screen_height = height;
 		}
-		rdn_current_rend = NULL;
+		rdn_set_current_rend(NULL);
 		rdn_make_current(rend);
 		return;
 	}
@@ -1691,7 +1812,7 @@ int rdn_mesa_attach_screen(void *gld_ctx, unsigned long surface)
                 &backing_stride, &backing_width, &backing_height);
         c->screen.base = backing ? backing : (void *)c;
 		c->screen_pitch = c->store_row_bytes / 4;
-		if (c->rend == rdn_current_rend) rdn_current_rend = NULL;
+		if (c->rend == rdn_current_rend) rdn_set_current_rend(NULL);
 		rdn_log("attach: context %p draws into backing surface %lu, %ux%u",
 		        gld_ctx, surface, backing_width, backing_height);
 		return 1;
@@ -1738,7 +1859,7 @@ int rdn_mesa_attach_screen(void *gld_ctx, unsigned long surface)
 	c->screen.rowbytes = pitch * 4;
 	c->screen.base = (void *)(pixels + (uint32_t)b[1] * pitch + (uint32_t)b[0]);
 	if (c->rend && c->rend == rdn_current_rend)
-		rdn_current_rend = NULL;
+		rdn_set_current_rend(NULL);
 	rdn_log("attach: context %p draws on the screen at %d,%d %dx%d (surface %lu, %u rectangles, %s)",
 		gld_ctx, (int)b[0], (int)b[1], (int)b[2], (int)b[3], surface,
 		(unsigned)count, c->direct ? "direct" : "copied");
@@ -2038,6 +2159,8 @@ void rdn_mesa_early_all(void *cgl_ctx)
 	/* Leopard gives each GPU a context sharing this engine dispatch table. */
 	if (cgl_ctx && !selected_renderer(cgl_ctx))
 		return;
+	/* What the glue holds back for the context that is current now is made first. */
+	rdn_dispatch_flush_pending();
 	if (!cgl_ctx) {
 		OSMesaContext m = OSMesaGetCurrentContext();
 
@@ -2057,7 +2180,7 @@ void rdn_mesa_early_all(void *cgl_ctx)
 					OSMesaMakeCurrent(NULL, NULL, GL_UNSIGNED_BYTE, 0, 0);
 				break;
 			}
-		rdn_current_rend = NULL;
+		rdn_set_current_rend(NULL);
 		return;
 	}
 	for (i = 0; i < MAX_CONTEXTS; i++)
@@ -2074,7 +2197,7 @@ void rdn_mesa_early_all(void *cgl_ctx)
 				return;
 			}
 		OSMesaMakeCurrent(NULL, NULL, GL_UNSIGNED_BYTE, 0, 0);
-		rdn_current_rend = NULL;
+		rdn_set_current_rend(NULL);
 	}
 }
 
@@ -2144,6 +2267,7 @@ static void make_current_drawable(void *rend, const struct drawable *snapshot)
 		rdn_log("GL call on engine context %p, which is not ours", rend);
 		return;
 	}
+	c->sig_valid = 0;
 	if (!c->mesa)
 		mesa_for(c);
 	if (!c->mesa)
@@ -2160,7 +2284,7 @@ static void make_current_drawable(void *rend, const struct drawable *snapshot)
 			c->thread = pthread_self();
 			if (rdn_trace)
 				rdn_log("Mesa adopted in this thread for context %p", c->gld_ctx);
-			rdn_current_rend = rend;
+			rdn_set_current_rend(rend);
 			return;
 		}
 	}
@@ -2215,7 +2339,7 @@ static void make_current_drawable(void *rend, const struct drawable *snapshot)
 		if (c->nowhere && OSMesaGetCurrentContext() == c->mesa)
 			return;
 		rdn_origin_x = rdn_origin_y = 0;
-		rdn_current_rend = NULL;
+		rdn_set_current_rend(NULL);
 		if (!OSMesaMakeCurrent(c->mesa, nowhere, GL_UNSIGNED_BYTE, side, side))
 			return;
 		OSMesaPixelStore(OSMESA_ROW_LENGTH, side);
@@ -2238,7 +2362,7 @@ static void make_current_drawable(void *rend, const struct drawable *snapshot)
 		c->bound = 1;
 		c->nowhere = 0;
 		rdn_watch = 0;
-		rdn_current_rend = rend;
+		rdn_set_current_rend(rend);
 		return;
 	}
 	if (c->type == DRAWABLE_SURFACE) {
@@ -2270,7 +2394,7 @@ static void make_current_drawable(void *rend, const struct drawable *snapshot)
 		c->drawable = d;
 		c->bound = 1;
 		c->nowhere = 0;
-		rdn_current_rend = rend;
+		rdn_set_current_rend(rend);
 		return;
 	}
 	if (c->type == DRAWABLE_SCREEN && c->direct) {
@@ -2302,7 +2426,7 @@ static void make_current_drawable(void *rend, const struct drawable *snapshot)
 		c->drawable = d;
 		c->bound = 1;
 		c->nowhere = 0;
-		rdn_current_rend = rend;
+		rdn_set_current_rend(rend);
 		return;
 	}
 	if (c->type == DRAWABLE_PBUFFER) {
@@ -2337,7 +2461,7 @@ static void make_current_drawable(void *rend, const struct drawable *snapshot)
 		c->drawable = d;
 		c->bound = 1;
 		c->nowhere = 0;
-		rdn_current_rend = rend;
+		rdn_set_current_rend(rend);
 		if (pbuffer_ws && !c->ws_state) {
 			/*
 			 * The window server's contexts start with rectangle
@@ -2380,12 +2504,113 @@ static void make_current_drawable(void *rend, const struct drawable *snapshot)
 	c->bound = 1;
 	c->nowhere = 0;
 	rdn_flush_waits = glthread;
-	rdn_current_rend = rend;
+	rdn_set_current_rend(rend);
+}
+
+/*
+ * The bindings that can be told again: a program's window, off-screen buffer
+ * or surface. The others (the screen, pbuffers, backings) are bound anew.
+ */
+static int bind_sig_type(const struct context *c)
+{
+	return c->type == DRAWABLE_WINDOW || c->type == DRAWABLE_OFFSCREEN ||
+	       c->type == DRAWABLE_SURFACE;
+}
+
+/* What the binding of `c` to `d` is made from, in the context's present state. */
+static void bind_sig_of(const struct context *c, const struct drawable *d, struct bind_sig *sig)
+{
+	uint32_t hash = 2166136261u, i;
+	const uint32_t *words = (const uint32_t *)c->screen_rect;
+
+	memset(sig, 0, sizeof(*sig));
+	sig->d = *d;
+	sig->mesa = c->mesa;
+	sig->record = c->record;
+	sig->type = c->type;
+	sig->connection = c->connection;
+	sig->window = c->window;
+	sig->surface = c->surface;
+	sig->origin_x = c->origin_x;
+	sig->origin_y = c->origin_y;
+	sig->placed = c->placed;
+	sig->direct = c->direct;
+	sig->stored = c->stored;
+	sig->backing_extent_set = c->backing_extent_set;
+	sig->screen_width = c->screen_width;
+	sig->screen_height = c->screen_height;
+	sig->screen_pitch = c->screen_pitch;
+	sig->screen_rects = c->screen_rects;
+	for (i = 0; i < c->screen_rects && i < MAX_SCREEN_RECTS * 4; i++)
+		hash = (hash ^ words[i]) * 16777619u;
+	sig->rect_hash = hash;
+	sig->store_offset = c->store_offset;
+	sig->store_row_bytes = c->store_row_bytes;
+	sig->store_width = c->store_width;
+	sig->store_height = c->store_height;
+}
+
+/*
+ * Make the engine context's Mesa context current in this thread, bound to the
+ * program's drawable.
+ *
+ * Programs call aglSetCurrentContext (and for a surface the swap comes
+ * here) every frame, with the same context and drawable as in the last. Doing
+ * it anew each time is not free: OSMesaMakeCurrent* and OSMesaSurfaceStorage
+ * wait for glthread's thread to run everything the program has called (the
+ * calls that follow cannot be queued while it does), and the surface's
+ * storage is registered with the kext again. When the context is still the
+ * one Mesa has current in this thread and nothing it is bound from has
+ * changed (the drawable's size, base and row length, a surface's place,
+ * visible rectangles and storage, the screen's mode), only what the slow
+ * way leaves in the globals is put back. Every 128th call takes the slow way
+ * anyway. RDN_GLD_NO_REBIND_SKIP=1 in the environment always does.
+ */
+static void make_current_cached(void *rend)
+{
+	rdn_lazy_flush();
+	struct context *c = NULL;
+	struct drawable d;
+	struct bind_sig now;
+	static int never = -1;
+	int i;
+
+	if (never < 0)
+		never = getenv("RDN_GLD_NO_REBIND_SKIP") != NULL;
+	for (i = 0; i < MAX_CONTEXTS; i++)
+		if (contexts[i].gld_ctx && contexts[i].rend == rend)
+			c = &contexts[i];
+	if (c && c->sig_valid && !never && !rdn_trace && c->bound && !c->nowhere && c->mesa &&
+	    (++c->sig_age & 127) && pthread_equal(c->thread, pthread_self()) &&
+	    OSMesaGetCurrentContext() == c->mesa && read_record(c, &d)) {
+		bind_sig_of(c, &d, &now);
+		if (!memcmp(&now, &c->sig, offsetof(struct bind_sig, global_origin_x))) {
+			async_data(c->mesa);
+			rdn_origin_x = c->sig.global_origin_x;
+			rdn_origin_y = c->sig.global_origin_y;
+			rdn_watch = c->sig.watch;
+			rdn_flush_waits = c->sig.flush_waits;
+			rdn_set_current_rend(rend);
+			return;
+		}
+	}
+	if (c)
+		c->sig_valid = 0;
+	make_current_drawable(rend, NULL);
+	if (c && !never && c->mesa && c->bound && !c->nowhere && bind_sig_type(c) &&
+	    rdn_current_rend == rend) {
+		bind_sig_of(c, &c->drawable, &c->sig);
+		c->sig.global_origin_x = rdn_origin_x;
+		c->sig.global_origin_y = rdn_origin_y;
+		c->sig.watch = rdn_watch;
+		c->sig.flush_waits = rdn_flush_waits;
+		c->sig_valid = 1;
+	}
 }
 
 void rdn_make_current(void *rend)
 {
-	make_current_drawable(rend, NULL);
+	make_current_cached(rend);
 	if (!rdn_window_server && migration_textures()) {
 		struct context *c = texture_context();
 		if (c) { sync_context_textures(c); sync_legacy_context(c); }
